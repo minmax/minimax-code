@@ -1,10 +1,14 @@
 import { InvalidArgumentError, Option, type Command } from 'commander';
+import { assertValidProfileName } from '@mavis/config';
 import { parseHeadlessModelOverride } from '../headless/model-selection.js';
 import type { TuiMode } from '../tui/engine/public.js';
 import { parseTuiStartupEnvironment } from './environment.js';
 import type { TuiBuildEnvironment } from '../auth/environment.js';
 
 const RETIRED_TOP_LEVEL_COMMAND_NAMES = new Set(['git', 'changes', 'projects']);
+
+const PROFILE_OPTION_DESCRIPTION =
+  'use a named profile with its own account, sessions, and settings';
 
 export interface TuiInteractiveLaunchRequest {
   readonly initialPrompt?: string;
@@ -25,7 +29,25 @@ export interface RawTuiInteractiveOptions {
   readonly resume?: string;
   readonly tuiMode?: TuiMode;
   readonly lane?: string;
+  readonly profile?: string;
   readonly env?: TuiBuildEnvironment;
+}
+
+/**
+ * Add `--profile <name>` to a command.
+ *
+ * Commander does not inherit parent options, and the root program runs with
+ * `enablePositionalOptions()`, so every subcommand needs its own copy for
+ * `mcode exec --profile work` to parse. The value is validated here rather than
+ * at use time: a profile name becomes a home-directory segment, so rejecting
+ * `../../etc` before any action runs is a security boundary, not input tidying.
+ */
+export function applyProfileCliOption(command: Command): Command {
+  return command.addOption(createProfileOption());
+}
+
+function createProfileOption(): Option {
+  return new Option('--profile <name>', PROFILE_OPTION_DESCRIPTION).argParser(parseProfileOption);
 }
 
 export function applyInteractiveCliContract(
@@ -36,6 +58,7 @@ export function applyInteractiveCliContract(
     .argument('[prompt]', 'task to execute in the interactive TUI')
     .addOption(new Option('-m, --model <provider/model>', 'select the model for this Session only'))
     .addOption(new Option('--lane <lane>', 'managed backend lane for test or staging builds'))
+    .addOption(createProfileOption())
     .addOption(
       new Option('--session [id]', 'open a Session by id, or browse Sessions when id is omitted'),
     )
@@ -180,6 +203,14 @@ function parseTuiMode(value: string): TuiMode {
 function parseStartupEnvironmentOption(value: string): TuiBuildEnvironment {
   try {
     return parseTuiStartupEnvironment(value);
+  } catch (error) {
+    throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function parseProfileOption(value: string): string {
+  try {
+    return assertValidProfileName(value);
   } catch (error) {
     throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
   }

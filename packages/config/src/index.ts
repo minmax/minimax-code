@@ -79,6 +79,19 @@ export {
 } from './data-dir.js';
 export type { DataDirMigrationLogger, ResolveDataDirOptions } from './data-dir.js';
 export {
+  DEFAULT_PROFILE_NAME,
+  InvalidProfileNameError,
+  LEGACY_PROFILE_ENV_VAR,
+  PROFILE_ENV_VAR,
+  assertValidProfileName,
+  isValidProfileName,
+  listProfiles,
+  normalizeProfileSelector,
+  readProfileEnv,
+  resolveProfileDataDirPaths,
+} from './auth-profile.js';
+export type { DataDirProfilePaths, DiscoveredProfile } from './auth-profile.js';
+export {
   isLegacyManagedMinimaxProvider,
   isManagedProviderBaseUrl,
   resolveProviderAuthMode,

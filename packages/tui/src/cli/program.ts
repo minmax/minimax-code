@@ -6,11 +6,13 @@ import {
   applyExecCliContract,
   applyExecReviewCliContract,
   applyInteractiveCliContract,
+  applyProfileCliOption,
   resolveInteractiveLaunchRequest,
   type RawTuiInteractiveOptions,
   type TuiInteractiveLaunchRequest,
 } from './contract.js';
 import type { McodeProviderCliRequest } from './provider-command.js';
+import type { McodeProfileCliRequest } from './profile-command.js';
 import {
   isModelProviderApiFormat,
   MCODE_PROVIDER_API_FORMATS,
@@ -42,6 +44,7 @@ export interface CreateTuiProgramOptions {
   runLogout: (region?: MavisRegion) => Promise<void>;
   runUpdate: () => Promise<void>;
   runProvider?: (request: McodeProviderCliRequest, lane?: string) => Promise<void>;
+  runProfile?: (request: McodeProfileCliRequest, lane?: string) => Promise<void>;
   runPlugin?: (request: McodePluginCliRequest, lane?: string) => Promise<void>;
   runTelemetry?: (action: McodeTelemetryCliAction) => Promise<void>;
   resolveLane?: typeof resolveTuiManagedBackendLane;
@@ -63,6 +66,12 @@ export function createTuiProgram(options: CreateTuiProgramOptions): Command {
     activeLane
       ? requirePluginRunner(options)(request, activeLane)
       : requirePluginRunner(options)(request);
+  const runProfile = (request: McodeProfileCliRequest) =>
+    options.runProfile
+      ? activeLane
+        ? options.runProfile(request, activeLane)
+        : options.runProfile(request)
+      : defaultRunProfile(request);
   const program = applyInteractiveCliContract(
     new Command()
       .name('mcode')
@@ -341,6 +350,33 @@ export function createTuiProgram(options: CreateTuiProgramOptions): Command {
       }),
     );
 
+  const profile = program.command('profile').description('Inspect and remove named auth profiles');
+
+  profile
+    .command('list')
+    .description('List profiles and their sign-in state')
+    .option('--json', 'print a JSON document')
+    .allowExcessArguments(false)
+    .action((commandOptions: { json?: boolean }) =>
+      runProfile({ action: 'list', json: commandOptions.json }),
+    );
+
+  profile
+    .command('current')
+    .description('Show the profile this invocation resolved to')
+    .allowExcessArguments(false)
+    .action(() => runProfile({ action: 'current' }));
+
+  profile
+    .command('remove')
+    .description('Delete a profile data directory')
+    .argument('<name>', 'profile name')
+    .option('--yes', 'confirm removal')
+    .allowExcessArguments(false)
+    .action((name: string, commandOptions: { yes?: boolean }) =>
+      runProfile({ action: 'remove', name, confirmed: Boolean(commandOptions.yes) }),
+    );
+
   const contributionRegistry = new TuiContributionRegistry<TuiCliCommandContribution>();
   contributionRegistry.registerAll(options.commandContributions ?? []);
   for (const contribution of contributionRegistry.freeze()) {
@@ -350,7 +386,27 @@ export function createTuiProgram(options: CreateTuiProgramOptions): Command {
     contribution.register(program, options);
   }
 
+  applyProfileOptionToEveryCommand(program);
+
   return program;
+}
+
+/**
+ * Give every command its own `--profile` option.
+ *
+ * Commander does not inherit parent options, and the root program runs with
+ * `enablePositionalOptions()`, so `mcode exec --profile work` fails with an
+ * unknown-option error unless `exec` declares the flag itself. Walking the
+ * finished tree keeps that from being a per-command chore and covers contributed
+ * commands too. The root already carries the option from
+ * `applyInteractiveCliContract`, hence the guard.
+ */
+function applyProfileOptionToEveryCommand(command: Command): void {
+  const declared = command.options.some((option) => option.attributeName() === 'profile');
+  if (!declared) applyProfileCliOption(command);
+  for (const child of command.commands) {
+    applyProfileOptionToEveryCommand(child);
+  }
 }
 
 function resolveExecReviewOptions(exec: Command, review: Command): RawTuiExecOptions {
@@ -423,6 +479,15 @@ function requireAcpRunner(options: CreateTuiProgramOptions) {
 function requireTelemetryRunner(options: CreateTuiProgramOptions) {
   if (!options.runTelemetry) throw new Error('Telemetry inspection is unavailable.');
   return options.runTelemetry;
+}
+
+/**
+ * Used until the composition root in `main.ts` injects `runProfile`, which also
+ * routes the output through its own process stream.
+ */
+async function defaultRunProfile(request: McodeProfileCliRequest): Promise<void> {
+  const { runMcodeProfileCommand } = await import('./profile-command.js');
+  process.stdout.write(`${await runMcodeProfileCommand({ request })}\n`);
 }
 
 function parsePositiveSafeInteger(value: string): number {

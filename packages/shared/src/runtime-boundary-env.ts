@@ -31,7 +31,16 @@ export const MANAGED_RUNTIME_KEYS = [
   'ELECTRON_RUN_AS_NODE',
 ] as const;
 
-/** Legacy runtime identity vars. Daemon identity now travels via args/files. */
+/**
+ * Legacy runtime identity vars. Daemon identity now travels via args/files.
+ *
+ * The public selectors `MINIMAX_DATA_DIR` and `MINIMAX_PROFILE` are listed here
+ * for the same reason: they describe which runtime *this* generation belongs
+ * to, and a child must be told its own identity rather than inherit one. A
+ * parent running `mcode --profile work` therefore passes `--profile` through
+ * args, and a `mcode` invoked from a shell inside a profile session starts on
+ * the default profile instead of silently joining the parent's credentials.
+ */
 export const LEGACY_RUNTIME_ENV_KEYS = [
   '__MAVIS_RUNTIME_PORT',
   '__MAVIS_RUNTIME_DATA_DIR',
@@ -44,6 +53,7 @@ export const LEGACY_RUNTIME_ENV_KEYS = [
   '__MAVIS_RUNTIME_DAEMON_URL',
   'MAVIS_PORT',
   'MINIMAX_DATA_DIR',
+  'MINIMAX_PROFILE',
   'MAVIS_DATA_DIR',
   'MAVIS_PROFILE',
   'MAVIS_SKIP_PID_PORT',
@@ -173,6 +183,7 @@ export function findLegacyRuntimeEnvKeys(env: NodeJS.ProcessEnv = process.env): 
       key.startsWith('__MAVIS_RUNTIME_') ||
       key === 'MAVIS_PORT' ||
       key === 'MINIMAX_DATA_DIR' ||
+      key === 'MINIMAX_PROFILE' ||
       key === 'MAVIS_DATA_DIR' ||
       key === 'MAVIS_PROFILE' ||
       key === 'MAVIS_SKIP_PID_PORT' ||

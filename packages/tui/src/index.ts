@@ -2,6 +2,8 @@
 
 import { fileURLToPath } from 'node:url';
 
+import { InvalidProfileNameError } from '@mavis/config';
+
 import {
   configureTuiRuntimeEnvironment,
   resolveTuiStartupEnvironmentOption,
@@ -24,8 +26,19 @@ async function main(): Promise<void> {
     return;
   }
   const { getTuiDataDirPath } = await import('./runtime/data-dir.js');
+  let startupDataDir: string;
+  try {
+    startupDataDir = getTuiDataDirPath();
+  } catch (error) {
+    // A rejected profile name is a user input error, not a crash. Anything else
+    // is a real defect and must stay visible.
+    if (!(error instanceof InvalidProfileNameError)) throw error;
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+    return;
+  }
   configureTuiRuntimeEnvironment({
-    dataDir: getTuiDataDirPath(),
+    dataDir: startupDataDir,
     ...(startupBuildEnvironment ? { startupBuildEnvironment } : {}),
   });
   const prefixProcess = await prepareMcodePrefixProcess();

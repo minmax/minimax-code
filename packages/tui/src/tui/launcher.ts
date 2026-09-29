@@ -56,7 +56,13 @@ import {
 import { resolveMcodeStartupUpdateNotice } from '../update/startup-notice.js';
 import type { McodeUpdateApplication } from '../update/application.js';
 import { tuiErrorDiagnostic } from '../user-facing-failure.js';
-import { getConfig, resetConfig, writeTuiStatusLineSetting, type MavisRegion } from '@mavis/config';
+import {
+  getConfig,
+  isValidProfileName,
+  resetConfig,
+  writeTuiStatusLineSetting,
+  type MavisRegion,
+} from '@mavis/config';
 import { markLoginRestartHandoff } from './login-restart-handoff.js';
 import {
   readTuiModeSetting,
@@ -69,6 +75,7 @@ import { MCODE_TUI_RESULT_PATH_ENV } from './automation/result-writer.js';
 import { startTuiStartupStatus, type TuiStartupStatus } from './startup-status.js';
 
 const MINIMAX_CODE_EXIT_SLOGAN = 'Intelligence with everyone, bye~';
+const PROFILE_OPTION = '--profile';
 export interface LaunchTuiOptions {
   version: string;
   initialPrompt?: string;
@@ -865,14 +872,56 @@ export function resolveRestartArguments(
   const userArgs = argv.slice(nodeExecutable ? 2 : 1);
   const startupEnvironment = resolveTuiStartupEnvironmentOption(userArgs, true);
   const environmentArgs = startupEnvironment ? ['--env', startupEnvironment] : [];
+  const profileArgs = resolveExplicitProfileArgs(userArgs);
   const resumeArgs = sessionId ? ['--session', sessionId] : [];
   const promptArgs = initialPrompt ? [initialPrompt] : [];
-  if (!nodeExecutable) return [...environmentArgs, ...resumeArgs, ...promptArgs];
+  if (!nodeExecutable) return [...profileArgs, ...environmentArgs, ...resumeArgs, ...promptArgs];
   const entryFile = argv[1];
   if (!entryFile || !isExistingFile(entryFile)) {
     throw new Error('Unable to restart MCode because its Node.js entry file is unavailable.');
   }
-  return [entryFile, ...environmentArgs, ...resumeArgs, ...promptArgs];
+  return [entryFile, ...profileArgs, ...environmentArgs, ...resumeArgs, ...promptArgs];
+}
+
+/**
+ * Re-emit an explicitly requested profile for the restarted process.
+ *
+ * The restart rebuilds argv from scratch, so without this a user who ran
+ * `mcode --profile work` would be dropped back into the default profile after
+ * signing in — pointed at the wrong account's credentials.
+ *
+ * Only an explicit flag is replayed. A profile that came from the environment or
+ * from git-branch auto-detection belongs to the old generation, and identity
+ * must travel through args rather than be inherited (see the runtime boundary
+ * rules in `@mavis/shared/runtime-boundary-env`). An unusable value is dropped
+ * instead of forwarded: validation already failed the run before a restart could
+ * happen, so re-emitting it would only produce a second, harder-to-read error.
+ *
+ * Both accepted spellings are normalised to `--profile <name>`, mirroring how
+ * `environmentArgs` is rebuilt rather than copied.
+ */
+function resolveExplicitProfileArgs(argv: readonly string[]): string[] {
+  let previousWasFlag = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === undefined) continue;
+    if (argument === '--') break;
+    if (argument === PROFILE_OPTION) {
+      const value = argv[index + 1];
+      // `mcode --profile --model x`: a following flag is not a profile name.
+      return isValidProfileName(value) ? [PROFILE_OPTION, value] : [];
+    }
+    if (argument.startsWith(`${PROFILE_OPTION}=`)) {
+      const value = argument.slice(PROFILE_OPTION.length + 1);
+      return isValidProfileName(value) ? [PROFILE_OPTION, value] : [];
+    }
+    // The prompt is the first bare token that does not belong to a preceding
+    // option, so `--env test --profile work` still resolves the profile. A
+    // following `--` already ended the option scan above.
+    if (!argument.startsWith('-') && !previousWasFlag) break;
+    previousWasFlag = argument.startsWith('-');
+  }
+  return [];
 }
 
 function isNodeExecutable(executable: string): boolean {

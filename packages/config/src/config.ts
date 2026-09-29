@@ -47,6 +47,7 @@ import {
   type AgentRuntimeConfig,
 } from "./agent-runtime-config.js";
 import { resolveDataDir } from "./data-dir.js";
+import { normalizeProfileSelector, readProfileEnv } from "./auth-profile.js";
 import type { ProviderAuthMode } from "./provider-auth-mode.js";
 import { parseAgentsConfig, type AgentsConfig } from "./agent-capabilities.js";
 import {
@@ -1217,21 +1218,51 @@ function runtimeEnv(suffix: string): string | undefined {
     : undefined;
 }
 
+/**
+ * Read a root option value out of `process.argv`.
+ *
+ * This runs before commander parses anything, because the data directory and
+ * the identity it selects must be known that early. Two rules keep it
+ * consistent with commander:
+ *
+ * - Scanning stops at `--`. Everything after it is positional text, so
+ *   `mcode exec -- --profile work` passes a prompt, it does not select a
+ *   profile.
+ * - The **last** occurrence wins, matching commander's default. Returning the
+ *   first would let `--profile work --profile personal` start in one account
+ *   while commander reports the other.
+ */
 function cliArgValue(name: string): string | undefined {
   const flag = `--${name}`;
+  let value: string | undefined;
   for (let i = 2; i < process.argv.length; i++) {
     const arg = process.argv[i];
-    if (arg === flag) return process.argv[i + 1];
-    if (arg?.startsWith(`${flag}=`)) return arg.slice(flag.length + 1);
+    if (arg === "--") break;
+    if (arg === flag) {
+      const next = process.argv[i + 1];
+      // A following flag is not this option's value. Report it as missing
+      // rather than passing `--env` down as a profile name and failing
+      // validation with a misleading message.
+      value = next === undefined || next.startsWith("-") ? undefined : next;
+      i++;
+      continue;
+    }
+    if (arg?.startsWith(`${flag}=`)) {
+      const inline = arg.slice(flag.length + 1);
+      value = inline.length > 0 ? inline : undefined;
+    }
   }
-  return undefined;
+  return value;
 }
 
 function hasCliFlag(name: string): boolean {
   const flag = `--${name}`;
-  return process.argv
-    .slice(2)
-    .some((arg) => arg === flag || arg.startsWith(`${flag}=`));
+  for (let i = 2; i < process.argv.length; i++) {
+    const arg = process.argv[i];
+    if (arg === "--") return false;
+    if (arg === flag || arg?.startsWith(`${flag}=`)) return true;
+  }
+  return false;
 }
 
 export const DEFAULT_PORT = 5321;
@@ -1330,9 +1361,19 @@ function shouldUseGitAutoConfig(): boolean {
   return true;
 }
 
+/**
+ * Resolve the explicitly requested profile from `--profile`, `MINIMAX_PROFILE`,
+ * or the gated legacy runtime variable.
+ *
+ * A non-blank selector is validated rather than sanitised. The value becomes a
+ * directory segment, so an unusable name must fail loudly instead of silently
+ * resolving to the default profile and its credentials.
+ *
+ * @throws {InvalidProfileNameError}
+ */
 function getExplicitProfileEnv(): string | null {
-  const profile = cliArgValue("profile") ?? runtimeEnv("PROFILE");
-  return profile && profile.length > 0 ? profile : null;
+  const profile = cliArgValue("profile") ?? readProfileEnv() ?? runtimeEnv("PROFILE");
+  return normalizeProfileSelector(profile);
 }
 
 function getExplicitPortEnv(): number | null {

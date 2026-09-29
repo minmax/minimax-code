@@ -133,6 +133,9 @@
       "@mavis/config": [
         "./packages/config/src/index.ts"
       ],
+      "@mavis/config/auth-profile": [
+        "./packages/config/src/auth-profile.ts"
+      ],
       "@mavis/config/cu-backend": [
         "./packages/config/src/cu-backend.ts"
       ],

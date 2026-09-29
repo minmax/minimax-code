@@ -12,6 +12,7 @@ import { tuiErrorDiagnostic } from '../user-facing-failure.js';
 import { configureTuiNetworkProxy } from './network-proxy.js';
 import { consumeLoginRestartHandoff } from '../tui/login-restart-handoff.js';
 import type { McodeTelemetryCliAction } from './telemetry-command.js';
+import type { McodeProfileCliRequest } from './profile-command.js';
 
 const OUTPUT_DRAIN_TIMEOUT_MS = 250;
 const MINIMAX_CODE_PROCESS_TITLE = 'minimax-code';
@@ -71,6 +72,10 @@ export interface RunTuiCliDependencies {
   readonly runTelemetry?: (
     action: McodeTelemetryCliAction,
     version: string,
+    environment: NodeJS.ProcessEnv,
+  ) => Promise<string> | string;
+  readonly runProfile?: (
+    request: McodeProfileCliRequest,
     environment: NodeJS.ProcessEnv,
   ) => Promise<string> | string;
   readonly configureNetworkProxy?: typeof configureTuiNetworkProxy;
@@ -168,6 +173,11 @@ export async function runTuiCli(dependencies: RunTuiCliDependencies = {}): Promi
       runTelemetry: async (action) => {
         const runTelemetry = dependencies.runTelemetry ?? defaultRunTelemetry;
         processRef.stdout.write(await runTelemetry(action, MINIMAX_CODE_VERSION, processRef.env));
+        completedCommandExitMode = 'natural';
+      },
+      runProfile: async (request) => {
+        const runProfile = dependencies.runProfile ?? defaultRunProfile;
+        processRef.stdout.write(`${await runProfile(request, processRef.env)}\n`);
         completedCommandExitMode = 'natural';
       },
     }).parseAsync(processRef.argv, { from: 'node' });
@@ -309,4 +319,12 @@ async function defaultRunTelemetry(
 ): Promise<string> {
   const { runMcodeTelemetryCommand } = await import('./telemetry-command.js');
   return runMcodeTelemetryCommand(action, version, { environment });
+}
+
+async function defaultRunProfile(
+  request: McodeProfileCliRequest,
+  environment: NodeJS.ProcessEnv,
+): Promise<string> {
+  const { runMcodeProfileCommand } = await import('./profile-command.js');
+  return runMcodeProfileCommand({ request, environment });
 }
