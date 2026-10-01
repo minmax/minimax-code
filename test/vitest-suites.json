@@ -5,6 +5,7 @@
       "test/windows-contract.test.mjs"
     ],
     "capability": [
+      "packages/local-runtime-v2/test/integration/compaction-openai-transport.integration.test.ts",
       "packages/local-runtime/test/unit/skill-directory-symlinks.test.ts",
       "packages/agent-core/test/unit/bash-subprocess-env.test.ts",
       "packages/agent-modules/permission/test/unit/permission/bash-policy-regressions.test.ts",
@@ -88,7 +89,6 @@
       "packages/tui/test/unit/tui-chat-controller.test.ts",
       "packages/tui/test/unit/tui-duration.test.ts",
       "packages/tui/test/unit/tui-engine-local-deltas.test.ts",
-      "packages/tui/test/unit/tui-scrollback-stability.test.ts",
       "packages/tui/test/unit/tui-ime-cursor.test.ts",
       "packages/tui/test/unit/tui-scrollbar-interaction.test.ts",
       "packages/tui/test/unit/tui-image-preview.test.ts",
@@ -102,6 +102,8 @@
       "packages/tui/test/unit/tui-thinking-preview.test.ts",
       "packages/tui/test/unit/tui-transcript-presentation.test.ts",
       "packages/tui/test/unit/tui-transcript-view.test.ts",
+      "packages/tui/test/unit/tui/transcript/panel-literal-user-text.test.ts",
+      "packages/tui/test/unit/tui/transcript/presentation/literal-text.test.ts",
       "packages/tui/test/unit/tui-workspace-status-line.test.ts",
       "packages/tui/test/unit/tui/controller/product/model-state.test.ts",
       "packages/tui/test/unit/tui/features/composer/attachments.test.ts",
@@ -156,6 +158,7 @@
       "packages/tui/test/unit/tui/controller/product/chrome-flow.test.ts",
       "packages/tui/test/unit/tui/controller/product/command-flow.test.ts",
       "packages/tui/test/unit/tui/controller/product/feature-flow.test.ts",
+      "packages/tui/test/unit/tui/controller/runtime/runtime-event-flow-stale-run.test.ts",
       "packages/tui/test/unit/tui/controller/run/turn-submission-retainer.test.ts",
       "packages/tui/test/unit/tui/features/settings/hotkeys-picker.test.ts",
       "packages/tui/test/unit/incident-reporter-privacy.test.ts",

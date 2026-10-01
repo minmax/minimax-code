@@ -82,6 +82,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
   const transcriptView = new TranscriptView(transcriptVisibility, {
     displayModes: new TranscriptPresentationController(),
     workspaceDir: options.workspaceDir,
+    appendOnly: () => renderer.mode === 'regular',
   });
   const editor = createEditor(tui, workspaceRoots, options.runtime);
   let draftLifecycle: TuiDraftLifecycle | undefined;
@@ -400,8 +401,8 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
       if (!userCell) return; // runtime-owned or retry-continuation turns
       // A second Esc in the settle window can reach the runtime-owned branch
       // with the same turnId; track restored turns so a repeat concatenates
-      // nothing. (Cell status cannot key this: abort-time markTurn also
-      // cancels still-pending user cells before the first restore.)
+      // nothing. (Track by turn rather than by cell status, which the runtime
+      // echo and the restore path both update.)
       if (restoredAbortTurnIds.has(turnId)) return;
       const hasIrreversibleActivity = cells.some((cell) => {
         if (cell.id === `user:${turnId}`) return false;
@@ -823,7 +824,12 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     activePermission: () => Boolean(interactionFlow.permission()),
     activeQuestionnaire: () => Boolean(interactionFlow.questionnaire()),
     agentInteraction: () => interactionFlow.agentReadback(),
-    ...(agentStatusEnabled ? { agentCounts: () => delegationFlow.agentCounts() } : {}),
+    ...(agentStatusEnabled
+      ? {
+          agentCounts: () => delegationFlow.agentCounts(),
+          backgroundTaskCount: () => delegationFlow.backgroundTaskCount(),
+        }
+      : {}),
     attachmentCount: () =>
       composerDraft.snapshot().attachments.length +
       sessionMutationFlow.retainedEditAttachments().length,

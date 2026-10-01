@@ -220,13 +220,13 @@ export class TuiSurfaceHost implements Component {
     else this.chatComponent.invalidate();
   }
 
-  getScrollbackLayout() {
-    return this.currentMode() === 'regular' ? this.chatComponent.getScrollbackLayout?.() : undefined;
-  }
-
   getViewportLayoutKey(): string | undefined {
     const key = this.chatComponent.getViewportLayoutKey?.();
     return key === undefined ? undefined : JSON.stringify([this.activeFeature()?.screen.id, key]);
+  }
+
+  takeDiscardedRows(): number {
+    return this.chatComponent.takeDiscardedRows?.() ?? 0;
   }
 
   render(width: number): string[] {
