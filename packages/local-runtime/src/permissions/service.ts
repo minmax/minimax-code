@@ -238,6 +238,10 @@ function toRuntimeConfig(local: LocalRuntimeConfig): Config {
         local.permission?.userConfirmationEnabled ??
         getConfig().permission?.userConfirmationEnabled ??
         true,
+      dangerousCommandGateEnabled:
+        local.permission?.dangerousCommandGateEnabled ??
+        getConfig().permission?.dangerousCommandGateEnabled ??
+        true,
     },
     beta: { ...(local.beta ?? {}), promptOverride: local.beta?.promptOverride ?? false },
     provider: local.provider,

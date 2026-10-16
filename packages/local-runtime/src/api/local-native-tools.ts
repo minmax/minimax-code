@@ -22,6 +22,7 @@ import {
 } from "@mavis/agent-tools/desktop";
 import { MatrixWebSearchToolDef } from "@mavis/agent-tools";
 import {
+  getConfig,
   resolveAgentCapabilities,
   type AgentBuiltinMcpToolId,
   type AgentBuiltinSkillId,
@@ -65,6 +66,17 @@ export function buildLocalNativeRuntimeTools(input: {
   dataDir?: string;
   workspaceRoot: string;
   agentName: string;
+  /**
+   * Session classification of the Turn these tools are built for.
+   *
+   * `'task'` marks an unattended sub-agent Session. The destructive-delete
+   * guard consults it so the main window can relax deletes for itself while
+   * every sub-agent keeps the recoverable-delete `rm` shim on its PATH.
+   * Absent is treated as a sub-agent for the same reason the permission layer
+   * treats an unknown scope as one: an unidentified origin must not inherit
+   * the main window's relaxed guard.
+   */
+  sessionKind?: string;
   excludeAgentResources?: boolean;
   expectedAgentInstanceId?: string;
   skipAgentResolution?: boolean;
@@ -194,7 +206,22 @@ export function buildLocalNativeRuntimeTools(input: {
       bashAdapter: input.bashAdapter,
       sandboxOperationsFactory: input.sandboxOperationsFactory,
       hostTrashRuntime: buildLocalHostTrashRuntime(input),
-      bashEnvPolicy: resolveAgentBashEnvPolicy(input.dataDir),
+      bashEnvPolicy: resolveAgentBashEnvPolicy(
+        input.dataDir,
+        undefined,
+        // The shim is the PATH half of the destructive-delete guard, so it
+        // reads the same flag live per launch: toggling the guard takes effect
+        // on the next command, and only an explicit `false` stops shadowing `rm`.
+        //
+        // Scoped exactly like the permission verdict: a sub-agent Session keeps
+        // the shim even when the main window disabled the guard. Without this
+        // the two layers would disagree — the permission layer would allow the
+        // delete and PATH would still route `rm` into the trash.
+        () =>
+          input.sessionKind !== undefined &&
+          input.sessionKind !== 'task' &&
+          getConfig().permission?.dangerousCommandGateEnabled !== false,
+      ),
       webFetchAdapter,
       webSearchAdapter,
       taskAdapter: input.taskAdapter,
@@ -279,6 +306,7 @@ export async function buildLocalTurnToolSources(
     dataDir: input.dataDir,
     workspaceRoot: input.workspaceRoot,
     agentName: input.agentName,
+    sessionKind: input.sessionKind,
     ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),
     ...(input.expectedAgentInstanceId
       ? { expectedAgentInstanceId: input.expectedAgentInstanceId }

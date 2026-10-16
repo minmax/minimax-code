@@ -738,6 +738,18 @@ function createPeripheralApplication(
         readLocalPermissionMode(host.apiHost.configGetter().permissionMode),
       setPermissionMode: ({ mode }) =>
         host.apiHost.setProcessLocalPermissionMode(mode),
+      getDangerousCommandGateEnabled: async () =>
+        host.apiHost.configGetter().permission?.dangerousCommandGateEnabled !==
+        false,
+      setDangerousCommandGateEnabled: ({ enabled }) =>
+        host.apiHost.setProcessLocalDangerousCommandGateEnabled(enabled),
+      // `undefined` means this host runs no sandbox service, so the caller has
+      // to say so rather than fall back to the config value: a host without a
+      // sandbox does not enforce any level, and reporting one would be a lie.
+      getSandboxFilesystemMode: async () =>
+        host.apiHost.getProcessLocalSandboxFilesystemMode(),
+      setSandboxFilesystemMode: ({ mode }) =>
+        host.apiHost.setProcessLocalSandboxFilesystemMode(mode),
     },
     backgroundTasks: {
       list: async ({

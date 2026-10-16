@@ -41,6 +41,20 @@ export interface PermissionConfig {
    * false so an ASK decision fails closed instead of waiting forever.
    */
   userConfirmationEnabled: boolean;
+
+  /**
+   * Whether the destructive-delete guard is enforced.
+   *
+   * Default `true`. When `false`, delete-shaped commands (`rm`, `rmdir`, `del`,
+   * `unlink`, `shred`, `mavis-trash`, …) are no longer asked about, hard-blocked
+   * or rewritten to the recoverable trash launcher, and the `rm` PATH shim is not
+   * installed for agent bash — so a delete runs exactly as written and is NOT
+   * recoverable.
+   *
+   * This is an explicit, user-owned opt-out of an irreversibility safety net,
+   * so it must stay opt-in: an absent or malformed value keeps the guard on.
+   */
+  dangerousCommandGateEnabled: boolean;
 }
 
 export const PERMISSION_CONFIG_DEFAULTS: PermissionConfig = {
@@ -48,6 +62,7 @@ export const PERMISSION_CONFIG_DEFAULTS: PermissionConfig = {
   storageWriteVersion: 2,
   classifierTimeoutMs: 60_000,
   userConfirmationEnabled: true,
+  dangerousCommandGateEnabled: true,
 };
 
 /**
@@ -83,5 +98,15 @@ export function parsePermissionConfig(
     typeof obj.userConfirmationEnabled === 'boolean'
       ? obj.userConfirmationEnabled
       : defaults.userConfirmationEnabled;
-  return { policyOwner, storageWriteVersion, classifierTimeoutMs, userConfirmationEnabled };
+  const dangerousCommandGateEnabled =
+    typeof obj.dangerousCommandGateEnabled === 'boolean'
+      ? obj.dangerousCommandGateEnabled
+      : defaults.dangerousCommandGateEnabled;
+  return {
+    policyOwner,
+    storageWriteVersion,
+    classifierTimeoutMs,
+    userConfirmationEnabled,
+    dangerousCommandGateEnabled,
+  };
 }

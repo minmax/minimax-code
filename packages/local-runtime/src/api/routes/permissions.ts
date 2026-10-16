@@ -196,6 +196,10 @@ export async function beforeLocalToolCall(
     input: toolArgs,
     agentName: session.agentName,
     sessionId: session.sessionId,
+    // The delete guard follows the Session, not the config: only the human's
+    // main window may relax it. A task Session runs unattended, so it keeps
+    // the recoverable-delete net no matter what the main window is set to.
+    sessionScope: session.sessionKind === 'task' ? 'subagent' : 'main',
     permissionModeOverride: permissionMode,
   });
   const executionPlan = readDecisionExecutionPlan(decision, toolArgs);

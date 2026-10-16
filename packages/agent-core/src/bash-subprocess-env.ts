@@ -45,6 +45,18 @@ export interface BashEnvPolicy {
    */
   prependPath?: readonly string[];
   /**
+   * Live alternative to {@link BashEnvPolicy.prependPath}, resolved once per
+   * bash subprocess launch. Lets a host-owned runtime toggle add or drop a shim
+   * directory without rebuilding the policy, which matters for the
+   * recoverable-delete `rm` shim: a user-facing switch must take effect on the
+   * next command, not on the next process start.
+   *
+   * Takes precedence over `prependPath` when present. Same contract: absolute
+   * directories only, and a callback rather than data so agent-core keeps no
+   * filesystem knowledge of what those directories contain.
+   */
+  resolvePrependPath?: () => readonly string[] | undefined;
+  /**
    * Host-injected gate that runs before every bash subprocess launch; throwing
    * blocks the spawn. The desktop runtime uses it to verify — and re-seed when
    * possible — the recoverable-delete `rm` shim, so a lost shim fails the
@@ -183,6 +195,7 @@ export function resolveBashEnvPolicy(
     mode,
     ...(overrides?.allowlist ? { allowlist: overrides.allowlist } : {}),
     ...(overrides?.prependPath ? { prependPath: overrides.prependPath } : {}),
+    ...(overrides?.resolvePrependPath ? { resolvePrependPath: overrides.resolvePrependPath } : {}),
     ...(overrides?.spawnPreflight ? { spawnPreflight: overrides.spawnPreflight } : {}),
   };
 }
@@ -218,7 +231,7 @@ export function sanitizeBashSubprocessEnv(
   }
 
   removed.sort();
-  applyPathPrefix(out, policy.prependPath);
+  applyPathPrefix(out, policy.resolvePrependPath?.() ?? policy.prependPath);
   return { env: out, removed };
 }
 

@@ -27,6 +27,16 @@ export type CreatePermissionExecutionPlanInput = Pick<
   shell?: ShellFamily;
   context?: Pick<PermissionEvaluationInput['context'], 'workingDirectory' | 'homeDir'>;
   rewrittenInput?: Readonly<Record<string, unknown>>;
+  /**
+   * Whether a delete intent must be backed by a recoverable-delete transform.
+   *
+   * Defaults to true: allowing a delete without a recoverable transform is the
+   * bug this invariant exists to catch. The single legitimate exception is a
+   * user who has explicitly disabled the destructive-delete guard — that
+   * delete is *meant* to run unrecoverably, so the caller passes `false` to
+   * say so rather than smuggling the exception past the check.
+   */
+  requireRecoverableDelete?: boolean;
 };
 
 /** Build the complete immutable plan consumed by production permission gates. */
@@ -43,6 +53,7 @@ export function createPermissionExecutionPlan(
   return validatePermissionExecutionPlan(
     { originalInput, effectiveInput, intents, transforms },
     originalInput,
+    { requireRecoverableDelete: input.requireRecoverableDelete ?? true },
   );
 }
 
@@ -95,6 +106,7 @@ export function inferPermissionCommandIntents(
 export function validatePermissionExecutionPlan(
   value: unknown,
   expectedOriginalInput: Readonly<Record<string, unknown>>,
+  options: { requireRecoverableDelete?: boolean } = {},
 ): Readonly<ExecutionPlan> {
   const plan = readRecord(value, 'Permission execution plan must be an object.');
   const originalInput = readRecord(
@@ -124,7 +136,13 @@ export function validatePermissionExecutionPlan(
     throw new TypeError('Permission execution plan effective input must be complete.');
   }
 
-  validateTransformConsistency(originalSnapshot, effectiveSnapshot, intents, transforms);
+  validateTransformConsistency(
+    originalSnapshot,
+    effectiveSnapshot,
+    intents,
+    transforms,
+    options.requireRecoverableDelete ?? true,
+  );
   const metadata = snapshotPermissionInput({ intents, transforms });
   return Object.freeze({
     originalInput: originalSnapshot as Record<string, unknown>,
@@ -260,13 +278,14 @@ function validateTransformConsistency(
   effectiveInput: Readonly<Record<string, unknown>>,
   intents: readonly CommandIntent[],
   transforms: readonly ExecutionTransform[],
+  requireRecoverableDelete: boolean,
 ): void {
   const changed = !permissionValuesEqual(originalInput, effectiveInput);
   const deleteIntents = intents.filter(
     (intent): intent is Extract<CommandIntent, { kind: 'filesystem' }> =>
       intent.kind === 'filesystem' && intent.action === 'delete',
   );
-  if (deleteIntents.length > 0 && transforms.length === 0) {
+  if (requireRecoverableDelete && deleteIntents.length > 0 && transforms.length === 0) {
     throw new TypeError('Delete execution plan requires a recoverable-delete transform.');
   }
   if (changed && transforms.length === 0) {

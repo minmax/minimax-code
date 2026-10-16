@@ -29,6 +29,13 @@
  * deletion stays on the existing host-side launcher there.
  *
  * Idempotent: only rewrites when the on-disk content differs.
+ *
+ * The shim is a runtime toggle, not a constant. When the user disables the
+ * destructive-delete guard (`permission.dangerousCommandGateEnabled: false`)
+ * the shim must stop being installed as well, because the permission layer
+ * stopping to rewrite `rm` is not enough on its own: PATH resolution would
+ * still route the command here. Both layers move together, so "the guard is
+ * off" always means the same thing.
  */
 import { accessSync, chmodSync, constants, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -78,17 +85,24 @@ export function resolveRmShimDir(dataDir: string): string {
  * A silent fall-through to `/bin/rm` is never possible. Without a dataDir
  * there is no shim to install, and Windows never uses the shim (see
  * `ensureRmShim`), so both return the shared resolver unchanged.
+ *
+ * `isGuardEnabled` is consulted per launch rather than captured, so toggling the
+ * destructive-delete guard takes effect on the next command instead of on the
+ * next process start. It is fail-closed: anything but an explicit `false` keeps
+ * the shim active.
  */
 export function resolveAgentBashEnvPolicy(
   dataDir?: string,
   platform: NodeJS.Platform = process.platform,
+  isGuardEnabled: () => boolean = () => true,
 ): BashEnvPolicy {
   if (!dataDir || platform === 'win32') return resolveBashEnvPolicy({});
   const shimDir = resolveRmShimDir(dataDir);
   const shimPath = path.join(shimDir, 'rm');
   return resolveBashEnvPolicy({
-    prependPath: [shimDir],
+    resolvePrependPath: () => (isGuardEnabled() ? [shimDir] : undefined),
     spawnPreflight: () => {
+      if (!isGuardEnabled()) return;
       try {
         accessSync(shimPath, constants.X_OK);
         return;

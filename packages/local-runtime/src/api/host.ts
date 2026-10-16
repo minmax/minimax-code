@@ -12,7 +12,7 @@ import type {
   PiLLMRequestObserver,
 } from "@mavis/agent-core/pi-turn-runner";
 import type { AgentMessage } from "@mavis/agent-core/protocol/agent-message";
-import { getConfig } from "@mavis/config";
+import { getConfig, type SandboxFilesystemMode } from "@mavis/config";
 import type { RuntimeConversation } from "@mavis/conversation-contract";
 import type { CronStorePort } from "@mavis/cron";
 import type { GlobalEventInput } from "@mavis/shared/global-events";
@@ -303,6 +303,20 @@ export class LocalRuntimeApiHost {
   ) => Promise<boolean> | boolean;
   /** Read-only projection from the V2 Pin owner for legacy Session responses. */
   public readSessionPinned?: (sessionId: string) => Promise<boolean>;
+  /**
+   * Process-local sandbox control, late-bound by the V2 runtime once its
+   * `LocalSandboxService` exists (V1-only hosts leave it unset and run no
+   * sandbox at all).
+   *
+   * The service owns both halves on purpose. `read` must report what the
+   * service actually enforces rather than what the config file says, and
+   * `apply` has to go through the service because a bare config write would
+   * persist a mode that no invocation is restricted by until the next restart.
+   */
+  public readSandboxFilesystemMode?: () => SandboxFilesystemMode | undefined;
+  public applySandboxFilesystemMode?: (
+    mode: SandboxFilesystemMode,
+  ) => Promise<SandboxFilesystemMode>;
   private legacyRuntime: LegacyHistoryReader | undefined;
   private readonly legacyOpencodeEnabled: boolean | undefined;
   private readonly runtimeMode: LocalRuntimeMode;
@@ -1503,6 +1517,46 @@ export class LocalRuntimeApiHost {
       ).syncAcceptEditsSeed();
     }
     return config.permissionMode;
+  }
+
+  /**
+   * Applies the process-local destructive-delete guard toggle. Fail-closed on
+   * the way back out too: a config the updater leaves without the field (or
+   * with a malformed one) still reports the enabled default, so the caller
+   * never renders "guard off" for a state that is not actually off.
+   */
+  public async setProcessLocalDangerousCommandGateEnabled(
+    enabled: boolean,
+  ): Promise<boolean> {
+    const { config } = await this.configUpdater({
+      field: "permission.dangerousCommandGateEnabled",
+      set: enabled,
+    });
+    return config.permission?.dangerousCommandGateEnabled !== false;
+  }
+
+  /**
+   * The filesystem level the sandbox service currently enforces, or
+   * `undefined` when this host runs no sandbox. Reporting a mode nothing
+   * enforces would let the UI claim a restriction that is not in effect, so
+   * "absent" is passed through instead of defaulted to the config value.
+   */
+  public getProcessLocalSandboxFilesystemMode(): SandboxFilesystemMode | undefined {
+    return this.readSandboxFilesystemMode?.();
+  }
+
+  /**
+   * Switches the sandbox filesystem level. Refuses on a host without a sandbox
+   * service instead of falling back to a config write: that write would look
+   * applied while the running backend kept enforcing the previous policy.
+   */
+  public async setProcessLocalSandboxFilesystemMode(
+    mode: SandboxFilesystemMode,
+  ): Promise<SandboxFilesystemMode> {
+    if (!this.applySandboxFilesystemMode) {
+      throw new Error("Sandbox is not available in this host");
+    }
+    return this.applySandboxFilesystemMode(mode);
   }
 
   /** Redacted process-local diagnostics owned by this concrete Runtime host. */

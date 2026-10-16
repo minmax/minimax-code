@@ -641,6 +641,43 @@ export class CliService {
     ).setPermissionMode(input);
   }
 
+  getDangerousCommandGateEnabled() {
+    return this.requireCapability(
+      "configuration",
+      "Configuration",
+    ).getDangerousCommandGateEnabled();
+  }
+
+  setDangerousCommandGateEnabled(
+    input: Parameters<
+      NonNullable<
+        LocalRuntimeApplication["configuration"]
+      >["setDangerousCommandGateEnabled"]
+    >[0],
+  ) {
+    return this.requireCapability(
+      "configuration",
+      "Configuration",
+    ).setDangerousCommandGateEnabled(input);
+  }
+
+  getSandboxFilesystemMode() {
+    return this.requireCapability(
+      "configuration",
+      "Configuration",
+    ).getSandboxFilesystemMode();
+  }
+
+  setSandboxFilesystemMode(
+    input: Parameters<
+      NonNullable<LocalRuntimeApplication["configuration"]>["setSandboxFilesystemMode"]
+    >[0],
+  ) {
+    return this.requireCapability("configuration", "Configuration").setSandboxFilesystemMode(
+      input,
+    );
+  }
+
   listModels(
     input?: Parameters<
       NonNullable<LocalRuntimeApplication["models"]>["list"]

@@ -32,6 +32,23 @@ export function isDangerousTuiPermissionMode(mode: TuiPermissionMode): boolean {
   return mode === 'bypassPermissions';
 }
 
+/**
+ * Coerce a runtime guard read into a boolean, or `undefined` when the host
+ * does not own the setting.
+ *
+ * `undefined` is deliberately distinct from `true`: it lets the UI say "this
+ * host does not manage the delete guard" instead of claiming a protection that
+ * may not exist. Anything that is not an explicit boolean is treated as absent.
+ */
+export function normalizeDangerousCommandGateEnabled(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+export function formatTuiDeleteGuardLabel(enabled: boolean | undefined): string {
+  if (enabled === undefined) return 'Managed by host';
+  return enabled ? 'Recoverable' : 'Permanent';
+}
+
 export function nextTuiPermissionMode(current: TuiPermissionMode): TuiPermissionMode {
   if (current === 'off') return 'default';
   const currentIndex = MINIMAX_CODE_PERMISSION_MODES.indexOf(current);

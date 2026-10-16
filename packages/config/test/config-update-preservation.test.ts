@@ -185,3 +185,72 @@ describe("valid local config updates", () => {
     });
   });
 });
+
+describe("sandbox config writes", () => {
+  // Only the master switch and the filesystem level are user-facing. The rest
+  // of the sandbox tree (deny lists, network policy, local access) stays
+  // closed to the generic updater, so naming the two fields explicitly cannot
+  // quietly widen the gate to the whole `sandbox` root.
+  it.each([
+    ["sandbox.enabled", true],
+    ["sandbox.filesystem.policy.mode", "workspace_write"],
+  ])("writes %s", async (field, value) => {
+    await updateLocalConfigFile({ field, set: value });
+
+    const written = yaml.load(fs.readFileSync(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(JSON.stringify(written)).toContain(
+      field === "sandbox.enabled"
+        ? '"enabled":true'
+        : '"mode":"workspace_write"',
+    );
+  });
+
+  it("keeps the rest of an existing sandbox tree while writing one field", async () => {
+    fs.writeFileSync(
+      configPath,
+      yaml.dump({
+        sandbox: {
+          enabled: true,
+          filesystem: { denyWrite: ["/etc"] },
+        },
+      }),
+    );
+
+    await updateLocalConfigFile({
+      field: "sandbox.filesystem.policy.mode",
+      set: "delete_guard",
+    });
+
+    expect(yaml.load(fs.readFileSync(configPath, "utf8"))).toEqual({
+      sandbox: {
+        enabled: true,
+        filesystem: { policy: { mode: "delete_guard" }, denyWrite: ["/etc"] },
+      },
+    });
+  });
+
+  it.each([
+    ["sandbox.filesystem.policy.mode", "root"],
+    ["sandbox.filesystem.policy.mode", true],
+    ["sandbox.enabled", "yes"],
+  ])("rejects an invalid %s value", async (field, value) => {
+    await expect(updateLocalConfigFile({ field, set: value })).rejects.toThrow(
+      /Invalid sandbox\./,
+    );
+  });
+
+  it.each([
+    "sandbox",
+    "sandbox.filesystem.denyWrite",
+    "sandbox.filesystem.denyRead",
+    "sandbox.network.policy.mode",
+    "sandbox.localAccess",
+  ])("rejects %s", async (field) => {
+    await expect(
+      updateLocalConfigFile({ field, set: "anything" }),
+    ).rejects.toThrow(`Local runtime cannot update config field "${field}"`);
+  });
+});

@@ -220,6 +220,18 @@ export class LocalSandboxService {
     });
   }
 
+  /**
+   * The configuration the service is currently enforcing, as a copy.
+   *
+   * {@link applyConfig} replaces the whole sandbox tree, so a caller that
+   * changes one field has to rebuild the candidate from the live state: any
+   * part it leaves out falls back to a parser default instead of the user's
+   * configured value.
+   */
+  configSnapshot(): SandboxConfig {
+    return structuredClone(this.#config);
+  }
+
   observationSnapshot(): SandboxObservation {
     const state = this.#effectiveState.load();
     const status = this.status();

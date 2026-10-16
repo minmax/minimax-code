@@ -89,6 +89,34 @@ function readPermissionPolicyOwner(value: unknown): 'engine' | 'core' {
 }
 
 /**
+ * The destructive-delete guard is fail-closed: anything other than an explicit
+ * `false` keeps it enforced, so a malformed or partially-written config can
+ * never silently disarm an irreversibility safety net.
+ */
+function readDangerousCommandGateEnabled(value: unknown): boolean {
+  return value !== false;
+}
+
+/**
+ * Resolve whether the destructive-delete guard applies to THIS call.
+ *
+ * Two independent reasons to keep it on, and one to drop it:
+ *   - the config did not explicitly disable it (fail-closed), or
+ *   - the call did not come from the main Session, so the user's preference
+ *     does not transfer to an unattended sub-agent, or an origin that could
+ *     not be identified at all.
+ *
+ * Only the main Session with an explicit opt-out runs deletes unrecoverably.
+ */
+function resolveDeleteGuardEnforced(
+  config: { permission?: { dangerousCommandGateEnabled?: unknown } },
+  sessionScope: 'main' | 'subagent' | undefined,
+): boolean {
+  if (sessionScope !== 'main') return true;
+  return readDangerousCommandGateEnabled(config.permission?.dangerousCommandGateEnabled);
+}
+
+/**
  * Convert a structured decision reason into diagnostic fields. Bash
  * subcommands retain their command and safety detail so operators can explain
  * an allow/ask/deny without consulting messages.jsonl. Top-level filesystem
@@ -359,6 +387,19 @@ export interface LocalPermissionCheckParams {
   agentName?: string;
   sessionId?: string;
   permissionModeOverride?: PermissionMode;
+  /**
+   * Which Session this call belongs to.
+   *
+   * Only the main Session honours a disabled destructive-delete guard. A
+   * sub-agent runs unattended, so it always keeps the guard: relaxing it in
+   * the main window must not silently extend to code nobody is watching.
+   *
+   * Absent means the caller could not establish scope (for example the public
+   * `POST /permission/check` route, which only receives a Session id), and is
+   * treated as `'subagent'` so an unknown origin can never inherit the main
+   * window's relaxed guard.
+   */
+  sessionScope?: 'main' | 'subagent';
   latestUserMessages?: AgentMessageProtocol[];
   recentMessages?: AgentMessageProtocol[];
   /** Trusted owner-only capability; never populated from public HTTP input. */
@@ -471,6 +512,13 @@ export class LocalPermissionFacade {
           toolName: params.toolName,
           input: params.input,
           ...(gatedVerdict.rewrittenInput ? { rewrittenInput: gatedVerdict.rewrittenInput } : {}),
+          // A user who disabled the destructive-delete guard in the main
+          // window is asking for deletes that are deliberately NOT
+          // recoverable, so the plan must be allowed to describe an
+          // unrecoverable delete instead of rejecting every one of them.
+          // Sub-agent Sessions always keep the guard, so they still get the
+          // recoverable-delete plan they have always gotten.
+          requireRecoverableDelete: resolveDeleteGuardEnforced(config, params.sessionScope),
           shell: this.deps.shellFamily ?? 'unknown',
           context: {
             workingDirectory: await this.resolveWorkingDirectory(
@@ -538,6 +586,29 @@ export class LocalPermissionFacade {
     let workingDirectory: string | undefined;
 
     const command = readCommand(params.input);
+
+    // Explicit user opt-out of the destructive-delete guard. When it is off,
+    // a delete-shaped command is executed exactly as written: no ask, no
+    // hard-block, and no rewrite to the recoverable trash launcher. This is
+    // checked before every delete-specific safety net below (the native-delete
+    // health boundary, the `off`-mode carve-out and the engine ladder), because
+    // the point of the switch is that none of them apply any more.
+    const dangerousCommandGateEnabled = resolveDeleteGuardEnforced(
+      config,
+      params.sessionScope,
+    );
+    if (
+      !dangerousCommandGateEnabled &&
+      command !== undefined &&
+      isDeleteLikeCommand(command)
+    ) {
+      return {
+        behavior: 'allow',
+        reason:
+          'Allowed: the destructive-delete guard is disabled, so this delete runs as written and is not recoverable.',
+      };
+    }
+
     const windowsHardSafety = await this.evaluateWindowsHardSafety(params, platform, command);
     if (windowsHardSafety.denial) return windowsHardSafety.denial;
     const { recoverableNativeDelete } = windowsHardSafety;

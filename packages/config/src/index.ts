@@ -173,10 +173,12 @@ export {
 } from './sandbox-config.js';
 export type {
   SandboxConfig,
+  SandboxFilesystemMode,
   SandboxFilesystemPolicy,
   SandboxLocalAccess,
   SandboxNetworkPolicy,
 } from './sandbox-config.js';
+export { SANDBOX_FILESYSTEM_MODE_NAMES } from './sandbox-settings.js';
 export {
   AGENT_BUILTIN_MCP_TOOL_IDS,
   AGENT_BUILTIN_SKILL_IDS,
