@@ -111,6 +111,26 @@ describe('headless invocation', () => {
     expect(readStdin).not.toHaveBeenCalled();
   });
 
+  it('opts only new exec Sessions into lightweight mode', async () => {
+    const cwd = await workspace();
+    const readStdin = vi.fn(async () => 'ignored');
+
+    await expect(
+      resolveTuiExecInvocation('hi', { cwd, mode: 'lightweight' }, readStdin),
+    ).resolves.toMatchObject({ contextMode: 'lightweight' });
+    await expect(
+      resolveTuiExecInvocation('hi', { cwd, mode: 'standard' }, readStdin),
+    ).resolves.not.toHaveProperty('contextMode');
+    for (const options of [
+      { cwd, mode: 'lightweight', session: 'existing' },
+      { cwd, mode: 'lightweight', continue: true },
+    ]) {
+      await expect(resolveTuiExecInvocation('hi', options, readStdin)).rejects.toThrow(
+        'requires a new Session',
+      );
+    }
+  });
+
   it('accepts JSON stdin and rejects prompt/source conflicts', async () => {
     const cwd = await workspace();
     await expect(
@@ -375,6 +395,8 @@ describe('headless invocation', () => {
     ['30s', 30_000],
     ['2m', 120_000],
     ['1H', 3_600_000],
+    ['600h', 2_160_000_000],
+    ['2147483648ms', 2_147_483_648],
   ] as const)('parses timeout %s as %i milliseconds', async (timeout, timeoutMs) => {
     const cwd = await workspace();
     await expect(
@@ -463,3 +485,54 @@ describe('Prompt mode selection', () => {
     ).rejects.toThrow('--prompt-mode must be one of');
   });
 });
+describe('System prompt overrides', () => {
+  it('resolves overrides for exec and exec review', async () => {
+    const cwd = await workspace();
+    await writeFile(join(cwd, 'append.md'), 'appended from file');
+    await expect(
+      resolveTuiExecInvocation(
+        'hello',
+        { cwd, systemPrompt: 'custom identity', appendSystemPromptFile: join(cwd, 'append.md') },
+        async () => '',
+      ),
+    ).resolves.toMatchObject({
+      systemPromptOverrides: {
+        customPrompt: 'custom identity',
+        appendSystemPrompt: 'appended from file',
+      },
+    });
+    await expect(
+      resolveTuiExecInvocation(
+        undefined,
+        { review: true, cwd, appendSystemPrompt: 'review rules' },
+        async () => '',
+      ),
+    ).resolves.toMatchObject({ systemPromptOverrides: { appendSystemPrompt: 'review rules' } });
+  });
+
+  it('omits overrides when no prompt flag is present', async () => {
+    const invocation = await resolveTuiExecInvocation('hello', {}, async () => '');
+    expect(invocation).not.toHaveProperty('systemPromptOverrides');
+  });
+
+  it('reports invalid prompt sources as invocation errors', async () => {
+    await expect(
+      resolveTuiExecInvocation(
+        'hello',
+        { systemPrompt: 'a', systemPromptFile: 'b.md' },
+        async () => '',
+      ),
+    ).rejects.toMatchObject({
+      kind: 'invocation',
+      message: '--system-prompt and --system-prompt-file cannot be combined.',
+    });
+    await expect(
+      resolveTuiExecInvocation(
+        undefined,
+        { review: true, appendSystemPromptFile: '/definitely/missing/append.md' },
+        async () => '',
+      ),
+    ).rejects.toMatchObject({ kind: 'invocation' });
+  });
+});
+

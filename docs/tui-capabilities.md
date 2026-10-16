@@ -1,6 +1,6 @@
 # TUI capability coverage
 
-The current capability target is **TUI 0.4.12**; see [version and evidence baseline](open-source-status.md#version-and-evidence-baseline) for the separate workspace and embedded-tool versions. “Restored” below describes implementation and assembly, not acceptance of every account or online service.
+The current capability target is **TUI 0.6.3**; see [version and evidence baseline](open-source-status.md#version-and-evidence-baseline) for the separate workspace and embedded-tool versions. “Restored” below describes implementation and assembly, not acceptance of every account or online service.
 
 ## Output speed
 
@@ -18,8 +18,23 @@ observed generation window, not server hardware throughput.
 
 ## Terminal titles and notifications
 
+The interactive TUI also reports [OSC 7501 program status](https://www.superlogical.com/rex/docs/build/program-status)
+with `app=mcode`: idle, working, done, error, or blocked on permission, a question,
+or login. It reuses the current session's runtime status, including queue handoffs,
+compaction and retries, and does not depend on status line items. Cancellation and
+suspension report idle; resume reapplies the current status. Completed and failed
+results remain reported when the TUI exits. Reports contain only `state`, `kind` and
+`app`, and are sent on changes, without a heartbeat or capability query, as
+permitted by protocol revision 0.4. Supporting terminals decide how to display
+them; other terminals should ignore the sequence. The protocol treats each
+multiplexer pane as its own terminal, so MCode does not wrap reports for tmux
+passthrough; the multiplexer must implement OSC 7501 for its panes. Redirected
+output, headless exec and ACP do not emit these reports. Set
+`tui.programStatus: false` to disable them. Existing title and notification
+settings remain independent of program status.
+
 Terminal titles show the current state, session name and MCode, for example
-`Needs approval | Fix login | MCode`. Renaming or switching a session updates the
+`Needs approval | Fix login | MCode`, or `Needs login` while sign-in is required. Renaming or switching a session updates the
 title. Unnamed sessions use the project name and a short session ID. Titles are
 cleared when MCode exits or suspends and reapplied when it resumes.
 
@@ -28,6 +43,7 @@ Configure these presentation settings in the MCode data directory's `config.yaml
 ```yaml
 tui:
   terminalTitle: [status, session-name, app-name]
+  programStatus: true
   notifications:
     when: unfocused
     method: auto
@@ -61,7 +77,7 @@ terminal-tab indicator, not a guarantee of a desktop notification. See the
 Inside tmux, OSC notifications require passthrough and support from the outer
 terminal; use `method: bel` for a bell fallback.
 
-The evidence column summarizes the historical TUI 0.3.11 restoration record from 2026-09-11. It does not claim fresh TUI 0.4.12 live-service acceptance. Use [current verification status](verification.md#current-source-verification-status) for checks run against the updated source and explicit NOT RUN boundaries.
+The evidence column summarizes the historical TUI 0.3.11 restoration record from 2026-09-11. It does not claim fresh TUI 0.6.3 live-service acceptance. Use [current verification status](verification.md#current-source-verification-status) for checks run against the updated source and explicit NOT RUN boundaries.
 
 | Capability | Implementation | Evidence |
 | --- | --- | --- |
@@ -79,6 +95,20 @@ The evidence column summarizes the historical TUI 0.3.11 restoration record from
 | Model catalog | Online catalog and bundled snapshot fallback restored | Actual build boundary checks and offline startup; online catalog contents not accepted |
 | Files, shell, subagents, sessions, headless, ACP | Actual runtime retained | BYOK, file reads, session resume, ACP, sandbox, and status protocol tests |
 | Built-in skills, MCP, plugin tools | Original TUI assets and activation conditions retained | Asset build, plugin, and MCP tests; no claim that every skill has passed a real task |
+
+## Model request timeouts
+
+Each model request attempt has a first-response bound: if the provider accepts
+the request but sends no response within 300 seconds, the attempt is aborted
+and reported as a retryable timeout, so the normal model-request retry runs
+instead of waiting for the 20-minute overall request limit. 300 seconds matches
+the transport's previous effective wait for response headers. After the first
+response event, a stream that stays silent for 300 seconds is failed the same
+way; once visible output has started, the turn fails rather than retrying.
+Override the bounds in milliseconds with `MCODE_LLM_FIRST_EVENT_TIMEOUT_MS` and
+`MCODE_LLM_STREAM_IDLE_TIMEOUT_MS`; `0` disables a bound. Embedding hosts can
+also set `firstEventTimeoutMs` and `streamIdleTimeoutMs` per model. The timeout error names
+the setting that fired. The 20-minute overall request limit still applies.
 
 ## Local Bash execution
 
@@ -160,7 +190,7 @@ Website deployment tools and routes follow the original tool set. Successful dep
 
 ## Release boundary
 
-Production client paths are restored without internal registries or test-service addresses as build dependencies. Real account behavior, quota, billing, model quality, media generation, and deployment require separate acceptance. Mocks, protocol fixtures, successful builds, and the source import do not replace that evidence. Public npm `latest` was 0.4.12 on 2026-09-18; that metadata observation does not validate the installed package or deploy a backend. See [verification records](verification.md) and the historical [release audit](release-audit.md) for recorded acceptance results.
+Production client paths are restored without internal registries or test-service addresses as build dependencies. Real account behavior, quota, billing, model quality, media generation, and deployment require separate acceptance. Mocks, protocol fixtures, successful builds, and the source import do not replace that evidence. Public npm `latest` was 0.6.9 on 2026-10-13; that metadata observation does not validate the installed package or deploy a backend. See [verification records](verification.md) and the historical [release audit](release-audit.md) for recorded acceptance results.
 
 ## Diagnostic upload privacy
 
@@ -174,8 +204,43 @@ Every collected diagnostic artifact, including prioritized session artifacts, is
 
 There is no raw-attachment upload option in this flow. Prompts, conversation text, tool arguments/results, command output, workspace excerpts, raw errors and unknown fields are excluded even if they contain no recognizable credential pattern. This intentionally reduces diagnostic detail: reproducing an exact response or inspecting an original stack is not possible from these uploads. Future raw attachments would require a separate, explicit review and consent surface describing their contents and scope.
 
-The regression tests use temporary synthetic files and intercepted HTTP only. They decrypt the final automatic-report request as a receiver would, and unzip the actual feedback PUT body after real session-report collection. They do not validate production ingestion of the new schemas, retention policies, live services, other telemetry paths or other platforms.
+The regression tests use temporary synthetic data and intercepted HTTP only. They decrypt the final automatic-report request as a receiver would, and unzip the actual feedback PUT body after real session-report collection. They do not validate production ingestion of the new schemas, retention policies, live services, other telemetry paths or other platforms.
 
+
+## Launch-scoped system prompt overrides
+
+The interactive TUI, `exec`, `exec review`, and `mcode acp` can replace or extend the main Agent identity prompt:
+
+```bash
+# Replace the identity section; runtime rules, project instructions, Environment, Memory, and Skills stay
+mcode --system-prompt-file ./identity.md
+
+# Append text after the identity section
+mcode exec --append-system-prompt "List the files you will change first." "Complete this task."
+```
+
+Use either `--system-prompt` or `--system-prompt-file`, and either `--append-system-prompt` or
+`--append-system-prompt-file`; replace and append can be combined. Each form is one slot, and the
+slot written closest to the subcommand wins: `mcode --system-prompt-file a.md exec --system-prompt "..."`
+uses the inline text and does not read `a.md`. The flags are also accepted before `exec`, `exec review`,
+or `acp`. Other subcommands, such as `login` or `init`, reject them instead of ignoring them.
+
+Files are read once at startup relative to the current directory; a missing, unreadable, or empty file
+fails the launch rather than running with an unpatched prompt. A restart after sign-in preserves the
+original flags, and the overrides are held in process memory only: they are never written to the
+Session or configuration. Task child Agents keep the packaged prompt, so an override affects the
+interactive surface it was launched for.
+
+
+## Ask/Plan answer requests
+
+When the model asks a question through the `ask_user` tool, that turn ends with a durable pending
+request instead of a final assistant message. The TUI now recognizes this state from the tool result
+and, when a fast reply arrived before the stream drained, from the pending request itself, so the turn
+settles as awaiting your answer. Previously the same turn fell through to a retryable
+"Runtime completed without a final assistant response" failure even though the question was already
+on screen. The settled duration and the `/retry` command follow this state rather than the previous
+failed-run path.
 
 ## Interactive startup model
 
@@ -257,6 +322,8 @@ remain hidden from `/sessions` and `/resume`.
 When a side-conversation model request fails and can be retried, run `/retry`
 in the side view to resend the side conversation's last message without
 returning to the main view.
+`/doctor` and `/feedback` also work in the side view, so a failed side response
+can be diagnosed or reported without leaving it. `/quit` stays unavailable there.
 
 Creation and activation failures record a bounded, redacted cause chain in the
 local `session.side.failed` diagnostic event. Feedback uploads still apply the

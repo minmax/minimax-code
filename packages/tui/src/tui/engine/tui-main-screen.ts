@@ -102,6 +102,16 @@ function extractKittyImageRows(line: string): number {
 	return parseKittyImageHeader(line)?.rows ?? 1;
 }
 
+/**
+ * Debug-log shape of a row (#426): letters become `a` and digits `9`, so the log
+ * shows which kind of row changed (rails, markers, separators) without its text.
+ */
+function redrawRowShape(line: string): string {
+	return JSON.stringify(
+		stripTerminalSequences(line).replace(/\p{L}/gu, "a").replace(/\p{N}/gu, "9").trimEnd().slice(0, 48),
+	);
+}
+
 function isTermuxSession(): boolean {
 	return Boolean(process.env.TERMUX_VERSION);
 }
@@ -118,6 +128,13 @@ export interface TuiMainScreenRenderState {
 	hadOverlays: boolean;
 }
 
+/**
+ * How long after user input the host is assumed to follow the bottom again.
+ * Terminals scroll to the bottom on key input, so a reconstruction in this
+ * window cannot strand a reader at the top of the replayed history (L047).
+ */
+const USER_INPUT_FOLLOW_WINDOW_MS = 1000;
+
 /** TUI implementation that renders into the terminal's main screen and scrollback. */
 export class TuiMainScreen extends TuiBase implements TUI {
 	readonly mode = "regular" as const;
@@ -131,6 +148,15 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private previousViewportTop = 0;
 	private resizeTimer: ReturnType<typeof setTimeout> | undefined;
 	private historyReplayPending = false;
+	// L047: a full reconstruction (ED 3 + replay) moves a host that is scrolled
+	// up to the top of the replayed history, because the host keeps its scrolled
+	// state while scrollback is rebuilt beneath it. Reconstruction after an
+	// output-driven layout shrink is therefore deferred until the next user
+	// input, which makes hosts return to the bottom first.
+	private historyReplayDeferred = false;
+	private historyReplayDeferredAt = 0;
+	private lastUserInputAt = Number.NEGATIVE_INFINITY;
+	private forceHistoryReplay = false;
 	private viewportLayouts: TuiMainScreenRenderState['viewportLayouts'] = [];
 	private hadOverlays = false;
 
@@ -150,6 +176,29 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.requestImmediateRender();
 	}
 
+	protected override onUserInput(): void {
+		this.lastUserInputAt = performance.now();
+		if (this.historyReplayDeferred) this.requestRender();
+	}
+
+	/** Whether the host has just scrolled back to the bottom for user input (L047). */
+	private hostFollowsBottom(): boolean {
+		return this.forceHistoryReplay || performance.now() - this.lastUserInputAt <= USER_INPUT_FOLLOW_WINDOW_MS;
+	}
+
+	/**
+	 * Whether user input arrived after the given time (L047). Input before an
+	 * output-driven event does not count: the reader may have scrolled up since.
+	 */
+	private userInputSince(time: number): boolean {
+		return this.forceHistoryReplay || this.lastUserInputAt >= time;
+	}
+
+	private deferHistoryReplay(): void {
+		if (!this.historyReplayDeferred) this.historyReplayDeferredAt = performance.now();
+		this.historyReplayDeferred = true;
+	}
+
 	private cancelResize(): void {
 		if (this.resizeTimer) clearTimeout(this.resizeTimer);
 		this.resizeTimer = undefined;
@@ -160,8 +209,16 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.cancelResize();
 		// Ordinary stop must retain the latest transcript even when output is held.
 		// Mode switches already captured the current render state before stop.
-		if (!this.stopped && (this.historyReplayPending || (!options.preserveScreen && this.hasPendingRender()))) {
-			this.doRender();
+		if (
+			!this.stopped &&
+			(this.historyReplayPending || this.historyReplayDeferred || (!options.preserveScreen && this.hasPendingRender()))
+		) {
+			this.forceHistoryReplay = true;
+			try {
+				this.doRender();
+			} finally {
+				this.forceHistoryReplay = false;
+			}
 		}
 		super.stop(options);
 	}
@@ -183,6 +240,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	restoreRenderState(state: TuiMainScreenRenderState): void {
 		this.cancelResize();
 		this.historyReplayPending = false;
+		this.historyReplayDeferred = false;
 		this.previousLines = state.previousLines.map((line) => (isImageLine(line) ? "" : line));
 		this.previousKittyImageIds = new Set();
 		this.previousWidth = state.previousWidth;
@@ -200,6 +258,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.hadOverlays = false;
 		this.cancelResize();
 		this.historyReplayPending = false;
+		this.historyReplayDeferred = false;
 		this.previousLines = [];
 		this.previousWidth = -1;
 		this.previousHeight = -1;
@@ -297,6 +356,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const previousBufferLength = this.previousHeight > 0 ? this.previousViewportTop + this.previousHeight : height;
 		let prevViewportTop = heightChanged ? Math.max(0, previousBufferLength - height) : this.previousViewportTop;
 		let viewportTop = prevViewportTop;
+		const followsBottom = this.hostFollowsBottom();
+		const runDeferredReplay = this.historyReplayDeferred && this.userInputSince(this.historyReplayDeferredAt);
 		let hardwareCursorRow = this.hardwareCursorRow;
 		const computeLineDiff = (targetRow: number): number => {
 			const currentScreenRow = hardwareCursorRow - prevViewportTop;
@@ -349,8 +410,11 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// When only addressable rows shrink, absorb the freed rows at the top of the
 		// screen instead. The composer stays at the bottom, historical rows stay unique,
 		// and later output consumes this temporary space before scrolling again.
+		// L047: an output-driven layout shrink uses the same padding instead of an
+		// immediate reconstruction, and reconstructs after the next user input.
 		if (
-			stableLayout && !hadOverlays && !widthChanged && !heightChanged && !this.historyReplayPending && !this.hasOverlayEntries &&
+			(stableLayout || !followsBottom) && !runDeferredReplay &&
+			!hadOverlays && !widthChanged && !heightChanged && !this.historyReplayPending && !this.hasOverlayEntries &&
 			prevViewportTop > 0 && newLines.length > prevViewportTop &&
 			newLines.length < prevViewportTop + height &&
 			this.previousKittyImageIds.size === 0 && !newLines.some(isImageLine)
@@ -365,6 +429,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			if (unchangedHistory) {
 				const padding = Array<string>(prevViewportTop + height - newLines.length).fill("");
 				newLines = [...newLines.slice(0, prevViewportTop), ...padding, ...newLines.slice(prevViewportTop)];
+				if (!stableLayout) this.deferHistoryReplay();
 			}
 		}
 
@@ -375,17 +440,19 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		// Helper to redraw either the complete logical document or only the visible viewport.
 		// Viewport-only redraws preserve the terminal's native scrollback.
-		const fullRender = (clear: boolean, viewportOnly = false): void => {
+		// `tail` repaints the screen with the last rows of the document (as a resize
+		// preview does) while native scrollback keeps its rows until a deferred replay.
+		const fullRender = (clear: boolean, viewportOnly = false, tail = false): void => {
 			// Native scrollback cannot move backwards with a shrinking document. Keep the
 			// previous viewport origin so rows already scrolled out are not painted twice,
 			// and growth still writes every row before it scrolls out. Resize previews are
 			// temporary: they show the new tail until the pending full history replay.
-			if (viewportOnly && !this.historyReplayPending && newLines.length <= prevViewportTop) {
+			if (viewportOnly && !tail && !this.historyReplayPending && newLines.length <= prevViewportTop) {
 				// Nothing remains addressable on screen; rebuild with one consistent origin.
 				viewportOnly = false;
 			}
 			const start = viewportOnly
-				? this.historyReplayPending
+				? this.historyReplayPending || tail
 					? Math.max(0, newLines.length - height)
 					: prevViewportTop
 				: 0;
@@ -443,18 +510,64 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		};
 
 		const debugRedraw = process.env.PI_DEBUG_REDRAW === "1";
-		const logRedraw = (reason: string): void => {
+		const logRedraw = (reason: string, detail = ""): void => {
 			if (!debugRedraw) return;
 			const logPath = path.join(this.logDirectory, "pi-debug.log");
-			const msg = `[${new Date().toISOString()}] fullRender: ${reason} (prev=${this.previousLines.length}, new=${newLines.length}, height=${height})\n`;
+			// Several sessions may share one log file; the pid tells them apart.
+			const msg = `[${new Date().toISOString()}] [pid ${process.pid}] fullRender: ${reason} (prev=${this.previousLines.length}, new=${newLines.length}, height=${height})${detail}\n`;
 			fs.mkdirSync(path.dirname(logPath), { recursive: true });
 			fs.appendFileSync(logPath, msg);
+		};
+		/** First row above the previous viewport whose text changed, or -1. */
+		const firstChangedHistoryRow = (from = 0): number => {
+			for (let i = from; i < prevViewportTop; i++) {
+				const oldLine = this.previousLines[i] ?? "";
+				const newLine = newLines[i] ?? "";
+				if (oldLine !== newLine && stripTerminalSequences(oldLine) !== stripTerminalSequences(newLine)) return i;
+			}
+			return -1;
+		};
+
+		// #426: a reconstruction (ED 3 + replay) moves a host that is scrolled up, such
+		// as xterm.js, to the top of the replayed history. Without recent user input the
+		// reader may be scrolled up, so repaint only the screen in place and defer the
+		// replay to the next key, a resize replay or stop (extends L047). Native scrollback
+		// keeps stale or duplicate rows until then. `tail` repaints the document's last
+		// rows when the document no longer reaches the previous viewport.
+		const reconstruct = (reason: string, tail: boolean, changedRow: number): void => {
+			const deferred = !followsBottom;
+			if (debugRedraw) {
+				const row = changedRow < 0
+					? ""
+					: ` row=${changedRow} old=${redrawRowShape(this.previousLines[changedRow] ?? "")} new=${redrawRowShape(newLines[changedRow] ?? "")}`;
+				logRedraw(reason, ` deferred=${deferred ? "yes" : "no"}${row}`);
+			}
+			if (!deferred) {
+				fullRender(true);
+				return;
+			}
+			this.deferHistoryReplay();
+			// A repaint from the previous viewport origin needs the document to still
+			// reach it (callers check the shrink-reveal case first). Otherwise
+			// `fullRender` would turn it into an immediate ED 3, so paint the tail.
+			fullRender(true, true, tail || newLines.length <= prevViewportTop);
 		};
 
 		if (this.historyReplayPending) {
 			const viewportOnly = this.resizeTimer !== undefined;
 			fullRender(true, viewportOnly);
-			if (!viewportOnly) this.historyReplayPending = false;
+			if (!viewportOnly) {
+				this.historyReplayPending = false;
+				// The resize replay rebuilt history, including any deferred shrink.
+				this.historyReplayDeferred = false;
+			}
+			return;
+		}
+
+		if (runDeferredReplay) {
+			logRedraw("deferred history replay after user input");
+			this.historyReplayDeferred = false;
+			fullRender(true);
 			return;
 		}
 
@@ -484,9 +597,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// A shorter document can bring previously scrolled rows back into view.
 		// Rebuild the complete projection so the viewport is full and native history
 		// contains each row once; neither tail replay nor blank padding can do both.
+		// Without recent input the rebuild waits for the next key (#426, L047).
 		if (Math.max(0, newLines.length - height) < prevViewportTop) {
-			logRedraw("document shrink reveals scrolled rows");
-			fullRender(true);
+			reconstruct("document shrink reveals scrolled rows", true, debugRedraw ? firstChangedHistoryRow() : -1);
 			return;
 		}
 
@@ -590,15 +703,15 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// would splice stale rows onto the new document, even when its total height grew.
 		// Style-only changes can still repaint the viewport without replaying history.
 		if (firstChanged < prevViewportTop) {
-			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
-			for (let i = firstChanged; i < prevViewportTop; i++) {
-				const oldLine = this.previousLines[i] ?? "";
-				const newLine = newLines[i] ?? "";
-				if (oldLine !== newLine && stripTerminalSequences(oldLine) !== stripTerminalSequences(newLine)) {
-					fullRender(true);
-					return;
-				}
+			const reason = `firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`;
+			const changedRow = firstChangedHistoryRow(firstChanged);
+			if (changedRow >= 0) {
+				// The document still reaches the previous viewport here, so an in-place
+				// repaint from that origin also writes any growth into native scrollback.
+				reconstruct(reason, false, changedRow);
+				return;
 			}
+			logRedraw(reason, " style-only");
 			fullRender(true, true);
 			return;
 		}

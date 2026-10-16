@@ -46,6 +46,7 @@ import type {
 import { abortTuiChatTurn } from './run/chat-turn-abort.js';
 import { TuiRuntimeTurnSettlement } from './run/runtime-turn-settlement.js';
 import { createTuiSettledTurn } from './run/turn-settlement.js';
+import { TuiTurnStartLedger } from './run/turn-start-ledger.js';
 
 export type { TuiSubmitStatus } from './chat-controller-support.js';
 export type {
@@ -73,6 +74,8 @@ export class TuiChatController {
   private readonly turnProjection: TuiTurnProjection;
   private readonly statusMetrics: TuiStatusMetricsFlow;
   private readonly outputRate: TuiTurnOutputRate;
+  /** Survives projection switches so a re-adopted live Turn keeps its original start. */
+  private readonly turnStarts = new TuiTurnStartLedger();
   readonly runtimeTurnSettlement: TuiRuntimeTurnSettlement;
   private state: TuiChatSnapshot = { status: 'idle', sessions: [] };
   private activeTurn?: TuiActiveTurn;
@@ -119,6 +122,8 @@ export class TuiChatController {
       currentSessionId: () => this.state.session?.sessionId,
       updateState: (patch) => this.updateState(patch),
       writeAutomationResult: this.writeAutomationResult,
+      runtime: this.runtime,
+      currentAgentName: () => this.state.session?.agentName ?? this.defaultAgentName,
     });
     this.statusMetrics = new TuiStatusMetricsFlow({
       runtime: this.runtime,
@@ -368,6 +373,7 @@ export class TuiChatController {
       this.turnProjection.removeOptimisticUserMessage(options.optimisticRequestId);
     }
     const timestamp = optimisticCell?.createdAtMs ?? this.now();
+    this.turnStarts.record(turnId, timestamp);
     this.outputRate.beginTurn(turnId);
     if (!isRetryContinuation) {
       this.transcript.upsert({
@@ -470,6 +476,8 @@ export class TuiChatController {
               onResult: async (execResult) => {
                 if (
                   activeTurn.retracted ||
+                  (execResult.status === 'blocked' &&
+                    execResult.error?.code === 'QUESTIONNAIRE_REQUIRED') ||
                   execResult.error?.code === 'PAUSED_QUEUE_SEND_CANCELLED' ||
                   (!recoveringPausedQueue && requiresQueueFallback(execResult.error?.code))
                 ) {
@@ -530,7 +538,15 @@ export class TuiChatController {
         if (this.activeTurn !== activeTurn) return 'blocked';
         this.turnProjection.markTurn(turnId, 'blocked');
         if (this.activeTurn === activeTurn) {
-          this.settleTurnState(turnId, 'blocked');
+          // Waiting is not a canonical terminal. Keep automation in run/ask/plan
+          // until the user's answer starts the continuation Turn.
+          this.updateState({
+            status: 'idle',
+            activeTurnId: undefined,
+            cancelling: false,
+            error: undefined,
+            lastSettledTurn: undefined,
+          });
         }
         return 'blocked';
       }
@@ -649,12 +665,28 @@ export class TuiChatController {
   }
 
   getTerminalDurationId(): string | undefined {
-    return this.transcript.snapshot().find((cell) => cell.kind === 'turn-duration')?.id;
+    // Older notes can stay in history once settled output follows them (#426);
+    // the terminal duration is the most recent one.
+    const cells = this.transcript.snapshot();
+    for (let index = cells.length - 1; index >= 0; index -= 1) {
+      if (cells[index]?.kind === 'turn-duration') return cells[index]?.id;
+    }
+    return undefined;
   }
 
   dismissTerminalDuration(id: string | undefined): void {
     if (!id || this.transcript.get(id)?.kind !== 'turn-duration') return;
     if (this.transcript.remove(id)) this.notify();
+  }
+
+  /** Records an observed Turn start; returns the earliest start known for that Turn. */
+  recordTurnStart(turnId: string, timestampMs: number): number {
+    return this.turnStarts.record(turnId, timestampMs);
+  }
+
+  /** Earliest observed start of a Turn, independent of the currently loaded projection. */
+  turnStartedAtMs(turnId: string): number | undefined {
+    return this.turnStarts.get(turnId);
   }
 
   beginRuntimeTurn(turnId: string, timestamp: number): void {

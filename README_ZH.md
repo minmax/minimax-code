@@ -82,7 +82,7 @@ mcode login --region global
 
 在浏览器中完成登录，再启动 `mcode`，通过 `/status` 检查账号、通过 `/provider` 选择模型。退出登录使用 `mcode logout`。
 
-Token Plan 需要账号与可用额度。从本仓库构建的版本与已发布的 npm CLI `@minimax-ai/code@0.4.12` 均默认将用户数据保存在 `~/.minimax`（选择 profile 时为 `~/.minimax-<profile>`）。`MINIMAX_DATA_DIR` 或 `MAVIS_DATA_DIR` 可以覆盖数据目录。安装脚本使用的 `~/.minimax-code` 安装目录与数据目录的选择是两回事。查找或删除配置和会话前，请参阅[账号与数据](docs/installation.md#accounts-and-data)。
+Token Plan 需要账号与可用额度。从本仓库构建的版本与已发布的 npm CLI `@minimax-ai/code@0.6.9` 均默认将用户数据保存在 `~/.minimax`（选择 profile 时为 `~/.minimax-<profile>`）。`MINIMAX_DATA_DIR` 或 `MAVIS_DATA_DIR` 可以覆盖数据目录。安装脚本使用的 `~/.minimax-code` 安装目录与数据目录的选择是两回事。查找或删除配置和会话前，请参阅[账号与数据](docs/installation.md#accounts-and-data)。
 
 <details>
 <summary>使用自己的 API Key（BYOK）</summary>
@@ -145,6 +145,25 @@ mcode "Find a failing test, fix the implementation, and run the relevant tests."
 | 交互式 TUI | `mcode [prompt]` | 探索代码、持续对话、审阅修改与权限确认。 |
 | Headless | `mcode exec [prompt]` | Shell、CI、批处理与评测。 |
 | ACP | `mcode acp` | 支持 Agent Client Protocol 的编辑器与客户端。 |
+
+### 轻量对话
+
+对于简单对话或通用知识问答，可用 `--mode lightweight` 创建新会话：
+
+```bash
+mcode --mode lightweight "解释 DNS 缓存的工作原理。"
+mcode exec --mode lightweight "概述 CAP 定理。"
+```
+
+轻量模式只发送精简的对话系统提示词，不发送工具 schema，并从提供方上下文中省略工作区
+指令、Skills、memory 块、MCP schema 和完整环境块，因此不能检查或修改本地文件。需要编程或工具能力时，请使用
+`mcode --mode standard` 或 `mcode exec --mode standard` 创建新的标准会话；省略 `--mode`
+与标准模式完全一致。
+
+模式在根会话创建时固定，因此 `--mode lightweight` 不能与 `--session` 或 `--continue`
+同时使用。子代理/子会话不会继承轻量模式，`/compact` 仍使用标准压缩上下文，ACP 与桌面端
+会话也始终使用标准模式。重新打开轻量会话时会保留该模式，并在 TUI 状态栏显示
+`Lightweight`；从轻量模式启动的 TUI 打开标准会话时仍保持标准模式，且不显示该标记。
 
 ### 继续之前的工作
 
@@ -253,7 +272,7 @@ pnpm mcode
 node /absolute/path/to/minimax-code/dist/cli.js
 ```
 
-本仓库目标为 **0.4.12 源码预览**。安装已发布的包与构建本仓库是两条独立路径，版本一致不代表构建来源完全相同，详见[版本与证据基线](docs/open-source-status.md#version-and-evidence-baseline)。
+本仓库目标为 **0.6.3 源码预览**。安装已发布的包与构建本仓库是两条独立路径，版本一致不代表构建来源完全相同，详见[版本与证据基线](docs/open-source-status.md#version-and-evidence-baseline)。
 
 ## 文档与贡献
 

@@ -21,6 +21,7 @@ import {
 } from '../canonical-user-input.js';
 import { createBackgroundTaskHostMetadata } from '../history/background/host-metadata.js';
 import { assertAgentHostCapabilityAvailable } from '../empty-dependencies.js';
+import { messagesCarrySessionId } from '../compaction/session-identity.js';
 import {
   prepareLocalInlineMedia,
   type LocalInlineMediaCandidate,
@@ -86,6 +87,12 @@ export interface LocalTurnReminderFacts {
     readonly promptText: string;
     readonly turnId: string;
     readonly desktopCapabilities?: AgentHostTurnCapabilityView;
+    /**
+     * True when a user message in the model-visible history since the latest
+     * compaction already contains this session's ID, so per-turn reminders may
+     * omit it. False on the first turn and after a compaction dropped it.
+     */
+    readonly sessionIdInContext?: boolean;
   }) => Promise<{
     readonly content: string;
     readonly diagnostic?: unknown;
@@ -135,6 +142,8 @@ export interface LocalTurnInputPreparationRequest {
   readonly immediateSendBatch?: AgentHostExecutionRequest['immediateSendBatch'];
   readonly provenance: AgentHostTurnProvenance;
   readonly desktopCapabilities?: AgentHostTurnCapabilityView;
+  /** Provider-facing history before this turn's user message. */
+  readonly history?: readonly unknown[];
 }
 
 export interface PreparedLocalTurnInput {
@@ -203,6 +212,9 @@ export class LocalTurnInputPreparer {
       promptText,
       turnId: input.lease.turnId,
       ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
+      ...(input.history && messagesCarrySessionId(input.history, input.session.sessionId)
+        ? { sessionIdInContext: true }
+        : {}),
     });
     const system = validateSystemReminder(systemValue);
     const systemBlock = optionalReminderBlock('system', system.content);

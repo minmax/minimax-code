@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { resolveTuiVisiblePresentation } from "../../../../../src/tui/controller/projection/visible-presentation.js";
 import { createTranscriptCell } from "../../../../../src/tui/transcript/model.js";
 import { TranscriptStore } from "../../../../../src/tui/transcript/store.js";
@@ -7,6 +7,7 @@ import { formatTuiShortcut } from "../../../../../src/tui/shell/shortcut-labels.
 import { normalizeAccountStatus } from "../../../../../src/runtime/adapters/normalizers.js";
 import { TuiWelcome } from "../../../../../src/tui/shell/welcome/component.js";
 import { stripAnsi } from "../../../../../src/tui/rendering/text.js";
+import { LIGHTWEIGHT_SESSION_PURPOSE } from "@mavis/protocol/local";
 
 const defaultQueueLabel = `${formatTuiShortcut("alt+enter")} queue`;
 
@@ -120,6 +121,28 @@ describe("visible presentation selector", () => {
     ).toBe("/other/workspace");
   });
 
+  it("projects lightweight mode only for the exact persisted Session purpose", () => {
+    const shellForPurpose = (purpose: string | undefined) =>
+      resolve({
+        snapshot: {
+          ...idleChat,
+          session: {
+            sessionId: "resumed",
+            ...(purpose ? { purpose } : {}),
+          },
+        },
+      }).shell;
+
+    expect(shellForPurpose(LIGHTWEIGHT_SESSION_PURPOSE).lightweightMode).toBe(true);
+    for (const purpose of [
+      undefined,
+      "code-review:context-mode:lightweight",
+      "context-mode:lightweight:im",
+    ]) {
+      expect(shellForPurpose(purpose)).not.toHaveProperty("lightweightMode");
+    }
+  });
+
   it("projects Runtime context independently from account quota and cache metrics", () => {
     const contextUsage = {
       usedTokens: 80,
@@ -230,6 +253,25 @@ describe("visible presentation selector", () => {
       headerHidden: true,
     });
     expect(presentation.composer.hint).toBeUndefined();
+  });
+
+  it("anchors the run timer to the recorded Turn start instead of the projection switch", () => {
+    const turnStartedAtMs = vi.fn((turnId: string) => (turnId === "turn-1" ? 1_000 : undefined));
+
+    expect(
+      resolve({
+        snapshot: { ...idleChat, status: "running", activeTurnId: "turn-1" },
+        currentLiveRunId: "turn-1",
+        turnStartedAtMs,
+      }).activity,
+    ).toMatchObject({ phase: "loading", runId: "turn-1", startedAtMs: 1_000 });
+    expect(
+      resolve({
+        snapshot: { ...idleChat, status: "running", activeTurnId: "turn-unknown" },
+        currentLiveRunId: "turn-unknown",
+        turnStartedAtMs,
+      }).activity,
+    ).not.toHaveProperty("startedAtMs");
   });
 
   it("keeps a pending Runtime stop more urgent than a transient warning", () => {

@@ -11,6 +11,7 @@ import type { McodePluginCliRequest } from '../plugin/contract.js';
 import { tuiErrorDiagnostic } from '../user-facing-failure.js';
 import { configureTuiNetworkProxy } from './network-proxy.js';
 import { consumeLoginRestartHandoff } from '../tui/login-restart-handoff.js';
+import type { SystemPromptOverrides } from './system-prompt-options.js';
 import type { McodeTelemetryCliAction } from './telemetry-command.js';
 import type { McodeProfileCliRequest } from './profile-command.js';
 
@@ -51,7 +52,11 @@ export interface RunTuiCliDependencies {
     options: RawTuiExecOptions,
     version: string,
   ) => Promise<void>;
-  readonly runAcp?: (version: string, lane?: string) => Promise<void>;
+  readonly runAcp?: (
+    version: string,
+    lane?: string,
+    systemPromptOverrides?: SystemPromptOverrides,
+  ) => Promise<void>;
   readonly runLogin?: (
     region?: MavisRegion,
     openBrowser?: boolean,
@@ -101,6 +106,7 @@ export async function runTuiCli(dependencies: RunTuiCliDependencies = {}): Promi
   try {
     (dependencies.configureNetworkProxy ?? configureTuiNetworkProxy)({
       environment: processRef.env,
+      writeWarning: (message) => processRef.stderr.write(`${message}\n`),
     });
     const createProgram = dependencies.createProgram ?? createTuiProgram;
     await createProgram({
@@ -114,7 +120,9 @@ export async function runTuiCli(dependencies: RunTuiCliDependencies = {}): Promi
         continueLatestSession,
         workspaceDir,
         tuiMode,
+        contextMode,
         lane,
+        systemPromptOverrides,
       }) => {
         const launchTui = dependencies.launchTui ?? defaultLaunchTui;
         await launchTui({
@@ -126,7 +134,9 @@ export async function runTuiCli(dependencies: RunTuiCliDependencies = {}): Promi
           ...(continueLatestSession ? { continueLatestSession: true } : {}),
           ...(workspaceDir ? { workspaceDir } : {}),
           ...(tuiMode ? { tuiMode } : {}),
+          ...(contextMode ? { contextMode } : {}),
           ...(lane ? { lane } : {}),
+          ...(systemPromptOverrides ? { systemPromptOverrides } : {}),
           ...(resumeDraftAfterLogin ? { resumeDraftAfterLogin: true } : {}),
         });
         completedCommandExitMode = 'force';
@@ -140,9 +150,11 @@ export async function runTuiCli(dependencies: RunTuiCliDependencies = {}): Promi
         );
         completedCommandExitMode = 'natural';
       },
-      runAcp: async (lane) => {
+      runAcp: async (lane, systemPromptOverrides) => {
         const runAcp = dependencies.runAcp ?? defaultRunAcp;
-        await runAcp(MINIMAX_CODE_VERSION, lane);
+        await (systemPromptOverrides
+          ? runAcp(MINIMAX_CODE_VERSION, lane, systemPromptOverrides)
+          : runAcp(MINIMAX_CODE_VERSION, lane));
         completedCommandExitMode = 'natural';
       },
       runLogin: async (region, openBrowser, lane) => {
@@ -220,7 +232,17 @@ async function formatTuiCliError(error: unknown): Promise<string> {
     return diagnostic;
   }
 
-  const { buildMcodePackageManagerCommand } = await import('../update/install-source.js');
+  const { buildMcodePackageManagerCommand, resolveMcodeNpmPrefixInstall } =
+    await import('../update/install-source.js');
+  if (resolveMcodeNpmPrefixInstall()) {
+    return [
+      'MCode could not load its native SQLite dependency.',
+      'The Node runtime recorded by this installation no longer loads it (for example after a Homebrew Node upgrade).',
+      'Reinstall with the original installer to repair this installation.',
+      '',
+      `Original error: ${diagnostic}`,
+    ].join('\n');
+  }
   const command = buildMcodePackageManagerCommand('npm-global', MINIMAX_CODE_VERSION);
   return [
     'MCode could not load its native SQLite dependency.',
@@ -270,9 +292,15 @@ async function defaultRunExec(
   await runTuiExecCommand(prompt, options, version);
 }
 
-async function defaultRunAcp(version: string, lane?: string): Promise<void> {
+async function defaultRunAcp(
+  version: string,
+  lane?: string,
+  systemPromptOverrides?: SystemPromptOverrides,
+): Promise<void> {
   const { runTuiAcpCommand } = await import('./run-acp-command.js');
-  await runTuiAcpCommand(version, {}, lane);
+  await (systemPromptOverrides
+    ? runTuiAcpCommand(version, {}, lane, systemPromptOverrides)
+    : runTuiAcpCommand(version, {}, lane));
 }
 
 async function defaultRunLogin(

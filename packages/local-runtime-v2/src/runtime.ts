@@ -96,6 +96,30 @@ function bindAskUserSuppressionProbe(
     hasPendingUserSteering(sessionId);
 }
 
+function bindSandboxPolicyControl(
+  apiHost: V1CreatedLocalRuntimeHost["apiHost"],
+  sandbox: InitializedOwnerRuntime["services"]["sandbox"],
+): void {
+  apiHost.readSandboxFilesystemMode = () =>
+    sandbox.configSnapshot().filesystem.policy.mode;
+  apiHost.applySandboxFilesystemMode = async (mode) => {
+    const current = sandbox.configSnapshot();
+    await sandbox.applyConfig({
+      ...current,
+      // The master switch and the level are one decision: `full_access` means
+      // no sandbox, and a restricting level cannot take effect while the
+      // switch is off (`parseSandboxConfig` normalizes the pair). Setting both
+      // keeps the stored config readable instead of leaving it to that
+      // normalization to reinterpret later.
+      enabled: mode !== "full_access",
+      filesystem: { ...current.filesystem, policy: { mode } },
+    });
+    // Report what the service ended up enforcing rather than what was asked
+    // for, so the UI cannot claim a level the backend did not accept.
+    return sandbox.configSnapshot().filesystem.policy.mode;
+  };
+}
+
 function bindV2AgentRuntimeManagementPort(
   agentRuntimePort: DeferredLocalAgentRuntimePort,
   ownerRuntime: InitializedOwnerRuntime,
@@ -131,7 +155,23 @@ async function createLocalRuntimeHostV2Internal(
   const sandboxOperationsFactory =
     createDeferredLocalSandboxBashOperationsFactory(
       () => options.configGetter?.().sandbox?.enabled ?? false,
-      resolveAgentBashEnvPolicy(options.dataDir),
+      // The rm shim is the PATH half of the destructive-delete guard, so it
+      // must move with it: consulted per launch, and only an explicit `false`
+      // stops shadowing `rm`.
+      resolveAgentBashEnvPolicy(
+        options.dataDir,
+        undefined,
+        // Background bash keeps the recoverable-delete shim unconditionally.
+        //
+        // Unlike the foreground tool — whose policy is rebuilt per Turn and so
+        // knows which Session it belongs to — this executor is created once for
+        // the whole process and only sees a `sessionId` at spawn time, with no
+        // synchronous way to tell a main-window run from a sub-agent one. The
+        // destructive-delete guard is therefore never relaxed here: an
+        // unattributable background delete keeps the recoverable net rather
+        // than inheriting the main window's opt-out.
+        () => true,
+      ),
     );
   const agentTelemetry = createDeferredAgentRuntimeTelemetry();
   let database: DatabaseClient | undefined;
@@ -294,6 +334,10 @@ async function createLocalRuntimeHostV2Internal(
       // V2 Turn system exists. V1-only hosts (and partial test graphs) keep
       // the probe unset, which means never suppress.
       bindAskUserSuppressionProbe(v1.apiHost, ownerRuntime.services.turnSystem);
+      // Same late binding for the sandbox policy: only the owner service can
+      // re-initialize the platform backend, so hosts without it report the
+      // sandbox as unmanaged instead of writing a mode nothing enforces.
+      bindSandboxPolicyControl(v1.apiHost, ownerRuntime.services.sandbox);
     }
     const cliService = ownerRuntime
       ? createCliService(ownerRuntime.services)
@@ -751,12 +795,14 @@ function configureV1HostOptions(
     browserToolExposure,
     promptConfigKey,
     promptMode,
+    systemPromptOverrides,
     ...v1Options
   } = options;
   void browserAdapter;
   void browserToolExposure;
   void promptConfigKey;
   void promptMode;
+  void systemPromptOverrides;
   // V2 owns the channel startup point: the V1 shell must build stores, APIs,
   // runner and registries without restoring a single transport.
   if (compatibility) {
@@ -867,6 +913,7 @@ async function initializeOwnerRuntime(input: {
         ? { promptConfigKey: options.promptConfigKey }
         : {}),
       capabilityProfile: options.capabilityProfile,
+      systemPromptOverrides: options.systemPromptOverrides,
       getRunawayGuardConfig: options.getRunawayGuardConfig,
       ...(options.getToolResultCompactionConfig
         ? {

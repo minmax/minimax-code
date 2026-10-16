@@ -40,6 +40,7 @@ import { TuiSessionFlow } from './controller/session-flow.js';
 import { TuiCommandFlow } from './controller/product/command-flow.js';
 import { TuiInputFlow } from './controller/interaction/input-flow.js';
 import { TuiPermissionModeFlow } from './controller/interaction/permission-mode-flow.js';
+import { TuiSandboxPolicyFlow } from './controller/interaction/sandbox-policy-flow.js';
 import { TuiPlanModeFlow } from './controller/interaction/plan-mode-flow.js';
 import { createTuiAbortLiveTurn } from './controller/run/abort-live-turn.js';
 import { createTuiUpdateFlow } from './controller/product/update-flow.js';
@@ -66,6 +67,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     tui,
     terminalNotifications,
     terminalTitle,
+    terminalProgramStatus,
     themeController,
     openExternalTarget,
     writeClipboardText,
@@ -215,6 +217,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     scheduleDraft: () => draftLifecycle?.schedule(),
     chrome: () => chromeFlow,
     isStopped: () => stopped,
+    hasLiveRun,
     updateChrome: () => updateChrome(controller.snapshot()),
     onEditorChanged: () => activeRunFlow?.onEditorChanged(),
     requestRender: () => (started && !stopped ? tui.requestRender() : undefined),
@@ -273,7 +276,6 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
       );
     },
     ...delegationFlow.permissionResolvers(liveRunId),
-    agentStatusLineItems: options.statusLineItems,
     stopTurn: () => {
       void abortLiveTurn();
     },
@@ -618,6 +620,16 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     },
     isStopped: () => stopped,
   });
+  const sandboxPolicyFlow = new TuiSandboxPolicyFlow({
+    runtime: options.runtime,
+    append: appendLocalCell,
+    setHint: (message) => chromeFlow?.setHint(message),
+    onChanged: () => {
+      updateChrome(controller.snapshot());
+      tui.requestRender();
+    },
+    isStopped: () => stopped,
+  });
   commandFlow = new TuiCommandFlow({
     bashFlow,
     workspaceDir: options.workspaceDir,
@@ -631,6 +643,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     goalFlow,
     planModeFlow,
     permissionModeFlow,
+    sandboxPolicyFlow,
     ...(options.auth ? { auth: options.auth } : {}),
     openExternalTarget: options.openExternalTarget,
     interactionFlow,
@@ -815,6 +828,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     isStarted: () => started,
     isStopped: () => stopped,
     setTerminalTitle: (title) => terminalTitle.update(title),
+    setProgramStatus: (programStatus) => terminalProgramStatus.update(programStatus),
     terminalTitle: options.terminalTitle,
     connection: () => stateStore.snapshot().connection,
     liveRunId,
@@ -841,6 +855,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     planMode: () => planModeFlow.snapshot(),
     sideConversation: () => sessionFlow.sideConversationSnapshot(),
     sessionState: () => stateStore.snapshot(),
+    turnStartedAtMs: (turnId) => controller.turnStartedAtMs(turnId),
     welcome,
     status,
     activity,
@@ -855,6 +870,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     await featureFlow.refreshSelectedModel();
     await Promise.all([
       permissionModeFlow.refresh().catch(() => undefined),
+      sandboxPolicyFlow.refresh().catch(() => undefined),
       planModeFlow.refreshCapabilities().catch(() => undefined),
     ]);
     await goalFlow?.refresh();
@@ -871,6 +887,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     stopped = true;
     terminalNotifications.dispose();
     terminalTitle.dispose();
+    terminalProgramStatus.dispose();
     const bashStopped = bashFlow.stop();
     detachInputFlow();
     composerDraft.abortClipboardRead();
@@ -881,6 +898,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     delegationFlow.stop();
     activeRunFlow.stop();
     permissionModeFlow.stop();
+    sandboxPolicyFlow.stop();
     planModeFlow.stop();
     feedbackFlow.stop();
     updateFlow.stop();
@@ -921,6 +939,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     suspended = true;
     terminalNotifications.setActive(false);
     terminalTitle.setActive(false);
+    terminalProgramStatus.setActive(false);
     renderer.stop();
     await terminal.drainOutput?.();
     await draftLifecycle?.suspend();
@@ -931,6 +950,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     renderer.start();
     terminalNotifications.setActive(true);
     terminalTitle.setActive(true);
+    terminalProgramStatus.setActive(true);
     updateChrome(controller.snapshot());
     runtimeEventFlow.restart();
     tui.requestRender(true);
@@ -953,6 +973,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
       started = true;
       terminalNotifications.setActive(true);
       terminalTitle.setActive(true);
+      terminalProgramStatus.setActive(true);
       updateChrome(controller.snapshot());
       surfaceHost.setChatFocus(editor);
       runtimeEventFlow.start();

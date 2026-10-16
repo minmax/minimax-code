@@ -49,6 +49,7 @@ import type {
 import { VirtualTerminalScreen } from "../helpers/virtual-terminal.js";
 import { VirtualTerminal } from "../pi-084-upstream/virtual-terminal.js";
 import { TuiFailure } from "../../src/failure.js";
+import { LIGHTWEIGHT_SESSION_PURPOSE } from "@mavis/protocol/local";
 
 const runtimeEvent = (event: RawTuiRuntimeEvent): TuiRuntimeEvent =>
   normalizeTuiRuntimeEvent(event);
@@ -402,6 +403,10 @@ function createRuntime(): TuiRuntime {
     })),
     getPermissionMode: vi.fn(async () => "auto" as const),
     setPermissionMode: vi.fn(async (mode) => mode),
+    getDangerousCommandGateEnabled: vi.fn(async () => true as boolean),
+    setDangerousCommandGateEnabled: vi.fn(async (enabled: boolean) => enabled),
+    getSandboxFilesystemMode: vi.fn(async () => "delete_guard" as const),
+    setSandboxFilesystemMode: vi.fn(async (mode: string) => mode),
     getPlanModeCapabilities: vi.fn(async () => ({ entryEnabled: true })),
     getPendingQuestionnaire: vi.fn(async () => undefined),
     getLatestPlanReview: vi.fn(async () => undefined),
@@ -2785,6 +2790,10 @@ describe("createTuiApp", () => {
     expect(conversation).toContain("Hello from the Agent");
     expect(terminal.started).toBe(true);
     expect(terminal.title).toBe("Done | workspace (session-) | MCode");
+    const programReports = () =>
+      terminal.writes.filter((value) => value.startsWith("\u001b]7501;"));
+    expect(programReports()).toContain("\u001b]7501;state=working:app=mcode\u001b\\");
+    expect(programReports().at(-1)).toBe("\u001b]7501;state=done:app=mcode\u001b\\");
     expect(runtime.createSession).toHaveBeenCalledWith({
       workspaceDir: "/workspace",
     });
@@ -2800,6 +2809,7 @@ describe("createTuiApp", () => {
 
     await app.stop();
     expect(terminal.stopped).toBe(true);
+    expect(programReports().at(-1)).toBe("\u001b]7501;state=done:app=mcode\u001b\\");
   });
 
   it("syncs the generated Session title to the terminal without duplicate writes", async () => {
@@ -2864,12 +2874,18 @@ describe("createTuiApp", () => {
     await app.submit("/rename Renamed session");
     expect(terminal.title).toBe("Renamed session");
 
+    const programReports = () =>
+      terminal.writes.filter((value) => value.startsWith("\u001b]7501;"));
     await app.suspend();
     expect(terminal.title).toBe("");
+    expect(programReports().at(-1)).toBe("\u001b]7501;state=idle:app=mcode\u001b\\");
+    const reportCount = programReports().length;
     await app.controller.renameCurrentSession("Renamed while suspended");
+    expect(programReports()).toHaveLength(reportCount);
     expect(terminal.title).toBe("");
     await app.resume();
     expect(terminal.title).toBe("Renamed while suspended");
+    expect(programReports().at(-1)).toBe("\u001b]7501;state=done:app=mcode\u001b\\");
 
     await app.stop();
     expect(terminal.title).toBe("");
@@ -5471,6 +5487,244 @@ describe("createTuiApp", () => {
     await app.stop();
   });
 
+  it("opens a delete guard selector for bare /delete-guard", async () => {
+    const runtime = createRuntime();
+    const terminal = new FakeTerminal();
+    const app = createTuiApp({
+      runtime,
+      terminal,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    await app.submit("/delete-guard");
+
+    expect(app.interaction.isActive()).toBe(true);
+    const rendered = app.interaction.current()?.render?.(100).join("\n") ?? "";
+    expect(rendered).toContain("Delete guard");
+    expect(rendered).toContain("Current · Recoverable");
+    // Both choices must be offered, and the destructive one must say so.
+    expect(rendered).toContain("RECO");
+    expect(rendered).toContain("PERM");
+    expect(rendered).toContain("permanent");
+    expect(runtime.setDangerousCommandGateEnabled).not.toHaveBeenCalled();
+
+    // Enter on the second row turns the guard off.
+    terminal.input?.("\u001b[B");
+    terminal.input?.("\r");
+    await vi.waitFor(() =>
+      expect(runtime.setDangerousCommandGateEnabled).toHaveBeenCalledWith(false),
+    );
+    expect(app.interaction.isActive()).toBe(false);
+
+    await app.stop();
+  });
+
+  it("keeps the permission picker free of the delete guard", async () => {
+    // The guard answers "are deletes recoverable", not "when am I asked".
+    // Folding it into the mode picker would let cycling to Full access
+    // silently disarm irreversibility protection.
+    const runtime = createRuntime();
+    const terminal = new FakeTerminal();
+    const app = createTuiApp({
+      runtime,
+      terminal,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    await app.submit("/permission");
+
+    const rendered = app.interaction.current()?.render?.(100).join("\n") ?? "";
+    expect(rendered).not.toContain("Delete guard");
+    expect(rendered).not.toContain("PERM");
+
+    await app.stop();
+  });
+
+  it("reports and switches the delete guard by argument", async () => {
+    const runtime = createRuntime();
+    const app = createTuiApp({
+      runtime,
+      terminal: new FakeTerminal(),
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+
+    await app.submit("/delete-guard status");
+    expect(
+      app.transcript
+        .snapshot()
+        .map((cell) => cell.content)
+        .join("\n"),
+    ).toContain("Delete guard: Recoverable.");
+
+    await app.submit("/delete-guard off");
+    await vi.waitFor(() =>
+      expect(runtime.setDangerousCommandGateEnabled).toHaveBeenCalledWith(false),
+    );
+
+    await app.submit("/delete-guard on");
+    await vi.waitFor(() =>
+      expect(runtime.setDangerousCommandGateEnabled).toHaveBeenCalledWith(true),
+    );
+
+    await app.stop();
+  });
+
+  it("refuses an unknown /delete-guard argument without writing config", async () => {
+    const runtime = createRuntime();
+    const app = createTuiApp({
+      runtime,
+      terminal: new FakeTerminal(),
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    await app.submit("/delete-guard maybe");
+
+    expect(
+      app.transcript
+        .snapshot()
+        .map((cell) => cell.content)
+        .join("\n"),
+    ).toContain("Usage: /delete-guard [status | on | off]");
+    expect(runtime.setDangerousCommandGateEnabled).not.toHaveBeenCalled();
+
+    await app.stop();
+  });
+
+  it("opens a sandbox selector for bare /sandbox", async () => {
+    const runtime = createRuntime();
+    const terminal = new FakeTerminal();
+    const app = createTuiApp({
+      runtime,
+      terminal,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    await app.submit("/sandbox");
+
+    expect(app.interaction.isActive()).toBe(true);
+    const rendered = app.interaction.current()?.render?.(100).join("\n") ?? "";
+    expect(rendered).toContain("Sandbox filesystem");
+    expect(rendered).toContain("Current · Delete guard");
+    // Every level must be offered, including the unrestricted one.
+    expect(rendered).toContain("READ");
+    expect(rendered).toContain("WORK");
+    expect(rendered).toContain("GUARD");
+    expect(rendered).toContain("FULL");
+    expect(runtime.setSandboxFilesystemMode).not.toHaveBeenCalled();
+
+    // The fourth row is the unrestricted level; picking it by number applies it.
+    terminal.input?.("4");
+    await vi.waitFor(() =>
+      expect(runtime.setSandboxFilesystemMode).toHaveBeenCalledWith(
+        "full_access",
+      ),
+    );
+    expect(app.interaction.isActive()).toBe(false);
+
+    await app.stop();
+  });
+
+  it("reports and switches the sandbox level by argument", async () => {
+    const runtime = createRuntime();
+    const app = createTuiApp({
+      runtime,
+      terminal: new FakeTerminal(),
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+
+    await app.submit("/sandbox status");
+    expect(
+      app.transcript
+        .snapshot()
+        .map((cell) => cell.content)
+        .join("\n"),
+    ).toContain("Sandbox: Delete guard.");
+
+    await app.submit("/sandbox workspace_write");
+    await vi.waitFor(() =>
+      expect(runtime.setSandboxFilesystemMode).toHaveBeenCalledWith(
+        "workspace_write",
+      ),
+    );
+
+    await app.stop();
+  });
+
+  it("refuses an unknown /sandbox argument without writing config", async () => {
+    const runtime = createRuntime();
+    const app = createTuiApp({
+      runtime,
+      terminal: new FakeTerminal(),
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    await app.submit("/sandbox maybe");
+
+    expect(
+      app.transcript
+        .snapshot()
+        .map((cell) => cell.content)
+        .join("\n"),
+    ).toContain(
+      "Usage: /sandbox [status | read_only | workspace_write | delete_guard | full_access]",
+    );
+    expect(runtime.setSandboxFilesystemMode).not.toHaveBeenCalled();
+
+    await app.stop();
+  });
+
+  it("reports an unmanaged sandbox when the host exposes no level", async () => {
+    // The sandbox is a separate layer: a host that does not implement it must
+    // say so instead of letting the UI name a level nothing is enforcing.
+    const runtime = createRuntime();
+    vi.mocked(runtime.getSandboxFilesystemMode).mockResolvedValue(undefined);
+    const app = createTuiApp({
+      runtime,
+      terminal: new FakeTerminal(),
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    await app.submit("/sandbox status");
+    await app.submit("/sandbox");
+
+    expect(
+      app.transcript
+        .snapshot()
+        .map((cell) => cell.content)
+        .join("\n"),
+    ).toContain("Sandbox is managed by host.");
+    expect(app.interaction.isActive()).toBe(false);
+    expect(runtime.setSandboxFilesystemMode).not.toHaveBeenCalled();
+
+    await app.stop();
+  });
+
   it("opens the latest settled Plan as a read-only full snapshot", async () => {
     const runtime = createRuntime();
     vi.mocked(runtime.getLatestPlanReview).mockResolvedValue(
@@ -7365,6 +7619,90 @@ describe("createTuiApp", () => {
     expect(
       transcriptBefore.filter((cell) => cell.kind === "user").length,
     ).toBeGreaterThan(0);
+  });
+
+  it("keeps the main run timer when switching to a side conversation and back", async () => {
+    let clock = 1_000_000;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const terminal = new FakeTerminal();
+    terminal.columns = 100;
+    terminal.rows = 20;
+    const runtime = createRuntime();
+    let mainTurnId: string | undefined;
+    let releaseMainTurn: () => void = () => undefined;
+    const mainTurnReleased = new Promise<void>((resolve) => {
+      releaseMainTurn = resolve;
+    });
+    const mainSession = {
+      sessionId: "session-1",
+      title: "New session",
+      workspaceDir: "/workspace",
+    };
+    const sideSession = {
+      sessionId: "side-1",
+      title: "BTW",
+      workspaceDir: "/workspace",
+      parentSessionId: "session-1",
+      purpose: "peek_btw_session",
+      sessionKind: "peek" as const,
+    };
+    vi.mocked(runtime.createSession).mockImplementation(async (input) =>
+      input?.purpose === sideSession.purpose ? { ...sideSession } : { ...mainSession },
+    );
+    vi.mocked(runtime.getSession).mockImplementation(async (sessionId) =>
+      sessionId === sideSession.sessionId ? { ...sideSession } : { ...mainSession, sessionId },
+    );
+    vi.mocked(runtime.getActiveRun).mockImplementation(async (sessionId) => {
+      const running = sessionId === "session-1" && mainTurnId !== undefined;
+      return {
+        schemaVersion: 1 as const,
+        sessionId,
+        state: running ? ("running" as const) : ("idle" as const),
+        ...(running ? { turnId: mainTurnId } : {}),
+        actions: { steer: false },
+      };
+    });
+    vi.mocked(runtime.watchSessionTurn).mockImplementation(
+      async function* watchSessionTurn(_sessionId, _turnId, signal) {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        for (const event of [] as TuiStreamEvent[]) yield event;
+      },
+    );
+    vi.mocked(runtime.sendMessage).mockImplementation(
+      async function* sendMessage(request): AsyncGenerator<TuiStreamEvent> {
+        mainTurnId = request.turnId;
+        yield { type: "delta", content: "Working on main" };
+        await mainTurnReleased;
+        yield { type: "done" };
+      },
+    );
+    const app = createTuiApp({ runtime, terminal, version: "0.1.0", workspaceDir: "/workspace" });
+    app.start();
+    await app.ready;
+    try {
+      void app.submit("main task");
+      await vi.waitFor(() => expect(mainTurnId).toBeDefined());
+      clock += 42_000;
+      await vi.waitFor(() => expect(renderTerminalViewport(app, terminal)).toContain("42s"));
+
+      await app.submit("/btw");
+      await vi.waitFor(() => expect(app.controller.snapshot().session?.sessionId).toBe("side-1"));
+      clock += 5_000;
+      await app.submit("/parent");
+      await vi.waitFor(() =>
+        expect(app.controller.snapshot().session?.sessionId).toBe("session-1"),
+      );
+      clock += 3_000;
+
+      // 42s before the switch + 5s in the side view + 3s back on main.
+      await vi.waitFor(() => expect(renderTerminalViewport(app, terminal)).toMatch(/\b50s\b/u));
+    } finally {
+      releaseMainTurn();
+      await app.stop();
+      now.mockRestore();
+    }
   });
 
   it("does not call forkSession when /fork is cancelled, unavailable, or fails", async () => {
@@ -9596,6 +9934,52 @@ describe("createTuiApp", () => {
     await app.stop();
   });
 
+  it.each([
+    {
+      label: "lightweight",
+      purpose: LIGHTWEIGHT_SESSION_PURPOSE,
+      indicator: true,
+    },
+    {
+      label: "standard",
+      purpose: undefined,
+      indicator: false,
+    },
+  ])("renders the persisted mode after /resume of a $label Session", async ({ purpose, indicator }) => {
+    const terminal = new FakeTerminal();
+    const runtime = createRuntime();
+    const session = {
+      sessionId: "session-resumed-mode",
+      title: "Resumed mode",
+      workspaceDir: "/workspace",
+      ...(purpose ? { purpose } : {}),
+    };
+    vi.mocked(runtime.listSessions).mockResolvedValue([session]);
+    vi.mocked(runtime.listSessionPage).mockResolvedValue({
+      sessions: [session],
+      hasMore: false,
+    });
+    vi.mocked(runtime.getSession).mockResolvedValue(session);
+    const app = createTuiApp({
+      runtime,
+      terminal,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+    try {
+      await app.ready;
+      await app.submit("/resume session-resumed-mode");
+      await vi.waitFor(() =>
+        expect(app.controller.snapshot().session?.sessionId).toBe("session-resumed-mode"),
+      );
+      const rendered = stripAnsi(app.tui.render(120).join("\n"));
+      if (indicator) expect(rendered).toContain("Lightweight");
+      else expect(rendered).not.toContain("Lightweight");
+    } finally {
+      await app.stop();
+    }
+  });
+
   it("queries the current workspace first and reloads the global catalog on Ctrl+A", async () => {
     const terminal = new FakeTerminal();
     const runtime = createRuntime();
@@ -9705,6 +10089,100 @@ describe("createTuiApp", () => {
     );
 
     await app.stop();
+  });
+
+  it("reports permission and question waits to the title and OSC 7501 without build-mode", async () => {
+    const terminal = new FakeTerminal();
+    const runtime = createRuntime();
+    vi.mocked(runtime.listSessions).mockResolvedValue([
+      {
+        sessionId: "session-existing",
+        title: "Existing session",
+        workspaceDir: "/workspace",
+      },
+    ]);
+    vi.mocked(runtime.listPendingPermissions).mockResolvedValue([
+      {
+        requestId: "permission-1",
+        sessionId: "session-existing",
+        agentName: "mavis",
+        toolName: "bash",
+        reason: "Run tests",
+      },
+    ]);
+    // The permission arrives while its Turn is active, as in a real approval prompt.
+    vi.mocked(runtime.getActiveRun).mockImplementation(async (sessionId: string) => ({
+      schemaVersion: 1,
+      sessionId,
+      state: "decision-blocked",
+      turnId: "turn-permission",
+      actions: { steer: false },
+    }));
+    vi.mocked(runtime.getPendingQuestionnaire).mockResolvedValue({
+      id: "question-1",
+      title: "Choose",
+      requester: { sessionId: "session-existing", runId: "turn-question" },
+      steps: [
+        {
+          id: "step-1",
+          question: "Proceed?",
+          selectionMode: "single",
+          options: [
+            { id: "yes", label: "Yes" },
+            { id: "no", label: "No" },
+          ],
+        },
+      ],
+    });
+    // Default configuration: no status line items, so no build-mode line.
+    const app = createTuiApp({
+      runtime,
+      terminal,
+      terminalCapabilities: TERMINAL_CAPABILITIES,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+    const programReports = () =>
+      terminal.writes.filter((value) => value.startsWith("\u001b]7501;"));
+
+    app.start();
+    await app.ready;
+    await app.submit("/resume session-existing");
+    await vi.waitFor(() =>
+      expect(terminal.title).toBe("Needs approval | Existing session | MCode"),
+    );
+    expect(programReports().at(-1)).toBe(
+      "\u001b]7501;state=blocked:kind=permission:app=mcode\u001b\\",
+    );
+
+    await app.submit("/allow");
+    await vi.waitFor(() =>
+      expect(terminal.title).toBe("Needs input | Existing session | MCode"),
+    );
+    expect(programReports().at(-1)).toBe(
+      "\u001b]7501;state=blocked:kind=question:app=mcode\u001b\\",
+    );
+    expect(app.tui.render(120).join("\n")).not.toContain("[V]");
+    await app.stop();
+  });
+
+  it("does not report OSC 7501 when tui.programStatus is false", async () => {
+    const terminal = new FakeTerminal();
+    const app = createTuiApp({
+      runtime: createRuntime(),
+      terminal,
+      terminalCapabilities: TERMINAL_CAPABILITIES,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+      programStatus: false,
+    });
+
+    app.start();
+    await app.ready;
+    await app.submit("Say hello");
+    expect(terminal.title).toBe("Done | workspace (session-) | MCode");
+    await app.stop();
+    expect(terminal.writes.some((value) => value.includes("\u001b]7501;"))).toBe(false);
   });
 
   it("shows account status and resolves pending permission and questionnaire decisions", async () => {
@@ -10583,6 +11061,10 @@ describe("createTuiApp", () => {
     await app.ready;
     await app.submit("/resume session-permission-render");
     await vi.waitFor(() => expect(app.interaction.isActive()).toBe(true));
+    // A user types `/resume`; model that input so the history rebuild for the
+    // welcome-to-conversation switch in this 8-row terminal runs now instead of
+    // being deferred to the permission key (#426, L047).
+    (app.tui as unknown as { onUserInput(): void }).onUserInput();
     app.tui.renderNow();
     terminal.writes.length = 0;
 
@@ -15276,6 +15758,32 @@ describe("interactive model argument contract", () => {
     const { command, launch } = program();
     await command.parseAsync(["hello"], { from: "user" });
     expect(launch).toHaveBeenCalledWith({ initialPrompt: "hello" });
+  });
+
+  it("opts a new Session into lightweight mode without changing the standard contract", async () => {
+    const lightweight = program();
+    await lightweight.command.parseAsync(["hello", "--mode", "lightweight"], { from: "user" });
+    expect(lightweight.launch).toHaveBeenCalledWith({
+      initialPrompt: "hello",
+      contextMode: "lightweight",
+    });
+
+    const standard = program();
+    await standard.command.parseAsync(["hello", "--mode", "standard"], { from: "user" });
+    expect(standard.launch).toHaveBeenCalledWith({ initialPrompt: "hello" });
+  });
+
+  it("rejects lightweight mode for resumed or selected Sessions", async () => {
+    for (const args of [
+      ["--continue", "--mode", "lightweight"],
+      ["--session", "existing", "--mode", "lightweight"],
+    ]) {
+      const { command, launch } = program();
+      await expect(command.parseAsync(args, { from: "user" })).rejects.toThrow(
+        "requires a new Session",
+      );
+      expect(launch).not.toHaveBeenCalled();
+    }
   });
 
   it.each(["-m", "--model"])("scans startup environment after %s values", (flag) => {

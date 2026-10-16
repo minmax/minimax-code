@@ -1,6 +1,6 @@
 {
   "name": "@minimax/code",
-  "version": "0.6.0",
+  "version": "0.6.5",
   "private": true,
   "description": "Minimax Code CLI and TUI product entry.",
   "type": "module",
@@ -52,7 +52,7 @@
     "@types/node": "^20",
     "@types/ws": "^8.18.1",
     "ghostty-web": "^0.4.0",
-    "knip": "^6.27.0",
+    "knip": "^6.38.0",
     "node-pty": "^1.0.0",
     "typescript": "^5",
     "vitest": "^2"

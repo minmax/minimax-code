@@ -28,6 +28,7 @@ import {
 } from '../../commands/catalog.js';
 import { resolveTuiComposerInputIntent } from '../../commands/input-intent.js';
 import { formatTuiTerminalTitle } from '../../platform/terminal-title.js';
+import type { TuiProgramStatus } from '../../platform/terminal-program-status.js';
 
 type PresentationSink<K extends keyof TuiVisiblePresentation> = {
   setState(state: TuiVisiblePresentation[K]): void;
@@ -52,6 +53,7 @@ export class TuiChromeFlow {
       readonly isStarted: () => boolean;
       readonly isStopped: () => boolean;
       readonly setTerminalTitle: (title: string | undefined) => void;
+      readonly setProgramStatus: (status: TuiProgramStatus) => void;
       readonly terminalTitle?: readonly string[] | null;
       readonly connection: () => Pick<TuiState['connection'], 'phase' | 'generation' | 'lastError'>;
       /** Multi-Session state kernel, including the background parent Turn. */
@@ -75,6 +77,8 @@ export class TuiChromeFlow {
       readonly sideConversation?: () => TuiSideConversationSnapshot | undefined;
       /** Multi-Session state kernel, including the background parent Turn. */
       readonly sessionState?: () => Pick<TuiState, 'sessions'>;
+      /** Earliest observed start of a Turn, kept across Session projection switches. */
+      readonly turnStartedAtMs?: (turnId: string) => number | undefined;
       readonly welcome: PresentationSink<'shell'>;
       readonly status: PresentationSink<'shell'>;
       readonly activity: PresentationSink<'activity'>;
@@ -199,6 +203,7 @@ export class TuiChromeFlow {
         const sideConversation = this.resolveSideConversationPresentation(snapshot);
         return sideConversation ? { sideConversation } : {};
       })(),
+      ...(this.options.turnStartedAtMs ? { turnStartedAtMs: this.options.turnStartedAtMs } : {}),
     });
     const agentCounts = this.options.agentCounts?.();
     const backgroundTasks = this.options.backgroundTaskCount?.();
@@ -216,13 +221,19 @@ export class TuiChromeFlow {
       ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
     });
     if (this.options.isStarted()) {
+      // Title and program status present the same projection; only login gets
+      // a more specific human-facing state than the machine `[V]` error.
+      const programStatus: TuiProgramStatus = automationStatus.loginRequired
+        ? 'auth'
+        : automationStatus.status;
+      this.options.setProgramStatus(programStatus);
       this.options.setTerminalTitle(
         formatTuiTerminalTitle(
           {
             title: snapshot.session?.title,
             sessionId: snapshot.session?.sessionId,
             workspace: this.options.workspace,
-            status: automationStatus.status,
+            status: programStatus,
           },
           this.options.terminalTitle,
         ),
