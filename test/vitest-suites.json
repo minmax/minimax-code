@@ -128,6 +128,7 @@
       "packages/local-runtime-v2/test/unit/agent/storage/canonical-agent-config.test.ts",
       "packages/local-runtime-v2/test/unit/compat/v1/runtime.test.ts",
       "packages/tui/test/unit/runtime-product-access.test.ts",
+      "packages/tui/test/unit/build-marker.test.ts",
       "packages/tui/test/unit/tui-app.test.ts",
       "packages/tui/test/unit/tui/commands/catalog.test.ts",
       "packages/tui/test/unit/tui-goal-banner.test.ts",

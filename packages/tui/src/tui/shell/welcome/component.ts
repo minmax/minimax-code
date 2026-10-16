@@ -1,5 +1,6 @@
 import type { Component } from '../../rendering/component.js';
 import { tuiChalk as chalk, tuiColors as colors } from '../../theme/runtime.js';
+import { buildChannelSuffix } from '../../../application/build-marker.js';
 import type { TuiShellState } from '../contracts.js';
 import {
   fitLine,
@@ -173,7 +174,7 @@ function renderCompactWelcome(
     ...renderTuiWelcomeHero(width),
     '',
     renderFrameHeader(
-      `${chalk.bold.hex(colors.brand)('MCode')} ${chalk.hex(colors.muted)(`v${state.version}`)}`,
+      `${chalk.bold.hex(colors.brand)('MCode')} ${chalk.hex(colors.muted)(`v${state.version}${buildChannelSuffix()}`)}`,
       staticBanner ? '' : renderActivity(state),
       width,
     ),
@@ -190,7 +191,7 @@ function renderCompactWelcome(
 
 function renderWelcomeHeader(state: TuiShellState, width: number, staticBanner: boolean): string {
   return renderFrameHeader(
-    chalk.hex(colors.muted)(`v${state.version}`),
+    chalk.hex(colors.muted)(`v${state.version}${buildChannelSuffix()}`),
     staticBanner ? '' : renderActivity(state),
     width,
   );
