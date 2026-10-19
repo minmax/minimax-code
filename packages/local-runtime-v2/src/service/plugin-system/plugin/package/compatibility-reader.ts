@@ -12,7 +12,9 @@ import {
 } from './filesystem.js';
 import { PluginReaderError, readerFail } from './reader-errors.js';
 import { readPluginHooks } from './hook/reader.js';
+import { readAgentDefinitions } from './agent-plugin-reader.js';
 import type {
+  PluginAgentDefinition,
   PluginMcpServer,
   PluginReaderDiagnostic,
   PluginSkill,
@@ -36,6 +38,7 @@ export async function readCompatiblePluginPackage(
   const name = stringValue(manifest.name);
   if (!name) readerFail('MANIFEST_SCHEMA_INVALID', 'Compatible Plugin name is required');
   const skills = await readCompatibleSkills(root, manifest.skills);
+  const agents = await readAgentDefinitions(root, name, []);
   const mcp = await readCompatibleMcp(root, manifest.mcpServers);
   const iconPath = await readOptionalIcon(root, manifest.icon);
   const author = readAuthor(manifest.author);
@@ -46,7 +49,7 @@ export async function readCompatiblePluginPackage(
     defaultPath: 'hooks/hooks.json',
     manifestPath: manifestRelativePath,
   });
-  if (mcp.servers.length + skills.length + hookResult.hooks.length === 0) {
+  if (mcp.servers.length + skills.length + agents.length + hookResult.hooks.length === 0) {
     readerFail(
       'MANIFEST_SCHEMA_INVALID',
       'Compatible Plugin has no supported executable capability',
@@ -65,6 +68,7 @@ export async function readCompatiblePluginPackage(
     apps: [],
     mcpServers: mcp.servers,
     skills,
+    ...(agents.length > 0 ? { agents } : {}),
     hooks: hookResult.hooks,
     diagnostics: [...mcp.diagnostics, ...hookResult.diagnostics],
   };

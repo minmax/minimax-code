@@ -306,6 +306,7 @@ function appendLocalPlugin(
     plugin.skills.length === 0 &&
     plugin.mcpServers.length === 0 &&
     (plugin.hooks?.length ?? 0) === 0 &&
+    (plugin.agents?.length ?? 0) === 0 &&
     !plugin.miniapp
   ) {
     state.diagnostics.push(
