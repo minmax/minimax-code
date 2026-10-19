@@ -42,10 +42,13 @@ export interface LLMRetryPolicy {
 }
 
 export const DEFAULT_LLM_RETRY_POLICY: Readonly<LLMRetryPolicy> = {
-  maxRetries: 5,
+  maxRetries: 100,
   baseDelayMs: 1_000,
   maxDelayMs: 30_000,
-  maxRetryElapsedMs: 120_000,
+  // 100 retries at the 30s backoff cap sum to ~48 min, so the elapsed
+  // deadline must exceed that or the loop stops retrying long before
+  // maxRetries is reached.
+  maxRetryElapsedMs: 3_600_000,
 };
 
 export interface LLMRetryError {
