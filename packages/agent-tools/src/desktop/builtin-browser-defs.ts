@@ -711,6 +711,46 @@ const BrowserProviderInput = Type.Object(
   },
 );
 
+const BrowserRunScriptTimeout = Type.Optional(
+  Type.Number({
+    minimum: 1_000,
+    maximum: 120_000,
+    description: 'Script budget in milliseconds; default 30000.',
+  }),
+);
+
+export const BrowserRunScriptInput = Type.Union(
+  [
+    Type.Object(
+      {
+        code: Type.String({
+          minLength: 1,
+          maxLength: 200_000,
+          description:
+            'run_script only: async function body with page, assert and console in scope. Exactly one of code or path.',
+        }),
+        timeout: BrowserRunScriptTimeout,
+      },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      {
+        path: Type.String({
+          minLength: 1,
+          description:
+            'Active-workspace .js file whose contents are the async function body. Exactly one of code or path.',
+        }),
+        timeout: BrowserRunScriptTimeout,
+      },
+      { additionalProperties: false },
+    ),
+  ],
+  {
+    additionalProperties: false,
+    description: 'Exactly one of code or path.',
+  },
+);
+
 export const LOCAL_BROWSER_ACTION_INPUT_CONTRACTS = {
   inspect: { schema: BrowserInspectInput, optional: true },
   query: { schema: BrowserQueryInput, optional: false },
@@ -739,6 +779,7 @@ export const LOCAL_BROWSER_ACTION_INPUT_CONTRACTS = {
   wait: { schema: BrowserWaitInput, optional: false },
   screenshot: { schema: BrowserScreenshotInput, optional: true },
   upload_files: { schema: BrowserUploadFilesInput, optional: false },
+  run_script: { schema: BrowserRunScriptInput, optional: false },
 } as const satisfies Record<string, { schema: TSchema; optional: boolean }>;
 
 export const LOCAL_BROWSER_ACTION_NAMES = [
@@ -766,6 +807,7 @@ export const LOCAL_BROWSER_ACTION_NAMES = [
   'wait',
   'screenshot',
   'upload_files',
+  'run_script',
 ] as const;
 
 const BrowserActionName = Type.String({
@@ -780,7 +822,8 @@ export const LocalBrowserToolDef = {
   name: 'browser',
   executionMode: 'sequential',
   description: [
-    'HARD PREREQUISITE: SESSION-SCOPED. Before the first Browser action in a session, load `control-in-app-browser` with the `skill` tool as the only tool call in that assistant step and wait for its complete result. If a system reminder explicitly says that the complete Browser Skill was already loaded for this session, the prerequisite remains satisfied and you must not reload it solely to use Browser. Context compaction invalidates that receipt; if Browser returns `SKILL_REQUIRED`, reload the complete Skill once before retrying. Never probe Browser before either condition is satisfied. The Browser rejects an unprepared call with `SKILL_REQUIRED`. Operate the Browser provider attached to the current chat session. Electron presents it in the right-side FilePanel; native headless Chrome uses an isolated profile without a visible panel. Terms such as "in-app browser", "embedded browser", "right-side browser", "current browser", "browser use", "内置浏览器", "右侧浏览器", and "当前浏览器" all mean this same session-scoped browser, not a separate remote browser. For a linked resource without explicit Browser intent, do not call this tool first: check available skills for an applicable purpose-built connector, API, or CLI, and when `tool_search` is available query deferred integration tools too. Earlier Browser use or an open Browser tab is context, not a reason to make later semantic work Browser-first. Use this tool for that operation only when the user explicitly selected this Browser, no applicable non-Browser path exists, that path cannot access the resource or perform the requested operation, or UI work remains. For a single Browser workflow, do not create or update a `todowrite` list only to mirror Browser progress; Browser tool calls already expose that progress. When the user says a page is already or currently open in this Browser, inspect that existing page first; do not navigate or reload it merely because the request also mentions its URL or domain. Choose between `navigate` and `open_tab` according to the active Browser provider guidance appended to this tool. When the user explicitly requests a new tab, asks to preserve the current page, or uses cues such as new tab, another tab, 继续打开, 再打开, 另开, or 新开, use `open_tab` whenever the active provider exposes it. Do not inspect solely to choose between `navigate` and `open_tab`; use the Browser state already present in the conversation or tool result. When the user refers to a page, link, or content already open there after Browser is selected, call `inspect` first to read its URL, title, and page state; do not ask them to provide the link or screenshot again. Call one Browser action at a time and wait for its result; Browser calls are stateful and must not be parallel. If any Browser result contains `safety.requiredNextTool` and that named tool is available, the very next assistant action MUST be exactly one actual call to that tool: emit no prose and call no other tool first. For `ask_user`, let the user take over the same Browser tab only when the active provider exposes a visible interactive surface; a headless provider must stop and report that interactive authentication is required; never request a password, verification code, or other secret in chat. Set `action` to exactly one supported enum value and never include quotes, XML, Markdown, or other markup in the action name. Put every action argument inside `input`; for example, fill is exactly `{ "action": "fill", "input": { "ref": "<opaque-ref>", "text": "<text>" } }`. A `screenshot` image is model-visible inspection evidence and is not shown to the user by default. Do not proactively claim it was sent, shared, shown, or attached, and do not emit delivery markup unless the user explicitly asks to see or receive that screenshot. When explicitly asked, emit `userDelivery.mediaMarkup` exactly once only if `userDelivery.available` is true. Never expose Base64 or a data URL, and never fabricate a path or markup when delivery is unavailable. Once inspect, query, or an action result contains the requested fact, result, or evidence, stop reading and answer or continue to the next required operation; do not chain inspect, query, DOM reads, or screenshot after sufficient evidence is already available. If inspect already lists the complete available options and none matches the user\'s intent, do not call screenshot, query, or inspect again; stop and ask the user. When a click is expected to navigate the main document, use `click_and_wait_for_navigation` so navigation listeners are registered before the click; keep ordinary non-navigation interactions on `click`. An ordinary `click` result proves only that input was dispatched; the requested page effect is not verified. Use `inspect`, `query`, or `screenshot` after it and confirm the expected state before claiming that the click achieved the user\'s goal. `upload_files` uses `input: { ref, paths }` with the opaque upload ref and exact current-turn attachment or active-workspace file paths; do not wrap them in a target object. `upload_files` is the only file validation call for this workflow; do not preflight with shell/read/stat/test/ls. Final publish, send, delete, purchase, or other externally visible actions require explicit user confirmation immediately before the action; broad initial requests or vague continuation messages do not count. Do not create a reminder, automation, scheduled task, background monitor, or follow-up merely to wait for confirmation. To read page text or DOM, use query with an explicit input.kind. Query `selector` is supported only for `text` and `dom`; `snapshot` and `editable` reject it. Reuse opaque element refs only for the snapshot that returned them. Continue truncated inspect results with action `inspect`, and truncated editable-query results with action `query`; in both cases preserve the returned snapshotId and nextOffset inside input. Arbitrary JavaScript execution is not available. ',
+    'HARD PREREQUISITE: SESSION-SCOPED. Before the first Browser action in a session, load `control-in-app-browser` with the `skill` tool as the only tool call in that assistant step and wait for its complete result. If a system reminder explicitly says that the complete Browser Skill was already loaded for this session, the prerequisite remains satisfied and you must not reload it solely to use Browser. Context compaction invalidates that receipt; if Browser returns `SKILL_REQUIRED`, reload the complete Skill once before retrying. Never probe Browser before either condition is satisfied. The Browser rejects an unprepared call with `SKILL_REQUIRED`. Operate the Browser provider attached to the current chat session. Electron presents it in the right-side FilePanel; native headless Chrome uses an isolated profile without a visible panel. Terms such as "in-app browser", "embedded browser", "right-side browser", "current browser", "browser use", "内置浏览器", "右侧浏览器", and "当前浏览器" all mean this same session-scoped browser, not a separate remote browser. For a linked resource without explicit Browser intent, do not call this tool first: check available skills for an applicable purpose-built connector, API, or CLI, and when `tool_search` is available query deferred integration tools too. Earlier Browser use or an open Browser tab is context, not a reason to make later semantic work Browser-first. Use this tool for that operation only when the user explicitly selected this Browser, no applicable non-Browser path exists, that path cannot access the resource or perform the requested operation, or UI work remains. For a single Browser workflow, do not create or update a `todowrite` list only to mirror Browser progress; Browser tool calls already expose that progress. When the user says a page is already or currently open in this Browser, inspect that existing page first; do not navigate or reload it merely because the request also mentions its URL or domain. Choose between `navigate` and `open_tab` according to the active Browser provider guidance appended to this tool. When the user explicitly requests a new tab, asks to preserve the current page, or uses cues such as new tab, another tab, 继续打开, 再打开, 另开, or 新开, use `open_tab` whenever the active provider exposes it. Do not inspect solely to choose between `navigate` and `open_tab`; use the Browser state already present in the conversation or tool result. When the user refers to a page, link, or content already open there after Browser is selected, call `inspect` first to read its URL, title, and page state; do not ask them to provide the link or screenshot again. Call one Browser action at a time and wait for its result; Browser calls are stateful and must not be parallel. If any Browser result contains `safety.requiredNextTool` and that named tool is available, the very next assistant action MUST be exactly one actual call to that tool: emit no prose and call no other tool first. For `ask_user`, let the user take over the same Browser tab only when the active provider exposes a visible interactive surface; a headless provider must stop and report that interactive authentication is required; never request a password, verification code, or other secret in chat. Set `action` to exactly one supported enum value and never include quotes, XML, Markdown, or other markup in the action name. Put every action argument inside `input`; for example, fill is exactly `{ "action": "fill", "input": { "ref": "<opaque-ref>", "text": "<text>" } }`. A `screenshot` image is model-visible inspection evidence and is not shown to the user by default. Do not proactively claim it was sent, shared, shown, or attached, and do not emit delivery markup unless the user explicitly asks to see or receive that screenshot. When explicitly asked, emit `userDelivery.mediaMarkup` exactly once only if `userDelivery.available` is true. Never expose Base64 or a data URL, and never fabricate a path or markup when delivery is unavailable. Once inspect, query, or an action result contains the requested fact, result, or evidence, stop reading and answer or continue to the next required operation; do not chain inspect, query, DOM reads, or screenshot after sufficient evidence is already available. If inspect already lists the complete available options and none matches the user\'s intent, do not call screenshot, query, or inspect again; stop and ask the user. When a click is expected to navigate the main document, use `click_and_wait_for_navigation` so navigation listeners are registered before the click; keep ordinary non-navigation interactions on `click`. An ordinary `click` result proves only that input was dispatched; the requested page effect is not verified. Use `inspect`, `query`, or `screenshot` after it and confirm the expected state before claiming that the click achieved the user\'s goal. `upload_files` uses `input: { ref, paths }` with the opaque upload ref and exact current-turn attachment or active-workspace file paths; do not wrap them in a target object. `upload_files` is the only file validation call for this workflow; do not preflight with shell/read/stat/test/ls. Final publish, send, delete, purchase, or other externally visible actions require explicit user confirmation immediately before the action; broad initial requests or vague continuation messages do not count. Do not create a reminder, automation, scheduled task, background monitor, or follow-up merely to wait for confirmation. To read page text or DOM, use query with an explicit input.kind. Query `selector` is supported only for `text` and `dom`; `snapshot` and `editable` reject it. Reuse opaque element refs only for the snapshot that returned them. Continue truncated inspect results with action `inspect`, and truncated editable-query results with action `query`; in both cases preserve the returned snapshotId and nextOffset inside input. Arbitrary JavaScript execution is not available outside `run_script`: when the active provider exposes `run_script`, page JavaScript runs only through its `page.evaluate`; otherwise it is not available at all. Never simulate JavaScript execution through another tool. ',
+    "When the active provider exposes `run_script`, use it for input the single-step actions cannot express: holding keys (game movement), modifier+mouse combinations, timed or repeated sequences, and checks that read page state before deciding where to act. The script body runs in an isolated worker with no Node, filesystem or network APIs against the current tab; page.keyboard/page.mouse send real input, every held key and mouse button is released when the script ends, fails, times out or is cancelled, and refs from earlier inspect calls are invalidated afterwards. page.evaluate runs JavaScript inside the page with its full capabilities (including fetch with the page cookies) and is reported per call site in `pageEvaluate`; do not use it to set the state you are trying to verify. Script screenshots (at most four, plus one on failure) are returned as images. Prefer single-step actions for ordinary form and link interaction. ",
     'When the active provider exposes `paste`, it accepts only an opaque `ref`, non-empty plain `text`, and optional `frame` or `clear`; it never reads the host operating-system clipboard. ',
     'When the active provider exposes `return_to_previous_tab`, use it to close the current headless tab and resume the page most recently preserved by `open_tab`. `back` and `forward` only traverse history inside the active tab and never return to a preserved tab. ',
     "Query kind `console` is available by default whenever this Browser tool is present; it needs no developer mode or experimental flag. Use it only for the active tab's current top-level page-load console and uncaught-exception diagnosis. Results are bounded, per-tab, reset on top-level navigation, redact URL query/fragment and common credential-shaped values, and accept optional `levels`, message `filter`, and `limit` fields to reduce unrelated tool output. ",
@@ -845,6 +888,15 @@ export const LocalBrowserClickToolDef = {
   }),
 } as const satisfies ToolDefinition;
 export type LocalBrowserClickToolInput = Static<typeof LocalBrowserClickToolDef.schema>;
+
+export const LocalBrowserRunScriptToolDef = {
+  name: 'browser_run_script',
+  executionMode: 'sequential',
+  description:
+    'Run a scripted input scenario against the active session-scoped Browser tab. The script body runs in an isolated worker with no Node, filesystem or network APIs; page.keyboard/page.mouse send real input, every held key and mouse button is released when the script ends, fails, times out or is cancelled, and refs from earlier inspect calls are invalidated afterwards. page.evaluate runs JavaScript inside the page with its full capabilities and is reported per call site; do not use it to set the state you are trying to verify. Script screenshots (at most four, plus one on failure) are returned as images. Prefer single-step actions for ordinary form and link interaction.',
+  schema: BrowserRunScriptInput,
+} as const satisfies ToolDefinition;
+export type LocalBrowserRunScriptToolInput = Static<typeof LocalBrowserRunScriptToolDef.schema>;
 
 export const LocalBrowserTypeToolDef = {
   name: 'browser_type',

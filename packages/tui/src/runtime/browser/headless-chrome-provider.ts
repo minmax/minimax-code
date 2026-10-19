@@ -46,6 +46,7 @@ const HEADLESS_ACTIONS = [
   'uncheck',
   'select_option',
   'upload_files',
+  'run_script',
   'paste',
   'scroll',
   'hover',

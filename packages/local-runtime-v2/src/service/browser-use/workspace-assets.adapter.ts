@@ -1,4 +1,4 @@
-import { realpath, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { basename, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import {
@@ -8,6 +8,7 @@ import {
   type LocalBrowserToolAction,
   type LocalRuntimeToolContext,
 } from '@mavis/agent-tools/desktop';
+import { BROWSER_SCRIPT_CODE_MAX_BYTES } from '@mavis/browser-core';
 
 const MAX_BROWSER_UPLOAD_FILES = 20;
 const MAX_BROWSER_UPLOAD_TOTAL_BYTES = 512 * 1024 * 1024;
@@ -47,6 +48,9 @@ export function createWorkspaceBrowserAssetAdapter(
       },
     async execute(ctx, action, input, signal) {
       throwIfAborted(signal);
+      if (action === 'run_script') {
+        return delegate.execute(ctx, action, await resolveRunScriptInput(input, options.workspaceRoot), signal);
+      }
       if (action !== 'upload_files') return delegate.execute(ctx, action, input, signal);
 
       const files = await resolveAuthorizedUploadPaths(ctx, input, options.workspaceRoot, signal);
@@ -58,6 +62,45 @@ export function createWorkspaceBrowserAssetAdapter(
       );
     },
   };
+}
+
+/**
+ * run_script accepts an active-workspace `.js` file instead of inline code.
+ * The file is read here — the only layer that knows the workspace root — so
+ * the provider and Browser Core only ever see inline code.
+ */
+async function resolveRunScriptInput(
+  input: Record<string, unknown>,
+  workspaceRoot: string,
+): Promise<Record<string, unknown>> {
+  const path = typeof input.path === 'string' ? input.path : undefined;
+  if (path === undefined) {
+    if (typeof input.code !== 'string' || input.code.length === 0) {
+      throw new Error('RUN_SCRIPT_INPUT_INVALID: exactly one of code or path is required');
+    }
+    return input;
+  }
+  if (typeof input.code === 'string' && input.code.length > 0) {
+    throw new Error('RUN_SCRIPT_INPUT_INVALID: pass either code or path, not both');
+  }
+  if (!path.endsWith('.js')) {
+    throw new Error('RUN_SCRIPT_INPUT_INVALID: path must point to a .js file');
+  }
+  const root = await realpath(workspaceRoot);
+  const candidate = isAbsolute(path) ? path : resolve(root, path);
+  const real = await realpath(candidate).catch(() => {
+    throw new Error('RUN_SCRIPT_INPUT_INVALID: script file does not exist');
+  });
+  if (!isPathInside(root, real)) {
+    throw new Error('RUN_SCRIPT_INPUT_INVALID: script path must be inside the active workspace');
+  }
+  const content = await readFile(real, 'utf8').catch(() => {
+    throw new Error('RUN_SCRIPT_INPUT_INVALID: script file could not be read');
+  });
+  if (Buffer.byteLength(content, 'utf8') > BROWSER_SCRIPT_CODE_MAX_BYTES) {
+    throw new Error(`RUN_SCRIPT_INPUT_INVALID: script file exceeds ${BROWSER_SCRIPT_CODE_MAX_BYTES} bytes`);
+  }
+  return { ...input, code: content, filename: basename(real), path: undefined };
 }
 
 async function resolveAuthorizedUploadPaths(

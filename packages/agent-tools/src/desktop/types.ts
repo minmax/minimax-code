@@ -211,7 +211,8 @@ export type LocalBrowserToolAction =
   | 'upload_files'
   | 'paste'
   | 'verify_text'
-  | 'inspect_editable_targets';
+  | 'inspect_editable_targets'
+  | 'run_script';
 
 export interface LocalBrowserAdapter {
   getCapabilities?(): BrowserProviderCapabilities;

@@ -454,6 +454,68 @@ read, stat, `test`, `ls`, or another filesystem tool; call `upload_files` direct
    returned recovery guidance; do not fall back to shell, standalone Playwright, AppleScript, or
    Computer Use.
 
+## Scripted Input With run_script
+
+Use `run_script` only when the active provider advertises it and single-step actions cannot
+express the check: holding keys (game movement), modifier plus mouse combinations, timed or repeated
+input, or a loop that reads page state before choosing where to act. Ordinary forms, links and
+one-off key presses stay on the single-step actions.
+
+The input is an async function body, either inline `code` or a saved active-workspace `.js` `path`
+(exactly one), with an optional `timeout` (1000-120000 ms, default 30000). The script body runs in an
+isolated worker with no Node.js APIs, filesystem, network or `require`; `page.evaluate` runs inside
+the page with that page's full capabilities, including `fetch` with its cookies. In scope:
+
+- `page.keyboard.down/up/press/type` and `page.mouse.move/down/up/click/wheel`: real input to the
+  page. Keys accept `KeyW`, `ArrowUp`, `Shift`, `Enter` style names; clicks made while a modifier is
+  held carry that modifier. Coordinates are main-Frame viewport CSS pixels. The pointer position
+  does not carry over between actions: call `page.mouse.move` or `page.mouse.click` before
+  `mouse.down`/`mouse.up`/`mouse.wheel` in every script.
+- `page.waitForTimeout(ms)`, `page.waitForFunction(fn, arg, { timeout, polling })`.
+- `page.evaluate(fn, arg)`: page JavaScript returning a JSON value.
+- `page.screenshot({ label })`, `page.consoleMessages({ levels })`, `page.url()`, `page.title()`,
+  `page.viewportSize()`.
+- `assert.ok/equal/notEqual/deepEqual/fail` and `console.log`.
+
+Example:
+
+```js
+await page.keyboard.down('Shift');
+await page.keyboard.down('KeyD');
+for (let i = 0; i < 7; i += 1) {
+  await page.waitForTimeout(140);
+  await page.mouse.click(520, 330);
+}
+await page.keyboard.up('KeyD');
+await page.keyboard.up('Shift');
+const state = await page.evaluate(() => window.__game.previewMismatches);
+assert.equal(state, 0, 'preview and click disagreed');
+await page.screenshot({ label: 'after-clicks' });
+return { mismatches: state };
+```
+
+Evidence rules:
+
+- Drive the behavior under test with `page.keyboard` and `page.mouse`. Use `page.evaluate` to read
+  state or arrange a precondition, never to perform the action being verified. The result lists every
+  `page.evaluate` call site in `pageEvaluate`; report a conclusion as input-verified only when the
+  asserted behavior came from real input.
+- Every key and mouse button still held when the script returns, throws, times out or is cancelled is
+  released automatically and listed in `input.autoReleased`. Treat a non-empty list as a script bug
+  to fix, not as a verified release.
+- A failure returns `code`, `error.message` and `error.location` (script line and column) plus one
+  failure screenshot. Fix the script or the page and rerun; do not retry an unchanged script.
+- Refs from earlier `inspect` calls are invalid after `run_script`; inspect again before a ref
+  action.
+- Keep `page.evaluate` short and synchronous where possible. An async `page.evaluate` interrupted by
+  a timeout or cancellation can still finish in the page later; when `pageEvaluate.interrupted` is
+  present, reload or re-inspect the page before trusting its state.
+- `assert.deepEqual` compares JSON data only; convert a Set, Map or Date first (for example
+  `[...set].sort()`, `date.getTime()`).
+- Save scripts that should be rerun after code changes under the workspace and call them by `path`.
+- Headless rendering may be software rendering. Do not report frame rate or GPU performance from a
+  script as real-hardware performance.
+
 ## Screenshot Visibility Boundary
 
 A Browser `screenshot` result is model-visible inspection evidence and is not shown to the user by
