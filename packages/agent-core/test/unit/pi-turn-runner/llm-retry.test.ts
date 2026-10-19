@@ -259,7 +259,7 @@ describe("withLLMRetry", () => {
         callId: "call-1",
         status: "waiting",
         retryAttempt: 1,
-        maxRetries: 5,
+        maxRetries: DEFAULT_LLM_RETRY_POLICY.maxRetries,
         requestAttempt: 2,
         delayMs: 500,
         error: { reason: "rate_limited" },
@@ -268,7 +268,7 @@ describe("withLLMRetry", () => {
         callId: "call-1",
         status: "recovered",
         retryAttempt: 1,
-        maxRetries: 5,
+        maxRetries: DEFAULT_LLM_RETRY_POLICY.maxRetries,
         requestAttempt: 2,
       },
     ]);
@@ -516,7 +516,7 @@ describe("withLLMRetry", () => {
     expect(attempts).toBe(2);
   });
 
-  it("uses five retries by default and emits exhausted after the sixth request", async () => {
+  it("uses one hundred retries by default and emits exhausted after the 101st request", async () => {
     let attempts = 0;
     const observed: LLMRetryEvent[] = [];
     const settled: LLMCallSettledEvent[] = [];
@@ -537,19 +537,21 @@ describe("withLLMRetry", () => {
     const result = await wrapped(fakeModel(), CONTEXT, {});
     await collectEvents(result);
 
-    expect(DEFAULT_LLM_RETRY_POLICY.maxRetries).toBe(5);
-    expect(attempts).toBe(6);
-    expect(sleep.mock.calls.map(([delayMs]) => delayMs)).toEqual([
-      500, 1_000, 2_000, 4_000, 8_000,
-    ]);
+    expect(DEFAULT_LLM_RETRY_POLICY.maxRetries).toBe(100);
+    expect(attempts).toBe(101);
+    const delays = sleep.mock.calls.map(([delayMs]) => delayMs);
+    expect(delays).toHaveLength(100);
+    expect(delays.slice(0, 4)).toEqual([500, 1_000, 2_000, 4_000]);
+    // random is pinned to 0, so every capped attempt sleeps half the cap.
+    expect(new Set(delays.slice(6))).toEqual(new Set([15_000]));
     expect(observed.filter((event) => event.status === "waiting")).toHaveLength(
-      5,
+      100,
     );
     expect(observed.at(-1)).toMatchObject({
       status: "exhausted",
-      retryAttempt: 5,
-      maxRetries: 5,
-      requestAttempt: 6,
+      retryAttempt: 100,
+      maxRetries: 100,
+      requestAttempt: 101,
       error: { reason: "overloaded" },
     });
     await result.result();
@@ -558,12 +560,12 @@ describe("withLLMRetry", () => {
         final: { outcome: "error", errorKind: "overloaded" },
         retryTriggered: true,
         retryReason: "overloaded",
-        requestAttempts: 6,
+        requestAttempts: 101,
       },
     ]);
   });
 
-  it("limits BYOK errors to five retries regardless of error classification", async () => {
+  it("limits BYOK errors to the default retry budget regardless of error classification", async () => {
     let attempts = 0;
     const inner = (async () => {
       attempts += 1;
@@ -577,7 +579,7 @@ describe("withLLMRetry", () => {
     const result = await wrapped(fakeModel("minimax_api"), CONTEXT, {});
     await collectEvents(result);
 
-    expect(attempts).toBe(6);
+    expect(attempts).toBe(DEFAULT_LLM_RETRY_POLICY.maxRetries + 1);
   });
 
   // #425: a request the provider deterministically rejects (too many images,
@@ -649,7 +651,7 @@ describe("withLLMRetry", () => {
 
     await collectEvents(await wrapped(fakeModel("custom_provider:work"), CONTEXT, {}));
 
-    expect(attempts).toBe(6);
+    expect(attempts).toBe(DEFAULT_LLM_RETRY_POLICY.maxRetries + 1);
   });
 
   it("keeps the exhausted attempt open when returning its terminal failure stream", async () => {
