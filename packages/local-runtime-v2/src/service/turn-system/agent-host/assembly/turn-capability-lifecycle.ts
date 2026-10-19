@@ -46,11 +46,31 @@ export interface AgentHostTurnRuntimeToolBinding {
   readonly tool: RuntimeTool;
 }
 
+/** One plugin-declared subagent exposed to delegation for exactly one turn. */
+export interface AgentHostTurnAgentCapability {
+  readonly pluginName: string;
+  /** Plugin-scoped delegate name: "<plugin>:<agent>". */
+  readonly name: string;
+  readonly agentName: string;
+  readonly description: string;
+  readonly systemPrompt: string;
+  readonly model?: string;
+  readonly effort?: string;
+  readonly tools?: readonly string[];
+  readonly disallowedTools?: readonly string[];
+  readonly mcpServers?: readonly string[];
+  readonly skills?: readonly string[];
+  readonly pluginRoot: string;
+  readonly packageDigest: string;
+  readonly sourceKind: 'local';
+}
+
 /** Immutable Plugin/App/MCP projection captured for exactly one v2 execution. */
 export interface AgentHostTurnCapabilityView {
   readonly revision: string;
   readonly plugins: readonly AgentHostTurnPluginCapability[];
   readonly skills: readonly AgentHostTurnSkillCapability[];
+  readonly agents?: readonly AgentHostTurnAgentCapability[];
   readonly runtimeTools: readonly RuntimeTool[];
   readonly runtimeToolBindings: readonly AgentHostTurnRuntimeToolBinding[];
   readonly hostBindings?: readonly AgentHostTurnHostBinding[];

@@ -1,9 +1,12 @@
+import { join } from 'node:path';
+
 import { getRuntimePresetKey, resolveModelAvailability } from '@mavis/config';
 import {
   hasConversationTaskModelSelection,
   type ConversationModelThinkingSelection,
   type ConversationModelSelection,
   type ConversationTaskModelSelection,
+  type ConversationTaskPluginAgent,
 } from '@mavis/conversation-contract';
 import type { AgentExecutionProfile, LocalAgentService } from '../../service/agent/index.js';
 import {
@@ -47,6 +50,8 @@ export interface TaskAgentBindingCaptureCoordinator {
 
 interface TaskAgentBindingCaptureInput {
   readonly agentName: string;
+  /** Plugin-declared delegate; the Session runs under the `worker` role. */
+  readonly pluginAgent?: ConversationTaskPluginAgent;
   /** The Session being frozen. V1 callers may provide only `parent`. */
   readonly session?: SessionRecord;
   readonly parent?: SessionRecord;
@@ -125,14 +130,21 @@ async function captureDefinition(
   const session = input.session ?? input.parent;
   if (!session) throw new Error('Session Agent definition capture requires a Session.');
   const config = options.config();
-  const profile = await renderSessionProfile({
-    options,
-    config,
-    agentName: input.agentName,
-    session,
-    appMode: input.appMode,
-    legacyTaskSurface: input.session === undefined,
-  });
+  const profile = input.pluginAgent
+    ? renderPluginAgentProfile({
+        declaration: input.pluginAgent,
+        config,
+        session,
+        ...(input.appMode ? { appMode: input.appMode } : {}),
+      })
+    : await renderSessionProfile({
+        options,
+        config,
+        agentName: input.agentName,
+        session,
+        appMode: input.appMode,
+        legacyTaskSurface: input.session === undefined,
+      });
   const frozenSurface = input.legacyDefinition ?? {
     systemPrompt: profile.agentSystemPrompt ?? '',
     ...(profile.promptSnapshot ? { promptSnapshot: profile.promptSnapshot } : {}),
@@ -153,7 +165,11 @@ async function captureDefinition(
   const effectiveModel = `${selection.providerId}/${selection.modelId}`;
   const variant = resolvedModelVariant({ selection, session, parent: input.parent });
   const thinking = resolvedThinkingSelection({ selection, session, parent: input.parent });
-  const ownerInstanceId = await captureOwnerInstanceId(options.agentService, profile);
+  // A plugin declaration has no persisted Agent row, so there is no owner
+  // instance to verify; the scoped name itself is the provenance.
+  const ownerInstanceId = input.pluginAgent
+    ? undefined
+    : await captureOwnerInstanceId(options.agentService, profile);
   return buildCapturedDefinition({
     profile,
     frozenSurface,
@@ -329,6 +345,80 @@ function buildAgentDefinition(input: {
       },
     },
   };
+}
+
+/**
+ * Synthetic profile for a plugin-declared delegate — the counterpart of the
+ * upstream frozen profile: the declaration's own system prompt with plugin
+ * root/data tokens substituted, and a ceiling that forbids further
+ * delegation so a plugin agent cannot spawn children.
+ */
+function renderPluginAgentProfile(input: {
+  readonly declaration: ConversationTaskPluginAgent;
+  readonly config: LocalConversationRuntimeConfig;
+  readonly session: SessionRecord;
+  readonly appMode?: SessionRecord['appMode'];
+}): AgentExecutionProfile {
+  const { declaration } = input;
+  const pluginDataDir = join(
+    input.config.dataDir,
+    'v2',
+    'plugin-data',
+    'agent-plugins',
+    declaration.pluginName,
+  );
+  const systemPrompt = substitutePluginTokens(declaration.systemPrompt, {
+    pluginRoot: declaration.pluginRoot,
+    pluginDataDir,
+  });
+  return {
+    requestRef: declaration.name,
+    resourceReadRef: declaration.name,
+    exactOwnerName: declaration.name,
+    canonicalViewName: declaration.name,
+    resolvedAgentName: declaration.name,
+    agentRole: 'worker',
+    creationSource: 'auto',
+    surface: 'task-child',
+    memoryReadAgentNames: [],
+    agentSystemPrompt: systemPrompt,
+    corePrompt: systemPrompt,
+    surfacePrompt: '',
+    configSelection: {
+      ...(declaration.model ? { model: declaration.model } : {}),
+      ...(declaration.effort ? { effort: declaration.effort } : {}),
+      ...(declaration.tools ? { tools: declaration.tools } : {}),
+      ...(declaration.disallowedTools ? { disallowedTools: declaration.disallowedTools } : {}),
+      ...(declaration.mcpServers ? { mcpServers: declaration.mcpServers } : {}),
+      ...(declaration.skills ? { skills: declaration.skills } : {}),
+    },
+    capabilityCeiling: {
+      personaEnabled: false,
+      features: { mavis: false, delegation: false, webSearch: false },
+    },
+    provenance: {
+      // Launch-scoped, not user-authored: a plugin declaration is never a
+      // persisted custom Agent file.
+      source: 'custom',
+      assetAgentName: declaration.name,
+      locale: 'en-US',
+    },
+  };
+}
+
+/**
+ * Expand the plugin placeholder family (`${PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_ROOT}`,
+ * `${<NAME>_PLUGIN_ROOT}` and the `_PLUGIN_DATA` variants) against this plugin's
+ * resolved roots.
+ */
+export function substitutePluginTokens(
+  prompt: string,
+  roots: { readonly pluginRoot: string; readonly pluginDataDir: string },
+): string {
+  return prompt.replace(
+    /\$\{(?:CLAUDE_)?(?:[A-Z0-9_]+_)?(PLUGIN_ROOT|PLUGIN_DATA)\}/gu,
+    (_, which: string) => (which === 'PLUGIN_ROOT' ? roots.pluginRoot : roots.pluginDataDir),
+  );
 }
 
 async function renderSessionProfile(input: {

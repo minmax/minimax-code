@@ -74,7 +74,7 @@ export const AGENT_REQUEST_REF_DESCRIPTION =
 export const LOCAL_MAVIS_AGENT_NAME_DESCRIPTION = `${AGENT_REQUEST_REF_DESCRIPTION} "me" selects the current Agent.`;
 
 const TASK_AGENT_REQUEST_REF_DESCRIPTION =
-  'Built-in name or stable custom `requestRef`. Use `agent:<stable-name>` for a custom Agent whose name collides with a reserved role or primary alias; ordinary custom names use their raw stable name. Use the native `mavis` tool with command "agent list" for discovery only when needed and available.';
+  'Built-in name, stable custom `requestRef`, or a plugin-declared subagent selected by its `<plugin>:<agent>` scoped name from the Plugin context. Use `agent:<stable-name>` for a custom Agent whose name collides with a reserved role or primary alias; ordinary custom names use their raw stable name. Use the native `mavis` tool with command "agent list" for discovery only when needed and available.';
 
 const WITHOUT_MAVIS_AGENT_REQUEST_REF_DESCRIPTION =
   'Use explore, worker, or verifier for built-in work. For a known custom Agent, use its stable `requestRef`. Use `agent:<stable-name>` to select the exact manual/custom Agent when its name collides with a reserved role or primary alias; ordinary custom names use their raw stable name.';

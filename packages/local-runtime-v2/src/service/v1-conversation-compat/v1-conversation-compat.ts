@@ -331,6 +331,7 @@ function toInternalSessionInput(
   const workspaceDir = nonEmpty(input.workspaceDir);
   return {
     agentName: input.agentName,
+    ...(input.taskPluginAgent ? { taskPluginAgent: input.taskPluginAgent } : {}),
     ...(workspaceDir ? { workspaceDir } : {}),
     sessionType: 'branch',
     ...sessionClassification(input),

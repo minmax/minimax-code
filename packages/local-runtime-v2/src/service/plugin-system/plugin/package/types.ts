@@ -66,6 +66,14 @@ export interface PluginAgentDefinition {
   readonly description: string;
   readonly content: string;
   readonly sourcePath: string;
+  /** Body after the frontmatter delimiter — the delegate's system prompt. */
+  readonly systemPrompt: string;
+  readonly model?: string;
+  readonly effort?: string;
+  readonly tools?: readonly string[];
+  readonly disallowedTools?: readonly string[];
+  readonly mcpServers?: readonly string[];
+  readonly skills?: readonly string[];
 }
 
 export type PluginHostBindingSurface = 'interactive';

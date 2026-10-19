@@ -132,8 +132,33 @@ export interface ConversationSessionListOptions {
   readonly scanLimit?: number;
 }
 
+/**
+ * Plugin-declared subagent frozen into a Task Session. The session itself
+ * runs under the builtin `worker` role; this declaration supplies its
+ * system prompt and capability selection.
+ */
+export interface ConversationTaskPluginAgent {
+  readonly pluginName: string;
+  /** Plugin-scoped delegate name: "<plugin>:<agent>". */
+  readonly name: string;
+  readonly agentName: string;
+  readonly description: string;
+  readonly systemPrompt: string;
+  readonly model?: string;
+  readonly effort?: string;
+  readonly tools?: readonly string[];
+  readonly disallowedTools?: readonly string[];
+  readonly mcpServers?: readonly string[];
+  readonly skills?: readonly string[];
+  readonly pluginRoot: string;
+  readonly packageDigest: string;
+  readonly sourceKind: 'local';
+}
+
 export interface ConversationSessionCreateInput {
   readonly agentName: string;
+  /** Set only when `agentName` is the builtin `worker` backing a plugin agent. */
+  readonly taskPluginAgent?: ConversationTaskPluginAgent;
   readonly workspaceDir?: string;
   readonly sessionType?: "root" | "branch";
   readonly sessionKind?: ConversationSessionKind;

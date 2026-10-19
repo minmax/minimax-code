@@ -261,7 +261,7 @@ async function readAgentDefinition(
   const { content } = await readPluginTextFile(root, relativePath, {
     rejectBom: true,
   });
-  const frontmatter = parseAgentFrontmatter(content, relativePath);
+  const { frontmatter, systemPrompt } = parseAgentFrontmatter(content, relativePath);
   const name = optionalString(frontmatter.name, 'name');
   if (!name) readerFail('AGENT_SCHEMA_INVALID', `${relativePath} has no agent name`);
   if (name !== directoryName || name.length > 64 || !AGENT_NAME.test(name)) {
@@ -271,19 +271,56 @@ async function readAgentDefinition(
   if (!description || description.length > 1_024) {
     readerFail('AGENT_SCHEMA_INVALID', `${relativePath} agent description is invalid`);
   }
+  const model = optionalStringField(frontmatter.model, relativePath);
+  const effort = optionalStringField(frontmatter.effort, relativePath);
+  const tools = optionalStringArrayField(frontmatter.tools, 'tools', relativePath);
+  const disallowedTools = optionalStringArrayField(
+    frontmatter.disallowedTools,
+    'disallowedTools',
+    relativePath,
+  );
+  const mcpServers = optionalStringArrayField(frontmatter.mcpServers, 'mcpServers', relativePath);
+  const skills = optionalStringArrayField(frontmatter.skills, 'skills', relativePath);
   return {
     name,
     scopedName: `${pluginName}:${name}`,
     description,
     content,
     sourcePath: relativePath,
+    systemPrompt,
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+    ...(tools ? { tools } : {}),
+    ...(disallowedTools ? { disallowedTools } : {}),
+    ...(mcpServers ? { mcpServers } : {}),
+    ...(skills ? { skills } : {}),
   };
+}
+
+function optionalStringField(value: unknown, relativePath: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.length === 0) {
+    readerFail('AGENT_SCHEMA_INVALID', `${relativePath} frontmatter field must be a non-empty string`);
+  }
+  return value;
+}
+
+function optionalStringArrayField(
+  value: unknown,
+  label: string,
+  relativePath: string,
+): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string' || item.length === 0)) {
+    readerFail('AGENT_SCHEMA_INVALID', `${relativePath} ${label} must contain non-empty strings`);
+  }
+  return value as readonly string[];
 }
 
 function parseAgentFrontmatter(
   content: string,
   relativeAgentFile: string,
-): Record<string, unknown> {
+): { frontmatter: Record<string, unknown>; systemPrompt: string } {
   const opening = /^---\r?\n/u.exec(content);
   if (!opening) {
     readerFail('AGENT_SCHEMA_INVALID', `${relativeAgentFile} must start with YAML frontmatter`);
@@ -294,6 +331,9 @@ function parseAgentFrontmatter(
     readerFail('AGENT_SCHEMA_INVALID', `${relativeAgentFile} has unclosed YAML frontmatter`);
   }
   const yamlText = remainder.slice(0, closing.index);
+  const systemPrompt = remainder
+    .slice(closing.index + closing[0].length)
+    .trim();
   let document: ReturnType<typeof parseDocument>;
   try {
     document = parseDocument(yamlText, { uniqueKeys: true });
@@ -312,7 +352,7 @@ function parseAgentFrontmatter(
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     readerFail('AGENT_SCHEMA_INVALID', `${relativeAgentFile} frontmatter must be a mapping`);
   }
-  return value as Record<string, unknown>;
+  return { frontmatter: value as Record<string, unknown>, systemPrompt };
 }
 
 async function readMcp(

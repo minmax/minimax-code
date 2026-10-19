@@ -49,6 +49,7 @@ describe('local plugin agent definitions', () => {
       name: 'code-reviewer',
       scopedName: 'helper-tools:code-reviewer',
       description: 'Reviews patches for correctness',
+      systemPrompt: 'Review the diff carefully.',
     });
     expect(agent?.content).toContain('Review the diff carefully.');
     expect(agent?.sourcePath).toBe('agents/code-reviewer/AGENT.md');
@@ -80,6 +81,39 @@ describe('local plugin agent definitions', () => {
       expect.objectContaining({ capability: 'AGENT', name: 'Bad_Name' }),
     );
     expect(pkg.skills).toHaveLength(1);
+  });
+
+  it('parses optional capability fields from the frontmatter', async () => {
+    const pluginRoot = await writePlugin('capable-agents', {
+      'plugin.json': JSON.stringify({ $schema: PLUGIN_SCHEMA, name: 'capable-agents' }),
+      'agents/scoped-runner/AGENT.md':
+        '---\nname: scoped-runner\ndescription: Runs checks\nmodel: inherit\neffort: high\ntools:\n  - read\n  - bash\ndisallowedTools:\n  - write\nskills:\n  - code-review\n---\nRun the checks.\n',
+    });
+    const pkg = await readAgentPluginPackage(pluginRoot, options);
+    expect(pkg.agents?.[0]).toMatchObject({
+      name: 'scoped-runner',
+      model: 'inherit',
+      effort: 'high',
+      tools: ['read', 'bash'],
+      disallowedTools: ['write'],
+      skills: ['code-review'],
+      systemPrompt: 'Run the checks.',
+    });
+  });
+
+  it('collects a diagnostic for a non-array tools field', async () => {
+    const pluginRoot = await writePlugin('bad-tools', {
+      'plugin.json': JSON.stringify({ $schema: PLUGIN_SCHEMA, name: 'bad-tools' }),
+      'agents/checker/AGENT.md':
+        '---\nname: checker\ndescription: x\ntools: read\n---\nBody.\n',
+      'skills/real-skill/SKILL.md':
+        '---\nname: real-skill\ndescription: A real skill\n---\nBody.\n',
+    });
+    const pkg = await readAgentPluginPackage(pluginRoot, options);
+    expect(pkg.agents).toBeUndefined();
+    expect(pkg.diagnostics).toContainEqual(
+      expect.objectContaining({ capability: 'AGENT', name: 'checker' }),
+    );
   });
 
   it('returns no agents field when the directory is absent', async () => {

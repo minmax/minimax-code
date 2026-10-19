@@ -2,11 +2,12 @@ import { join } from "node:path";
 
 import type {
   AgentDetail,
-  CreateAgentInput as CreateAgentInput,
+  CreateAgentInput,
 } from "@mavis/protocol/local";
 import type {
   ConversationSessionKind,
   ConversationTaskModelSelection,
+  ConversationTaskPluginAgent,
   RuntimeConversation,
 } from "@mavis/conversation-contract";
 import type { GlobalEventInput } from "@mavis/shared/global-events";
@@ -688,6 +689,7 @@ export class LocalApiAgentRoutes {
 
   async createSession(input: {
     agentName?: string;
+    taskPluginAgent?: ConversationTaskPluginAgent;
     workspaceDir?: string;
     sessionType?: "root" | "branch";
     sessionKind?: ConversationSessionKind;

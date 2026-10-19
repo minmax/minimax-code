@@ -1,6 +1,7 @@
 import path from 'node:path';
 
 import type {
+  AgentHostTurnAgentCapability,
   AgentHostTurnCapabilityView as DesktopTurnCapabilityView,
   AgentHostTurnRuntimeToolBinding as DesktopTurnRuntimeToolBinding,
 } from '../../../turn-system/index.js';
@@ -91,6 +92,7 @@ export interface PluginSnapshot {
   readonly enabledPlugins: readonly PluginSnapshotEnabledProjection[];
   readonly skills: readonly PluginSkill[];
   readonly mcpServers: readonly PluginSnapshotMcpServer[];
+  readonly agents: readonly AgentHostTurnAgentCapability[];
   readonly diagnostics: readonly PluginSnapshotDiagnostic[];
   readonly turnCapabilities: DesktopTurnCapabilityView;
 }
@@ -111,10 +113,12 @@ interface SnapshotBuildState {
   readonly skills: PluginSkill[];
   readonly skillOwners: Map<PluginSkill, string>;
   mcpServers: PluginSnapshotMcpServer[];
+  readonly agents: AgentHostTurnAgentCapability[];
   readonly hooks: NonNullable<ReadPluginPackage['hooks']>[number][];
   readonly hostBindings: DesktopTurnHostBinding[];
   readonly pluginNames: Set<string>;
   readonly skillNames: Set<string>;
+  readonly agentNames: Set<string>;
 }
 
 export class PluginSnapshotBuilder {
@@ -175,6 +179,11 @@ export class PluginSnapshotBuilder {
           }),
         ),
       ),
+      agents: freeze(
+        [...state.agents]
+          .sort((left, right) => left.name.localeCompare(right.name))
+          .map((agent) => freeze(agent)),
+      ),
       // P4B owns live Plugin MCP tool construction. P1A freezes the per-turn
       // slot now so later tools use the same snapshot as prompt and skill reads.
       runtimeTools: freeze([]),
@@ -190,6 +199,7 @@ export class PluginSnapshotBuilder {
       enabledPlugins: freeze(state.enabledPlugins),
       skills: frozenSkills,
       mcpServers: freeze(state.mcpServers),
+      agents: freeze(state.agents),
       diagnostics: freeze(state.diagnostics),
       turnCapabilities,
     });
@@ -233,10 +243,12 @@ function createSnapshotBuildState(reservations: PluginCapabilityReservations): S
     skills: [],
     skillOwners: new Map(),
     mcpServers: [],
+    agents: [],
     hooks: [],
     hostBindings: [],
     pluginNames: new Set(),
     skillNames: new Set(reservations.skillNames.map(normalizedSkillKey)),
+    agentNames: new Set(),
   };
 }
 
@@ -320,6 +332,7 @@ function appendLocalPlugin(
   state.skills.push(...accepted.skills);
   for (const skill of accepted.skills) state.skillOwners.set(skill, plugin.name);
   state.mcpServers.push(...accepted.mcpServers);
+  state.agents.push(...accepted.agents);
   state.hooks.push(...accepted.hooks);
   state.hostBindings.push(...accepted.hostBindings);
 }
@@ -349,6 +362,7 @@ function capabilityCollisionState(state: SnapshotBuildState) {
   return {
     pluginNames: state.pluginNames,
     skillNames: state.skillNames,
+    agentNames: state.agentNames,
     diagnostics: state.diagnostics,
   };
 }
@@ -360,6 +374,7 @@ interface PackageCapabilityAcceptanceInput {
   includeRuntimeCapabilities: boolean;
   pluginNames: Set<string>;
   skillNames: Set<string>;
+  agentNames: Set<string>;
   diagnostics: PluginSnapshotDiagnostic[];
 }
 
@@ -367,6 +382,7 @@ function acceptPackageCapabilities(input: PackageCapabilityAcceptanceInput):
   | {
       skills: PluginSkill[];
       mcpServers: PluginSnapshotMcpServer[];
+      agents: AgentHostTurnAgentCapability[];
       hooks: NonNullable<ReadPluginPackage['hooks']>[number][];
       hostBindings: DesktopTurnHostBinding[];
     }
@@ -385,15 +401,54 @@ function acceptPackageCapabilities(input: PackageCapabilityAcceptanceInput):
   const pluginKey = collisionKey(plugin.name);
   input.pluginNames.add(pluginKey);
   if (!input.includeRuntimeCapabilities) {
-    return { skills: [], mcpServers: [], hooks: [], hostBindings: [] };
+    return { skills: [], mcpServers: [], agents: [], hooks: [], hostBindings: [] };
   }
   const skills = acceptPackageSkills(input);
   return {
     skills,
     mcpServers: acceptPackageServers(input),
+    // Upstream keeps declared subagents in the runtime roster for local
+    // plugins only; official packages never contribute agents.
+    agents: input.sourceKind === 'local' ? acceptPackageAgents(input) : [],
     hooks: [...(plugin.hooks ?? [])],
     hostBindings: acceptHostBindings(input, skills),
   };
+}
+
+function acceptPackageAgents(input: PackageCapabilityAcceptanceInput): AgentHostTurnAgentCapability[] {
+  const { plugin } = input;
+  return (plugin.agents ?? []).flatMap((declaration) => {
+    const key = normalizedSkillKey(declaration.scopedName);
+    if (input.agentNames.has(key)) {
+      input.diagnostics.push(
+        freeze({
+          code: conflictCode('local', 'AGENT'),
+          pluginName: plugin.name,
+          capabilityName: declaration.scopedName,
+        }),
+      );
+      return [];
+    }
+    input.agentNames.add(key);
+    return [
+      freeze({
+        pluginName: plugin.name,
+        name: declaration.scopedName,
+        agentName: declaration.name,
+        description: declaration.description,
+        systemPrompt: declaration.systemPrompt,
+        ...(declaration.model ? { model: declaration.model } : {}),
+        ...(declaration.effort ? { effort: declaration.effort } : {}),
+        ...(declaration.tools ? { tools: declaration.tools } : {}),
+        ...(declaration.disallowedTools ? { disallowedTools: declaration.disallowedTools } : {}),
+        ...(declaration.mcpServers ? { mcpServers: declaration.mcpServers } : {}),
+        ...(declaration.skills ? { skills: declaration.skills } : {}),
+        pluginRoot: plugin.rootPath,
+        packageDigest: input.packageContentDigest,
+        sourceKind: 'local' as const,
+      }),
+    ];
+  });
 }
 
 function acceptHostBindings(
@@ -482,7 +537,10 @@ function acceptPackageServers(input: PackageCapabilityAcceptanceInput): PluginSn
   );
 }
 
-function conflictCode(sourceKind: 'official' | 'local', capability: 'PLUGIN' | 'SKILL'): string {
+function conflictCode(
+  sourceKind: 'official' | 'local',
+  capability: 'PLUGIN' | 'SKILL' | 'AGENT',
+): string {
   return `${sourceKind === 'local' ? 'LOCAL' : 'OFFICIAL'}_${capability}_NAME_CONFLICT`;
 }
 

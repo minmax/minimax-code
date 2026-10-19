@@ -68,6 +68,12 @@ export interface LocalRuntimeToolContext extends ToolExecutionContext {
    * set shared by the skill and Browser tools; legacy/test hosts may omit it.
    */
   readonly loadedSkills?: Set<string>;
+  /**
+   * Plugin-declared subagents available for task delegation this turn.
+   * Absent when no enabled local plugin declares agents or the surface has
+   * no task tool.
+   */
+  readonly pluginAgents?: PluginAgentsRegistry;
   /** Parent-turn Plugin Hook generation inherited by a user-visible child Agent. */
   readonly pluginSubagentLifecycle?: {
     start(
@@ -83,6 +89,34 @@ export interface LocalRuntimeToolContext extends ToolExecutionContext {
     ): Promise<string | undefined>;
     cancel(childSessionId: string): void;
   };
+}
+
+/** Plugin-declared subagent definition carried through turn capabilities. */
+export interface PluginAgentRuntimeDefinition {
+  readonly pluginName: string;
+  /** Plugin-scoped delegate name: "<plugin>:<agent>". */
+  readonly name: string;
+  readonly agentName: string;
+  readonly description: string;
+  readonly systemPrompt: string;
+  readonly model?: string;
+  readonly effort?: string;
+  readonly tools?: readonly string[];
+  readonly disallowedTools?: readonly string[];
+  readonly mcpServers?: readonly string[];
+  readonly skills?: readonly string[];
+  readonly pluginRoot: string;
+  readonly packageDigest: string;
+  readonly sourceKind: 'local';
+}
+
+/** Immutable lookup of the turn's plugin-declared subagents. */
+export interface PluginAgentsRegistry {
+  list(): readonly PluginAgentRuntimeDefinition[];
+  /** Exact scoped-name lookup ("<plugin>:<agent>", normalization-insensitive). */
+  resolve(name: string): PluginAgentRuntimeDefinition | undefined;
+  /** Bare-name lookup; defined only when exactly one declaration matches. */
+  resolveByBareName(name: string): PluginAgentRuntimeDefinition | undefined;
 }
 
 export interface LocalBrowserAsset {

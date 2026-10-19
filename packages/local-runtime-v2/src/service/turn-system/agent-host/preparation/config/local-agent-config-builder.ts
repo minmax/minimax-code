@@ -262,6 +262,12 @@ export class LocalAgentConfigBuilder {
       customConfig,
       overrides: this.options.systemPromptOverrides,
       profile,
+      // Upstream shows declared plugin subagents next to the skill catalog,
+      // and only on a turn whose capability ceiling still allows delegation.
+      ...(turnInput.desktopCapabilities?.agents?.length &&
+      profile?.capabilityCeiling?.features?.delegation !== false
+        ? { pluginAgentsBlock: renderPluginAgentsPromptBlock(turnInput.desktopCapabilities.agents) }
+        : {}),
     });
     return createAgentConfig({
       input: turnInput,
@@ -728,6 +734,27 @@ async function loadCustomConfig(
   });
 }
 
+const PLUGIN_AGENTS_DESCRIPTION_MAX_CHARS = 200;
+
+function renderPluginAgentsPromptBlock(
+  agents: readonly { readonly name: string; readonly description: string }[],
+): string {
+  const lines = agents.map((agent) => {
+    const description = agent.description
+      .slice(0, PLUGIN_AGENTS_DESCRIPTION_MAX_CHARS)
+      .replace(/&/gu, '&amp;')
+      .replace(/</gu, '&lt;')
+      .replace(/>/gu, '&gt;');
+    return `- \`${agent.name}\`: ${description}`;
+  });
+  return [
+    '<plugin-agents>',
+    'Plugin-declared subagents are available to the task tool. To delegate, call `task` with `agent_name` set to the scoped name:',
+    ...lines,
+    '</plugin-agents>',
+  ].join('\n');
+}
+
 function buildSystemPrompt(scope: {
   readonly config: LocalConversationRuntimeConfig;
   readonly environment: LocalPromptEnvironment | undefined;
@@ -740,6 +767,7 @@ function buildSystemPrompt(scope: {
   readonly customConfig: LocalAgentCustomConfigResult | undefined;
   readonly overrides: SystemPromptOverrides | undefined;
   readonly profile: LocalAgentExecutionProfile | undefined;
+  readonly pluginAgentsBlock?: string;
 }): ComposedPrompt {
   const { agent, sessionType, layers, customConfig, overrides, profile } = scope;
   const interactiveSurface =
@@ -769,6 +797,7 @@ function buildSystemPrompt(scope: {
       : []),
     ...layers.memoryBlocks.map((text) => ({ text, kind: 'MEMORY' as const })),
     { text: layers.catalog.trim(), kind: 'SKILLS' },
+    { text: scope.pluginAgentsBlock ?? '', kind: 'OTHER' },
   ]);
 }
 

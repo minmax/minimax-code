@@ -4,6 +4,7 @@ import {
   type ConversationModelThinkingSelection,
   type ConversationModelSelection,
   type ConversationTaskModelSelection,
+  type ConversationTaskPluginAgent,
 } from '@mavis/conversation-contract';
 
 import type {
@@ -74,6 +75,7 @@ export interface CapturedTaskAgentBinding {
 
 export interface SessionCreateInput {
   readonly agentName: string;
+  readonly taskPluginAgent?: ConversationTaskPluginAgent;
   readonly workspaceDir?: string;
   readonly title?: string | null;
   readonly parentSessionId?: string | null;
@@ -90,6 +92,7 @@ export interface SessionCreateInput {
 
 export interface InternalSessionCreateInput {
   readonly agentName: string;
+  readonly taskPluginAgent?: ConversationTaskPluginAgent;
   readonly workspaceDir?: string;
   readonly sessionType?: 'root' | 'branch';
   readonly sessionKind?: SessionKind;
@@ -457,6 +460,7 @@ export class SessionRecordService
     });
     const taskCapture = await this.captureSessionAgentDefinition({
       agentName: input.agentName,
+      ...(input.taskPluginAgent ? { taskPluginAgent: input.taskPluginAgent } : {}),
       ...(input.model ? { requestedModel: input.model } : {}),
       session: sessionCaptureCandidate({
         sessionId,
@@ -588,6 +592,7 @@ export class SessionRecordService
       forkedAgentDefinition: undefined,
       taskCapture: await this.captureSessionAgentDefinition({
         agentName: input.input.agentName,
+        ...(input.input.taskPluginAgent ? { taskPluginAgent: input.input.taskPluginAgent } : {}),
         session,
         parent: input.parent,
         appMode: input.appMode,
@@ -707,6 +712,7 @@ export class SessionRecordService
 
   private async captureSessionAgentDefinition(input: {
     readonly agentName: string;
+    readonly taskPluginAgent?: ConversationTaskPluginAgent;
     readonly session: SessionRecord;
     readonly parent: SessionRecord | undefined;
     readonly appMode?: SessionRecord['appMode'];
@@ -731,6 +737,7 @@ export class SessionRecordService
     return capture.capture({
       agentName: input.agentName,
       session: input.session,
+      ...(input.taskPluginAgent ? { pluginAgent: input.taskPluginAgent } : {}),
       ...(input.parent ? { parent: input.parent } : {}),
       ...(input.appMode ? { appMode: input.appMode } : {}),
       ...(parentModel?.parameterSnapshot ? { parentModel } : {}),

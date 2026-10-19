@@ -2,6 +2,7 @@ import {
   resolveCanonicalSubagentRole,
   type CanonicalSubagentRole,
 } from '@mavis/agent-tools/desktop/subagent-roles';
+import type { PluginAgentRuntimeDefinition } from '@mavis/agent-tools/desktop';
 import type { AgentReferenceReadScope, AgentReferenceResolver } from '@mavis/shared';
 
 export type { AgentReferenceReadScope, AgentReferenceResolver } from '@mavis/shared';
@@ -15,6 +16,8 @@ export interface LocalTaskTargetFacts {
   readonly canonicalRole?: CanonicalSubagentRole;
   readonly trustedBuiltin: boolean;
   readonly source: AgentReferenceReadScope['source'];
+  /** Set when the target came from the plugin-declared subagent registry. */
+  readonly pluginAgent?: PluginAgentRuntimeDefinition;
 }
 
 /**

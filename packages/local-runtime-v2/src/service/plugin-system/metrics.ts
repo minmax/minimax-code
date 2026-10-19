@@ -60,6 +60,7 @@ export class PluginSystemMetrics {
       enabled_plugin: snapshot.enabledPlugins.length,
       app_provider: appProviders.size,
       skill: snapshot.skills.length,
+      agent: snapshot.turnCapabilities.agents?.length ?? 0,
       mcp_server: snapshot.mcpServers.length,
       mcp_tool: snapshot.turnCapabilities.runtimeToolBindings.filter(
         (binding) => binding.kind === 'mcp',

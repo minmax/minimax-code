@@ -87,6 +87,7 @@ export {
 } from './agent-host/preparation/config/session-model-selection.js';
 export {
   AgentHostTurnCapabilityLifecycle,
+  type AgentHostTurnAgentCapability,
   type AgentHostTurnCapabilityPreparation,
   type AgentHostTurnCapabilityProvider,
   type AgentHostTurnCapabilityView,
