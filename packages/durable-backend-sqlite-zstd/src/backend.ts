@@ -8,11 +8,20 @@
  *   batch, `compressed` the payload byte length;
  * - `entries(entry_id PK, seq, ordinal, batch_id)` — the log index
  *   `entry_id -> (batch_id, ordinal)`, ordered for windowed reads by `(seq, ordinal)`;
- * - `meta(key, value)` — format id and the log `head` (last committed sequence).
+ * - `meta(key, value)` — format id, the log `head` (last committed sequence),
+ *   the single-writer `owner_epoch`, and the `resume` capsule.
  *
- * Every `appendBatch()` commits batch row, index rows, and head in ONE SQLite
- * transaction on a WAL journal with `synchronous = FULL`, so a resolved commit
- * is durable and later reads observe it.
+ * Every `appendBatch()` commits batch row, index rows, head, and the resume
+ * capsule in ONE SQLite transaction on a WAL journal with
+ * `synchronous = FULL`, so a resolved commit is durable and later reads
+ * observe it.
+ *
+ * Single writer (owner-epoch): a writable open takes ownership — it bumps
+ * `meta.owner_epoch` and records its pid in `meta.owner_pid` inside one
+ * transaction. A second writer whose process is alive is refused at open
+ * (`OwnerWriteLockError`); a handle whose epoch moved underneath it refuses
+ * further writes (`OwnerLostError`) instead of racing retries. `close()`
+ * releases the pid; a crashed writer's pid is detected as stale and stolen.
  *
  * Format generations: a database opens as `sessions.gN.db`. Opening generation
  * `N + 1` next to it seals every older generation — live handles refuse writes
@@ -25,7 +34,7 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 
 import { type Codec, decodeFrame, encodeFrame, resolveCodec } from './codec.js';
-import { CorruptFrameError, SealedGenerationError, SqliteZstdError } from './errors.js';
+import { CorruptFrameError, OwnerLostError, OwnerWriteLockError, SealedGenerationError, SqliteZstdError } from './errors.js';
 import {
 	type BatchId,
 	type Commit,
@@ -33,6 +42,7 @@ import {
 	type EntryDraft,
 	type JsonValue,
 	type OpenDurableBackendOptions,
+	type ResumeCapsule,
 	SEQ_AT_START,
 	type Seq,
 	type SqliteZstdBackendOptions,
@@ -45,6 +55,19 @@ export const FORMAT_ID = 'sqlite-zstd.v1';
 /** File name of the database of one format generation. */
 export function databaseFileName(generation: number): string {
 	return `sessions.g${generation}.db`;
+}
+
+/**
+ * Function-form alias of `SqliteZstdBackend.open`, shipped for factory-style
+ * construction from worker threads (the off-thread storage worker loads a
+ * module and calls an exported function; a static class method is an awkward
+ * factory there).
+ */
+export function openSqliteZstdBackend(
+	directory: string,
+	options: OpenDurableBackendOptions = {},
+): SqliteZstdBackend {
+	return SqliteZstdBackend.open(directory, options);
 }
 
 const GENERATION_FILE_PATTERN = /^sessions\.g(\d+)\.db$/;
@@ -114,6 +137,7 @@ CREATE INDEX IF NOT EXISTS entries_by_seq ON entries (seq, ordinal);
 CREATE INDEX IF NOT EXISTS entries_by_batch ON entries (batch_id, ordinal);
 INSERT OR IGNORE INTO meta (key, value) VALUES ('format', '${FORMAT_ID}');
 INSERT OR IGNORE INTO meta (key, value) VALUES ('head', '${SEQ_AT_START}');
+INSERT OR IGNORE INTO meta (key, value) VALUES ('owner_epoch', '0');
 `;
 
 /** Live backends per directory, so opening a newer generation seals them. */
@@ -168,10 +192,11 @@ export class SqliteZstdBackend {
 
 	private db: SqliteDatabase | null;
 	private codec: Codec;
-	private maxBatchUncompressedBytes: number;
+	private batchCapBytes: number;
 	private sealedFlag: boolean;
 	private closedFlag: boolean;
 	private headValue: Seq;
+	private ownerEpoch: number | null;
 	private openBatch: EntryDraft[];
 
 	private readonly setHeadStmt: SqliteStatement;
@@ -258,10 +283,11 @@ export class SqliteZstdBackend {
 		this.path = path;
 		this.db = db;
 		this.codec = resolveCodec(options.codec);
-		this.maxBatchUncompressedBytes = options.maxBatchUncompressedBytes ?? MAX_BATCH_UNCOMPRESSED_BYTES;
+		this.batchCapBytes = options.maxBatchUncompressedBytes ?? MAX_BATCH_UNCOMPRESSED_BYTES;
 		this.sealedFlag = sealed;
 		this.closedFlag = false;
 		this.headValue = SEQ_AT_START as Seq;
+		this.ownerEpoch = null;
 		this.openBatch = [];
 
 		if (sealed) {
@@ -275,6 +301,7 @@ export class SqliteZstdBackend {
 			// genuinely fresh file receives the schema, never a foreign one.
 			if (hasUserTables(db)) this.assertFormat(db);
 			else db.exec(SCHEMA_SQL);
+			this.acquireOwnership(db);
 		}
 
 		const headRow = db.prepare('SELECT value FROM meta WHERE key = ?').get('head') as { readonly value?: unknown } | undefined;
@@ -299,6 +326,11 @@ export class SqliteZstdBackend {
 	get head(): Seq {
 		this.assertOpen();
 		return this.headValue;
+	}
+
+	/** The uncompressed batch cap this backend enforces, in bytes (`0` = disabled). */
+	get maxBatchUncompressedBytes(): number {
+		return this.batchCapBytes;
 	}
 
 	/** Whether this generation is sealed (reads allowed, writes rejected). */
@@ -383,6 +415,71 @@ export class SqliteZstdBackend {
 	}
 
 	/**
+	 * The durable resume capsule written by the last commit, or `null` when
+	 * nothing was committed yet. One meta-row read — no batch decoding — so a
+	 * reader can resume from `(seq, head)` in microseconds even on a
+	 * gigabyte-scale log.
+	 */
+	readResume(): ResumeCapsule | null {
+		this.assertOpen();
+		const db = this.db;
+		if (db === null) throw new SqliteZstdError(`backend at ${this.path} is closed`);
+		const row = db.prepare('SELECT value FROM meta WHERE key = ?').get('resume') as
+			| { readonly value?: unknown }
+			| undefined;
+		if (row?.value === undefined) return null;
+		return parseResumeCapsule(row.value, this.path);
+	}
+
+	/**
+	 * Point read by entry id: resolves the entry through the index and decodes
+	 * ONLY the one batch containing it — not the whole log. `undefined` when
+	 * the id was never committed.
+	 */
+	getEntry(entryId: string): Entry | undefined {
+		this.assertOpen();
+		if (typeof entryId !== 'string' || entryId.length === 0) {
+			throw new TypeError(`entryId must be a non-empty string, got ${JSON.stringify(entryId)}`);
+		}
+		const db = this.db;
+		if (db === null) throw new SqliteZstdError(`backend at ${this.path} is closed`);
+		const row = db.prepare('SELECT entry_id, seq, ordinal, batch_id FROM entries WHERE entry_id = ?').get(entryId);
+		const index = parseFullIndexRow(row);
+		if (index === undefined) return undefined;
+		const batchRow = this.db
+			.prepare('SELECT batch_id, payload FROM batches WHERE batch_id = ?')
+			.get(index.batchId);
+		if (batchRow === undefined) {
+			throw new CorruptFrameError(`entry ${entryId}: index points at missing batch ${index.batchId}`);
+		}
+		const batch = parseBatchRow(batchRow);
+		const decoded = decodeBatchPayload(batch.payload, batch.batchId);
+		this.assertIndexMatches(batch.batchId, decoded.entries);
+		return decoded.entries[index.ordinal];
+	}
+
+	/**
+	 * Windowed read anchored at an entry id: like `readDelta`, but starting
+	 * at (inclusive) or right after (default) the anchor's BATCH instead of
+	 * sequence `0` — resume without decoding everything before the anchor.
+	 * Reads are batch-granular (batches are atomic units), so entries sharing
+	 * the anchor's batch are only served with `inclusive`. Throws when the
+	 * anchor was never committed.
+	 */
+	readDeltaFrom(
+		entryId: string,
+		limitBytes: number,
+		options: { readonly inclusive?: boolean } = {},
+	): Entry[] {
+		const anchor = this.getEntry(entryId);
+		if (anchor === undefined) {
+			throw new SqliteZstdError(`entry ${entryId} does not exist in ${this.path}`);
+		}
+		const afterSeq = options.inclusive === true ? anchor.seq - 1 : anchor.seq;
+		return this.readDelta(afterSeq, limitBytes);
+	}
+
+	/**
 	 * Seal this generation: flush the open batch while the file is still
 	 * writable, refuse further writes, then strip the write bits from the
 	 * generation's files. Idempotent; reads stay allowed.
@@ -404,19 +501,27 @@ export class SqliteZstdBackend {
 	}
 
 	/**
-	 * Flush the open batch (unless sealed), release the database, and make all
-	 * later operations reject. Idempotent.
+	 * Flush the open batch (unless sealed), release the single-writer lock,
+	 * close the database, and make all later operations reject. Idempotent.
 	 */
 	async close(): Promise<void> {
 		if (this.closedFlag) return;
 		if (!this.sealedFlag && this.openBatch.length > 0) await this.checkpoint();
+		if (!this.sealedFlag && this.ownerEpoch !== null) this.releaseOwnership();
 		this.db?.close();
 		this.db = null;
 		this.closedFlag = true;
 		unregisterBackend(this);
 	}
 
-	/** Commit path shared by `appendBatch`, `checkpoint`, and sealing. */
+	/**
+	 * Commit path shared by `appendBatch`, `checkpoint`, and sealing.
+	 *
+	 * Refuses to write when the single-writer epoch moved underneath this
+	 * handle (`OwnerLostError`): the durable view is stale, retrying would
+	 * race the new owner. Also refreshes the `resume` capsule in the same
+	 * transaction, so a committed batch and its resume point are atomic.
+	 */
 	private commitBatch(drafts: readonly EntryDraft[]): Commit {
 		if (drafts.length === 0) {
 			// A commit without entries would advance the head for nothing;
@@ -426,16 +531,31 @@ export class SqliteZstdBackend {
 		for (const draft of drafts) validateDraft(draft);
 		const json = JSON.stringify(drafts);
 		const jsonBytes = Buffer.from(json, 'utf8');
-		if (this.maxBatchUncompressedBytes > 0 && jsonBytes.length > this.maxBatchUncompressedBytes) {
+		if (this.batchCapBytes > 0 && jsonBytes.length > this.batchCapBytes) {
 			throw new SqliteZstdError(
-				`batch exceeds the uncompressed cap: ${jsonBytes.length} > ${this.maxBatchUncompressedBytes} bytes`,
+				`batch exceeds the uncompressed cap: ${jsonBytes.length} > ${this.batchCapBytes} bytes`,
 			);
 		}
 		const frame = encodeFrame(this.codec.name, jsonBytes);
 		const db = this.db;
 		if (db === null) throw new SqliteZstdError(`backend at ${this.path} is closed`);
 		const codecName = this.codec.name;
+		const ownerEpoch = this.ownerEpoch;
 		const commit = db.transaction(() => {
+			// Ownership first: if another writer took over, THIS handle is stale
+			// no matter what the head says — the terminal cause must not be
+			// masked by a secondary divergence error.
+			if (ownerEpoch !== null) {
+				const epochRow = db.prepare('SELECT value FROM meta WHERE key = ?').get('owner_epoch') as
+					| { readonly value?: unknown }
+					| undefined;
+				if (Number(epochRow?.value) !== ownerEpoch) {
+					throw new OwnerLostError(
+						`${this.path}: owner epoch moved (${String(epochRow?.value)} != ${ownerEpoch}); ` +
+							'another writer took over this generation',
+					);
+				}
+			}
 			// Re-read the head inside the transaction: the new sequence is
 			// derived from the durable head, keeping it strictly monotonic.
 			const headRow = db.prepare('SELECT value FROM meta WHERE key = ?').get('head') as
@@ -451,6 +571,16 @@ export class SqliteZstdBackend {
 				this.insertEntryStmt.run(draft.id, seq, ordinal, seq);
 			});
 			this.setHeadStmt.run('head', String(seq));
+			this.setHeadStmt.run(
+				'resume',
+				JSON.stringify({
+					batchId: seq,
+					seq,
+					head: seq,
+					entryCount: drafts.length,
+					updatedMs: Date.now(),
+				} satisfies ResumeCapsule),
+			);
 			return {
 				seq,
 				batchId: seq as unknown as BatchId,
@@ -463,6 +593,64 @@ export class SqliteZstdBackend {
 		})();
 		this.headValue = commit.head;
 		return commit;
+	}
+
+	/**
+	 * Takes single-writer ownership inside one transaction: bumps the durable
+	 * `owner_epoch` and records this process's pid. A second writer whose
+	 * process is alive — including a second handle in this process — is
+	 * refused; a stale pid (crashed writer) is stolen.
+	 */
+	private acquireOwnership(db: SqliteDatabase): void {
+		db.transaction(() => {
+			const epochRow = db.prepare('SELECT value FROM meta WHERE key = ?').get('owner_epoch') as
+				| { readonly value?: unknown }
+				| undefined;
+			const epoch = Number(epochRow?.value);
+			if (!Number.isSafeInteger(epoch) || epoch < 0) {
+				throw new SqliteZstdError(
+					`${this.path}: meta.owner_epoch is not a valid epoch (${String(epochRow?.value)})`,
+				);
+			}
+			const pidRow = db.prepare('SELECT value FROM meta WHERE key = ?').get('owner_pid') as
+				| { readonly value?: unknown }
+				| undefined;
+			const ownerPid = pidRow?.value === undefined || pidRow.value === '' ? undefined : Number(pidRow.value);
+			if (ownerPid !== undefined) {
+				if (!Number.isInteger(ownerPid) || ownerPid <= 0) {
+					throw new SqliteZstdError(
+						`${this.path}: meta.owner_pid is not a valid pid (${String(pidRow?.value)})`,
+					);
+				}
+				if (isProcessAlive(ownerPid)) {
+					throw new OwnerWriteLockError(
+						`${this.path}: another writer owns this generation (pid ${ownerPid}); ` +
+							'open a newer generation or wait for it to close',
+					);
+				}
+			}
+			db.prepare(
+				"INSERT INTO meta (key, value) VALUES ('owner_epoch', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			).run(String(epoch + 1));
+			db.prepare(
+				"INSERT INTO meta (key, value) VALUES ('owner_pid', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			).run(String(process.pid));
+			this.ownerEpoch = epoch + 1;
+		})();
+	}
+
+	/** Best-effort release of the pid marker; the epoch stays (it must move). */
+	private releaseOwnership(): void {
+		const db = this.db;
+		if (db === null) return;
+		try {
+			db.prepare(
+				"INSERT INTO meta (key, value) VALUES ('owner_pid', '') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			).run();
+		} catch {
+			// Best effort: a failed release leaves a stale pid, which open()
+			// detects as dead and steals.
+		}
 	}
 
 	/** The stored format must be ours; a foreign file is never rewritten. */
@@ -542,6 +730,16 @@ function parseIndexRow(row: unknown): { readonly entryId: string; readonly ordin
 	return { entryId: row.entry_id, ordinal: row.ordinal };
 }
 
+/** Full index row shape used by point reads (`entry_id, seq, ordinal, batch_id`). */
+function parseFullIndexRow(
+	row: unknown,
+): { readonly seq: number; readonly ordinal: number; readonly batchId: number } | undefined {
+	if (!isObject(row) || !isSafeIntegerValue(row.seq) || !isSafeIntegerValue(row.ordinal) || !isSafeIntegerValue(row.batch_id)) {
+		return undefined;
+	}
+	return { seq: row.seq, ordinal: row.ordinal, batchId: row.batch_id };
+}
+
 /** Decode one stored batch payload into its entries. */
 function decodeBatchPayload(payload: Uint8Array, batchId: number): { readonly entries: Entry[]; readonly byteLength: number } {
 	const frame = decodeFrame(payload);
@@ -568,8 +766,16 @@ function parseStoredEntry(item: unknown, batchId: number, ordinal: number): Entr
 	if (!('payload' in item) || !isJsonValue(item.payload)) {
 		throw new CorruptFrameError(`batch ${batchId} entry ${ordinal}: payload is not JSON`);
 	}
+	let parentId: string | null | undefined;
+	if ('parentId' in item) {
+		if (item.parentId !== null && typeof item.parentId !== 'string') {
+			throw new CorruptFrameError(`batch ${batchId} entry ${ordinal}: parentId is not a string or null`);
+		}
+		parentId = item.parentId;
+	}
 	return {
 		id: item.id,
+		parentId,
 		kind: item.kind,
 		payload: item.payload as JsonValue,
 		seq: batchId as Seq,
@@ -582,12 +788,54 @@ function validateDraft(draft: EntryDraft): void {
 	if (!isObject(draft) || typeof draft.id !== 'string' || draft.id.length === 0) {
 		throw new TypeError('entry draft requires a non-empty string id');
 	}
+	if (draft.parentId !== undefined && draft.parentId !== null && typeof draft.parentId !== 'string') {
+		throw new TypeError(`entry ${draft.id}: parentId must be a string or null`);
+	}
 	if (typeof draft.kind !== 'string' || draft.kind.length === 0) {
 		throw new TypeError(`entry ${draft.id}: kind must be a non-empty string`);
 	}
 	if (!('payload' in draft) || !isJsonValue(draft.payload)) {
 		throw new TypeError(`entry ${draft.id}: payload must be a JSON value`);
 	}
+}
+
+/** Whether the pid could still be a live writer (`EPERM` counts as alive). */
+function isProcessAlive(pid: number): boolean {
+	if (pid === process.pid) return true;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === 'EPERM';
+	}
+}
+
+/** Parse and validate the `meta.resume` capsule value. */
+function parseResumeCapsule(value: unknown, path: string): ResumeCapsule {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(String(value));
+	} catch (cause) {
+		throw new SqliteZstdError(`${path}: meta.resume is not valid JSON`, { cause });
+	}
+	if (
+		!isObject(parsed) ||
+		!isSafeIntegerValue(parsed.batchId) ||
+		!isSafeIntegerValue(parsed.seq) ||
+		!isSafeIntegerValue(parsed.head) ||
+		!isSafeIntegerValue(parsed.entryCount) ||
+		typeof parsed.updatedMs !== 'number' ||
+		!Number.isFinite(parsed.updatedMs)
+	) {
+		throw new SqliteZstdError(`${path}: meta.resume is not a valid resume capsule`);
+	}
+	return {
+		batchId: parsed.batchId,
+		seq: parsed.seq as Seq,
+		head: parsed.head as Seq,
+		entryCount: parsed.entryCount,
+		updatedMs: parsed.updatedMs,
+	};
 }
 
 /** Structural JSON check; cyclic input fails later in JSON.stringify, before any write. */

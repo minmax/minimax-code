@@ -20,10 +20,17 @@ export {
 	currentGeneration,
 	databaseFileName,
 	loadSqlite3Constructor,
+	openSqliteZstdBackend,
 	type Sqlite3Constructor,
 } from './backend.js';
 export { isZstdSupported, type Codec, type CodecName } from './codec.js';
-export { CorruptFrameError, SealedGenerationError, SqliteZstdError } from './errors.js';
+export {
+	CorruptFrameError,
+	OwnerLostError,
+	OwnerWriteLockError,
+	SealedGenerationError,
+	SqliteZstdError,
+} from './errors.js';
 export {
 	type BatchId,
 	type Commit,
@@ -32,6 +39,7 @@ export {
 	type JsonValue,
 	MAX_BATCH_UNCOMPRESSED_BYTES,
 	type OpenDurableBackendOptions,
+	type ResumeCapsule,
 	SEQ_AT_START,
 	type Seq,
 	type SqliteZstdBackendOptions,

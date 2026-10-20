@@ -32,6 +32,12 @@ export type JsonValue = null | boolean | number | string | readonly JsonValue[] 
 export type EntryDraft = {
 	/** Stable application identity, unique across the whole database. */
 	readonly id: string;
+	/**
+	 * Log position of the predecessor entry, `null` for the first entry.
+	 * Preserved inside the stored batch frame; the backend does not index it —
+	 * the log order itself is authoritative.
+	 */
+	readonly parentId?: string | null;
 	/** Application-defined discriminator (for example a `pi.*` entry kind). */
 	readonly kind: string;
 	/** JSON payload stored inside the batch frame. */
@@ -44,6 +50,25 @@ export type Entry = EntryDraft & {
 	readonly seq: Seq;
 	/** Zero-based position of the entry inside its batch. */
 	readonly ordinal: number;
+};
+
+/**
+ * Durable resume capsule, refreshed inside every commit transaction. A reader
+ * opens the database, reads this one meta row, and resumes from
+ * `(seq, head)` without decoding any batch — the "lazy open" path of the
+ * durable-core plan.
+ */
+export type ResumeCapsule = {
+	/** Batch of the last commit; `batch_id === seq` for this backend. */
+	readonly batchId: number;
+	/** Sequence of the last commit. */
+	readonly seq: Seq;
+	/** Log head after the last commit; equal to `seq` for this backend. */
+	readonly head: Seq;
+	/** Entries stored in the last commit. */
+	readonly entryCount: number;
+	/** Wall clock of the last commit. */
+	readonly updatedMs: number;
 };
 
 /** Result of one committed batch. */

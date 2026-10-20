@@ -10,6 +10,8 @@ import {
 	FORMAT_ID,
 	isZstdSupported,
 	MAX_BATCH_UNCOMPRESSED_BYTES,
+	OwnerLostError,
+	OwnerWriteLockError,
 	type Commit,
 	type EntryDraft,
 	SEQ_AT_START,
@@ -448,3 +450,101 @@ describe('format generations', () => {
 function secondGeneration(): SqliteZstdBackend {
 	return SqliteZstdBackend.openNextGeneration(workDir);
 }
+
+describe('single-writer owner epoch', () => {
+	it('refuses a second writable open while the first writer is alive and frees the lock on close', async () => {
+		const first = SqliteZstdBackend.open(workDir);
+		expect(() => SqliteZstdBackend.open(workDir)).toThrow(OwnerWriteLockError);
+		expect(() => SqliteZstdBackend.open(workDir)).toThrow(/another writer owns this generation/);
+
+		await first.close();
+		const second = SqliteZstdBackend.open(workDir);
+		await second.appendBatch(drafts(1));
+		expect(second.head).toBe(1);
+		await second.close();
+	});
+
+	it('steals the lock of a crashed writer (stale pid) and breaks the loser terminally', async () => {
+		const crashed = SqliteZstdBackend.open(workDir);
+		// Simulate the writer dying without cleanup: its recorded pid becomes
+		// one that cannot be alive (beyond every platform's pid range).
+		const raw = new Database(join(workDir, 'sessions.g1.db'), { timeout: 5000 });
+		raw.prepare("UPDATE meta SET value = '99999999' WHERE key = 'owner_pid'").run();
+		raw.close();
+
+		const takeover = SqliteZstdBackend.open(workDir); // steals the stale lock
+		await takeover.appendBatch(drafts(1));
+
+		// The stale handle's view is broken for good: writes refuse instead of
+		// racing the new owner with retries.
+		await expect(crashed.appendBatch(drafts(1))).rejects.toThrow(OwnerLostError);
+		await expect(crashed.appendBatch(drafts(1))).rejects.toThrow(OwnerLostError);
+
+		await takeover.close();
+		await crashed.close();
+	});
+
+	it('exposes the enforced batch cap', () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		expect(backend.maxBatchUncompressedBytes).toBe(MAX_BATCH_UNCOMPRESSED_BYTES);
+		const custom = SqliteZstdBackend.openNextGeneration(workDir, { maxBatchUncompressedBytes: 1024 });
+		expect(custom.maxBatchUncompressedBytes).toBe(1024);
+		backend.close();
+		custom.close();
+	});
+});
+
+describe('resume capsule and entry-id reads', () => {
+	it('refreshes the resume capsule atomically with every commit', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		expect(backend.readResume()).toBeNull(); // nothing committed yet
+
+		await backend.appendBatch(drafts(2));
+		expect(backend.readResume()).toMatchObject({ batchId: 1, seq: 1, head: 1, entryCount: 2 });
+		await backend.appendBatch(drafts(3, 2));
+		const capsule = backend.readResume();
+		expect(capsule).toMatchObject({ batchId: 2, seq: 2, head: 2, entryCount: 3 });
+		expect(typeof capsule?.updatedMs).toBe('number');
+		backend.close();
+
+		// The capsule survives reopen and is readable without decoding batches.
+		const reopened = SqliteZstdBackend.open(workDir);
+		expect(reopened.readResume()).toMatchObject({ seq: 2, head: 2 });
+		reopened.close();
+	});
+
+	it('serves a point read by entry id and a window read anchored at it', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		await backend.appendBatch(drafts(2)); // e-0, e-1
+		await backend.appendBatch(drafts(2, 2)); // e-2, e-3
+
+		expect(backend.getEntry('e-2')?.seq).toBe(2);
+		expect(backend.getEntry('e-2')?.ordinal).toBe(0);
+		expect(backend.getEntry('e-3')?.ordinal).toBe(1);
+		expect(backend.getEntry('missing')).toBeUndefined();
+		expect(() => backend.getEntry('')).toThrow(TypeError);
+
+		// Reads are batch-granular (batches are atomic units): a non-inclusive
+		// anchor serves batches strictly AFTER the anchor's batch.
+		expect(backend.readDeltaFrom('e-2', 1024 * 1024)).toEqual([]);
+		expect(
+			backend.readDeltaFrom('e-2', 1024 * 1024, { inclusive: true }).map((entry) => entry.id),
+		).toEqual(['e-2', 'e-3']);
+		expect(backend.readDeltaFrom('e-0', 1024 * 1024).map((entry) => entry.id)).toEqual(['e-2', 'e-3']);
+		expect(backend.readDeltaFrom('e-1', 1024 * 1024).map((entry) => entry.id)).toEqual(['e-2', 'e-3']);
+		expect(() => backend.readDeltaFrom('missing', 1024)).toThrow(/does not exist/);
+		backend.close();
+	});
+
+	it('preserves parentId through the stored frame', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		await backend.appendBatch([
+			draft('parent', { n: 0 }),
+			{ ...draft('child', { n: 1 }), parentId: 'parent' },
+		]);
+		const delta = backend.readDelta(0, 1024 * 1024);
+		expect(delta.map((entry) => entry.parentId)).toEqual([undefined, 'parent']);
+		expect(backend.getEntry('child')?.parentId).toBe('parent');
+		backend.close();
+	});
+});

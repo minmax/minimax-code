@@ -30,3 +30,28 @@ export class CorruptFrameError extends SqliteZstdError {
 		this.name = 'CorruptFrameError';
 	}
 }
+
+/**
+ * Single-writer refusal at open time: a live writer (same process, or a
+ * process that is still alive) already owns this generation. The second
+ * writer must open a newer generation or wait — it never retries blindly.
+ */
+export class OwnerWriteLockError extends SqliteZstdError {
+	constructor(message: string, options?: { readonly cause?: unknown }) {
+		super(message, options);
+		this.name = 'OwnerWriteLockError';
+	}
+}
+
+/**
+ * Single-writer loss at write time: this handle owned the generation when it
+ * was opened, but the meta owner epoch has since moved — another writer took
+ * over. Terminal for this handle: it must not retry, its view of the log is
+ * stale.
+ */
+export class OwnerLostError extends SqliteZstdError {
+	constructor(message: string, options?: { readonly cause?: unknown }) {
+		super(message, options);
+		this.name = 'OwnerLostError';
+	}
+}
