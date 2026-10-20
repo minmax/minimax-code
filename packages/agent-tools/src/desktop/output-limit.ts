@@ -10,7 +10,11 @@ export type DesktopOutputLimitStrategy = 'prefix_lines' | 'head_tail_lines';
 export type DesktopOutputOffsetUnit = 'line' | 'match' | 'file';
 
 export interface DesktopOutputContinuationHint {
-  tool: 'read' | 'grep' | 'glob' | 'mavis' | 'bash' | 'task_output';
+  /**
+   * `generic` marks a hint produced by the shared tool-result truncation seam
+   * (truncation/tool-result.ts), which has no tool-specific continuation.
+   */
+  tool: 'read' | 'grep' | 'glob' | 'mavis' | 'bash' | 'task_output' | 'generic';
   preserve_args: readonly string[];
   instruction: string;
 }
