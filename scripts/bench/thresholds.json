@@ -1,0 +1,11 @@
+{
+  "comment": "Acceptance thresholds of the Ф1 perf gates (final-architecture.md §363-384). Keys are exact `<bench>.<metric>` names as printed by the bench scripts; values are MAXIMA. run-all.mjs --check fails when any metric exceeds its maximum. The `offthread.*` rows gate the durable path (commit work on the worker thread, Ф1 'not on the main thread'); `bridge.stallP99Ms` is the explicit stall budget under which the bridge fallback stays acceptable.",
+  "open.totalMs": 1000,
+  "open.rssDeltaMb": 500,
+  "append.appendP99Ms": 1,
+  "append.stallP99Ms": 5,
+  "offthread.enqueueP99Ms": 1,
+  "offthread.commitP95Ms": 5,
+  "offthread.stallP99Ms": 5,
+  "bridge.stallP99Ms": 5
+}

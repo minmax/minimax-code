@@ -5,8 +5,12 @@
 // are taken after a full GC and runs do not skew each other's heap.
 //
 // Usage: node scripts/bench/run-all.mjs   (env FIXTURE=path/to/messages.jsonl [ITERS=20] [REPLAY_STEPS=287])
+//        node scripts/bench/run-all.mjs --check scripts/bench/thresholds.json
+// With `--check`, every collected metric is compared against the threshold
+// file (`<bench>.<metric>` -> maximum); the run FAILS (exit 1) when any
+// metric exceeds its maximum — that is the merge-barrier mode of the CI gate.
 import { spawnSync } from 'node:child_process';
-import { statSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const MIB = 1048576;
@@ -15,7 +19,13 @@ const BENCHES = [
   { id: 'open', script: 'bench-open.mjs' },
   { id: 'append', script: 'bench-append.mjs' },
   { id: 'replay', script: 'bench-replay.mjs' },
+  // Builds its own synthetic storage (no fixture dependency): the worker
+  // commit path — enqueue p99, commit p95, event-loop stalls.
+  { id: 'worker', script: 'bench-worker-commit.mjs' },
 ];
+
+const checkIndex = process.argv.indexOf('--check');
+const thresholdsPath = checkIndex !== -1 ? process.argv[checkIndex + 1] : undefined;
 
 const fixture = process.env.FIXTURE;
 if (!fixture) {
@@ -111,6 +121,41 @@ lines.push(
     ['replay.p95Ms', pick('replay', 'p95Ms')],
   ]),
 );
+
+// Threshold gate (--check <thresholds.json>): every collected metric is
+// compared against its maximum; any violation fails the run. This is the
+// merge-barrier form of the perf gates.
+let gateFailed = false;
+if (thresholdsPath !== undefined) {
+  const allMetrics = {};
+  for (const run of runs) Object.assign(allMetrics, run.metrics);
+  const thresholds = JSON.parse(readFileSync(thresholdsPath, 'utf8'));
+  lines.push('## Threshold gate');
+  lines.push('');
+  const gateRows = [];
+  for (const [key, max] of Object.entries(thresholds)) {
+    if (key === 'comment') continue;
+    const raw = allMetrics[key];
+    const value = raw === undefined ? undefined : Number(raw);
+    if (value === undefined || !Number.isFinite(value)) {
+      gateFailed = true;
+      gateRows.push([`gate.${key}`, `FAIL (metric missing)`]);
+      console.log(`gate.${key}=FAIL metric missing`);
+      continue;
+    }
+    if (value <= max) {
+      gateRows.push([`gate.${key}`, `PASS (${value} <= ${max})`]);
+      console.log(`gate.${key}=PASS ${value}<=${max}`);
+    } else {
+      gateFailed = true;
+      gateRows.push([`gate.${key}`, `FAIL (${value} > ${max})`]);
+      console.log(`gate.${key}=FAIL ${value}>${max}`);
+    }
+  }
+  console.log(`gate.passed=${!gateFailed}`);
+  lines.push(markdownTable(gateRows));
+  lines.push('');
+}
 lines.push('');
 lines.push('## Machine-readable');
 lines.push('');
@@ -118,3 +163,8 @@ lines.push(fence);
 for (const run of runs) for (const [key, value] of Object.entries(run.metrics)) lines.push(`${key}=${value}`);
 lines.push(fence);
 console.log(lines.join('\n'));
+
+if (gateFailed) {
+  console.error('run-all: threshold gate FAILED');
+  process.exit(1);
+}

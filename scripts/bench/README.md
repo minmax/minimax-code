@@ -17,14 +17,38 @@ The measurement logic follows the ad-hoc profilers in
 ## Usage
 
 ```sh
-# All three benches, markdown summary to stdout
-FIXTURE=/path/to/messages.jsonl node scripts/bench/run-all.mjs
+# Build the synthetic fixture corpus (never real sessions)
+node scripts/bench/build-fixtures.mjs messages --out /tmp/bench-fixtures            # 5.1 MB / 2061 messages
+node scripts/bench/build-fixtures.mjs images   --out /tmp/bench-fixtures            # ~100 MB of image blocks
+node scripts/bench/build-fixtures.mjs giant    --out /tmp/bench-fixtures            # 1 GiB scaling row
+node scripts/bench/build-fixtures.mjs giant    --target-gb 10 --out /tmp/bench-fixtures  # Ф1 10 GiB row (~50 s, opt-in)
+
+# Worker commit path, BOTH execution modes (bridge + off-thread)
+node scripts/bench/bench-worker-commit.mjs
+
+# All four benches, markdown summary to stdout, thresholds enforced
+FIXTURE=/path/to/messages.jsonl node scripts/bench/run-all.mjs --check scripts/bench/thresholds.json
 
 # Individual benches
 FIXTURE=/path/to/messages.jsonl node --expose-gc scripts/bench/bench-open.mjs
 FIXTURE=/path/to/messages.jsonl node --expose-gc scripts/bench/bench-append.mjs
 FIXTURE=/path/to/messages.jsonl node --expose-gc scripts/bench/bench-replay.mjs
+node --expose-gc scripts/bench/bench-worker-commit.mjs   # worker commit path, own synthetic store
 ```
+
+The `worker` bench drives the REAL storage worker + sqlite-zstd backend from
+TypeScript sources (Node type stripping plus an in-process `.js -> .ts`
+resolve hook), measuring enqueue p99, commit p95, and caller-thread
+event-loop stalls.
+
+## Threshold gate
+
+`run-all.mjs --check <thresholds.json>` compares every collected metric
+against its maximum (`thresholds.json` for the messages corpus,
+`thresholds.images.json` for the ~100 MB image corpus — see the file comment
+for the one deliberate difference) and exits 1 on any violation. This is the
+merge barrier wired into `.github/workflows/performance.yml`
+(`bench-gates` job).
 
 `--expose-gc` is optional for the individual scripts (they use `global.gc` when
 available); `run-all.mjs` always passes it so RSS readings are taken after a
@@ -34,9 +58,14 @@ full GC and benches run in isolated child processes.
 
 | Variable       | Default | Applies to                       |
 | -------------- | ------- | -------------------------------- |
-| `FIXTURE`      | —       | all; path to a `.jsonl` session file (required) |
+| `FIXTURE`      | newest `messages.jsonl` under `~/.minimax/v2/sessions` (`bench-append` only) | all; path to a `.jsonl` session file |
 | `ITERS`        | `20`    | `bench-append` (and so `run-all`); append iterations |
 | `REPLAY_STEPS` | `287`   | `bench-replay` (and so `run-all`); stringify steps |
+| `BATCHES`      | `200`   | `bench-worker-commit`; committed batches |
+| `ENTRY_KB`     | `64`    | `bench-worker-commit`; entry payload size |
+
+Every bench also reports event-loop stall metrics (`<bench>.stallP99Ms`,
+`<bench>.stallMaxMs`) sampled across the measured path.
 
 ## Output format
 
@@ -69,7 +98,9 @@ scripting.
 
 `FIXTURE` must be a JSONL file with one JSON record per line (a session
 `messages.jsonl`). `bench-append.mjs` copies the fixture to a temp file and
-never writes to the original. Per `src/AGENTS.md`, do not commit real
+never writes to the original; when `FIXTURE` is unset it benchmarks the newest
+`messages.jsonl` under the durable session root, so a real session is picked up
+without configuration. Per `src/AGENTS.md`, do not commit real
 sessions, logs, or account data to the repository — keep fixtures outside it;
 a synthetic fixture (any JSONL, e.g. records with `message.content` text
 blocks) is enough for smoke runs.

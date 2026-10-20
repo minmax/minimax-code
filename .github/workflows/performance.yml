@@ -98,3 +98,46 @@ jobs:
           include-hidden-files: true
           retention-days: 14
           if-no-files-found: warn
+  # Ф1 perf gates as a merge barrier: build the synthetic fixture corpus,
+  # run the session-path benches against the acceptance thresholds, and fail
+  # the PR when any threshold is violated. Independent of the relative
+  # candidate-vs-baseline job above (absolute thresholds, deterministic
+  # synthetic data, no benchmark harness dependency).
+  bench-gates:
+    name: bench thresholds
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 9.12.0
+          package_json_file: package.json
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          package-manager-cache: false
+      - name: Install dependencies (better-sqlite3 for the worker bench)
+        run: pnpm install --frozen-lockfile
+      - name: Build the fixture corpus (synthetic, ~5 MB messages + ~100 MB images)
+        run: |
+          node scripts/bench/build-fixtures.mjs messages --out "$RUNNER_TEMP/bench-fixtures"
+          node scripts/bench/build-fixtures.mjs images --out "$RUNNER_TEMP/bench-fixtures"
+      - name: Gate the messages corpus against the acceptance thresholds
+        run: |
+          FIXTURE="$(ls "$RUNNER_TEMP"/bench-fixtures/messages-*.jsonl)" \
+            node scripts/bench/run-all.mjs --check scripts/bench/thresholds.json
+      - name: Gate the images corpus against the acceptance thresholds
+        run: |
+          FIXTURE="$(ls "$RUNNER_TEMP"/bench-fixtures/images-*.jsonl)" \
+            node scripts/bench/run-all.mjs --check scripts/bench/thresholds.images.json
+      - name: Upload bench gate evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bench-gates-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bench-fixtures/
+          retention-days: 14
+          if-no-files-found: warn

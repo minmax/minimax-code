@@ -1,0 +1,10 @@
+{
+  "comment": "Thresholds for the ~100 MB images corpus. Same acceptance budgets as thresholds.json, except `open.rssDeltaMb`: bench-open MATERIALIZES the whole 100 MB corpus (the legacy path), which inherently holds several hundred MB of heap — the Ф1 'RSS <= 500 MB' budget belongs to the lazy open (resume capsule) path and is enforced there, not on the legacy materialization.",
+  "open.totalMs": 1000,
+  "append.appendP99Ms": 1,
+  "append.stallP99Ms": 5,
+  "offthread.enqueueP99Ms": 1,
+  "offthread.commitP95Ms": 5,
+  "offthread.stallP99Ms": 5,
+  "bridge.stallP99Ms": 5
+}
