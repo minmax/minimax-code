@@ -130,6 +130,9 @@
       "@mavis/browser-core": [
         "./packages/browser-core/src/index.ts"
       ],
+      "@mavis/cas": [
+        "./packages/cas/src/index.ts"
+      ],
       "@mavis/config": [
         "./packages/config/src/index.ts"
       ],
@@ -153,6 +156,12 @@
       ],
       "@mavis/cron": [
         "./packages/agent-modules/cron/src/index.ts"
+      ],
+      "@mavis/durable-backend-sqlite-zstd": [
+        "./packages/durable-backend-sqlite-zstd/src/index.ts"
+      ],
+      "@mavis/durable-backend-sqlite-zstd/codec": [
+        "./packages/durable-backend-sqlite-zstd/src/codec.ts"
       ],
       "@mavis/goal": [
         "./packages/agent-modules/goal/src/index.ts"
@@ -376,11 +385,98 @@
       "@mavis/skills": [
         "./packages/agent-modules/skills/src/index.ts"
       ],
+      "@mavis/storage-worker": [
+        "./packages/storage-worker/src/index.ts"
+      ],
       "@mavis/system-reminder": [
         "./packages/agent-modules/system-reminder/src/index.ts"
       ],
+      "@mavis/v2-adapter": [
+        "./packages/v2-adapter/src/index.ts"
+      ],
       "@minimax/code/package.json": [
         "./packages/tui/package.json"
+      ],
+      "@minimax/local/chord": [
+        "./third_party/chord/src/index.ts"
+      ],
+      "@minimax/local/chord/context": [
+        "./third_party/chord/src/context/index.ts"
+      ],
+      "@minimax/local/chord/delta": [
+        "./third_party/chord/src/delta/index.ts"
+      ],
+      "@minimax/local/chord/node": [
+        "./third_party/chord/src/node.ts"
+      ],
+      "@minimax/local/chord/output": [
+        "./third_party/chord/src/output.ts"
+      ],
+      "@minimax/local/chord/package.json": [
+        "./third_party/chord/package.json"
+      ],
+      "@minimax/local/chord/sqlite": [
+        "./third_party/chord/src/sqlite/index.ts"
+      ],
+      "@minimax/local/chord/sqlite/cloudflare": [
+        "./third_party/chord/src/sqlite/cloudflare.ts"
+      ],
+      "@minimax/local/chord/sqlite/node": [
+        "./third_party/chord/src/sqlite/node.ts"
+      ],
+      "@minimax/local/chord/telemetry-sqlite": [
+        "./third_party/chord/src/telemetry-sqlite/index.ts"
+      ],
+      "@minimax/local/pi-durable": [
+        "./third_party/pi-durable/src/index.ts"
+      ],
+      "@minimax/local/pi-durable/codemode": [
+        "./third_party/pi-durable/src/codemode/index.ts"
+      ],
+      "@minimax/local/pi-durable/env": [
+        "./third_party/pi-durable/src/env/index.ts"
+      ],
+      "@minimax/local/pi-durable/env/node": [
+        "./third_party/pi-durable/src/env/node.ts"
+      ],
+      "@minimax/local/pi-durable/images": [
+        "./third_party/pi-durable/src/images/index.ts"
+      ],
+      "@minimax/local/pi-durable/images/cloudflare": [
+        "./third_party/pi-durable/src/images/cloudflare.ts"
+      ],
+      "@minimax/local/pi-durable/images/node": [
+        "./third_party/pi-durable/src/images/node.ts"
+      ],
+      "@minimax/local/pi-durable/package.json": [
+        "./third_party/pi-durable/package.json"
+      ],
+      "@minimax/local/pi-durable/storage/jsonl": [
+        "./third_party/pi-durable/src/storage/jsonl/index.ts"
+      ],
+      "@minimax/local/pi-durable/storage/jsonl/node": [
+        "./third_party/pi-durable/src/storage/jsonl/node.ts"
+      ],
+      "@minimax/local/pi-durable/storage/memory": [
+        "./third_party/pi-durable/src/storage/memory.ts"
+      ],
+      "@minimax/local/pi-durable/storage/sqlite": [
+        "./third_party/pi-durable/src/storage/sqlite/index.ts"
+      ],
+      "@minimax/local/pi-durable/storage/sqlite/cloudflare": [
+        "./third_party/pi-durable/src/storage/sqlite/cloudflare.ts"
+      ],
+      "@minimax/local/pi-durable/storage/sqlite/node": [
+        "./third_party/pi-durable/src/storage/sqlite/node.ts"
+      ],
+      "@minimax/local/pi-durable/testing": [
+        "./third_party/pi-durable/src/testing/index.ts"
+      ],
+      "@minimax/local/pi-durable/tool-search": [
+        "./third_party/pi-durable/src/tool-search/index.ts"
+      ],
+      "@minimax/local/pi-durable/tools": [
+        "./third_party/pi-durable/src/tools/index.ts"
       ],
       "@minimax/mcode-sandbox-runtime": [
         "./third_party/sandbox-runtime/src/index.ts"

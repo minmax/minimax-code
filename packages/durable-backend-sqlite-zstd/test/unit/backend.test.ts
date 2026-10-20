@@ -1,0 +1,450 @@
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { SqliteZstdBackend } from '../../src/index.js';
+import { decodeFrame, encodeFrame, getCodec, resolveCodec } from '../../src/codec.js';
+import {
+	CorruptFrameError,
+	FORMAT_ID,
+	isZstdSupported,
+	MAX_BATCH_UNCOMPRESSED_BYTES,
+	type Commit,
+	type EntryDraft,
+	SEQ_AT_START,
+	SqliteZstdError,
+	SealedGenerationError,
+	loadSqlite3Constructor,
+} from '../../src/index.js';
+
+const Database = loadSqlite3Constructor();
+
+let workDir: string;
+
+/** Flip the last byte — where the frame checksum lives — to simulate a torn write. */
+function flipLastByte(buffer: Buffer): Buffer {
+	const torn = Buffer.from(buffer);
+	const last = torn.length - 1;
+	torn[last] = (torn[last] ?? 0) ^ 0xff;
+	return torn;
+}
+
+beforeEach(() => {
+	workDir = mkdtempSync(join(tmpdir(), 'sqlite-zstd-'));
+});
+
+afterEach(() => {
+	bestEffortUnseal(workDir);
+	rmSync(workDir, { recursive: true, force: true });
+});
+
+/** Sealed files keep their write bits stripped; restore them so removal never fails. */
+function bestEffortUnseal(directory: string): void {
+	if (!existsSync(directory)) return;
+	for (const name of readdirSync(directory)) {
+		if (!/^sessions\.g\d+\.db/.test(name)) continue;
+		try {
+			chmodSync(join(directory, name), 0o644);
+		} catch {
+			// Removal below is best effort on every platform.
+		}
+	}
+}
+
+function draft(id: string, payload: unknown, kind = 'pi.user'): EntryDraft {
+	return { id, kind, payload: payload as EntryDraft['payload'] };
+}
+
+function drafts(count: number, offset = 0): EntryDraft[] {
+	return Array.from({ length: count }, (_, index) =>
+		draft(`e-${offset + index}`, { position: offset + index, note: `запись №${offset + index}` }),
+	);
+}
+
+function commitSeqs(commits: readonly Commit[]): number[] {
+	return commits.map((commit) => commit.seq);
+}
+
+describe('codec seam', () => {
+	it('resolves zstd when the runtime provides it and falls back to gzip', () => {
+		const resolved = resolveCodec();
+		expect(resolved.name).toBe(isZstdSupported() ? 'zstd' : 'gzip');
+		expect(resolveCodec('gzip').name).toBe('gzip');
+		if (isZstdSupported()) {
+			expect(resolveCodec('zstd').name).toBe('zstd');
+			expect(getCodec('zstd').compress(Buffer.from('x')).length).toBeGreaterThan(0);
+		} else {
+			expect(() => getCodec('zstd')).toThrow(SqliteZstdError);
+		}
+	});
+
+	it('round-trips a frame through the envelope', () => {
+		const name = isZstdSupported() ? 'zstd' : 'gzip';
+		const original = Buffer.from('batch payload 🚀 '.repeat(64), 'utf8');
+		const decoded = decodeFrame(encodeFrame(name, original));
+		expect(decoded.name).toBe(name);
+		expect(decoded.data.equals(original)).toBe(true);
+	});
+
+	it('rejects frames with a broken envelope', () => {
+		expect(() => decodeFrame(Buffer.from('MZS1'))).toThrow(CorruptFrameError);
+		expect(() => decodeFrame(Buffer.from('nope-not-a-frame'))).toThrow(CorruptFrameError);
+		expect(() => decodeFrame(Buffer.concat([Buffer.from('MZS1', 'ascii'), Buffer.from([0x7f]), Buffer.alloc(8)]))).toThrow(
+			CorruptFrameError,
+		);
+	});
+
+	it('detects a flipped byte inside the compressed frame', () => {
+		if (!isZstdSupported()) return; // gzip path asserts the same guarantee below
+		const frame = encodeFrame('zstd', Buffer.from('checksummed content', 'utf8'));
+		const torn = flipLastByte(frame); // the frame checksum lives in the last bytes
+		expect(() => decodeFrame(torn)).toThrow(CorruptFrameError);
+	});
+
+	it('detects a flipped byte in a gzip frame', () => {
+		const frame = encodeFrame('gzip', Buffer.from('checksummed content', 'utf8'));
+		const torn = flipLastByte(frame);
+		expect(() => decodeFrame(torn)).toThrow(CorruptFrameError);
+	});
+});
+
+describe('appendBatch -> readDelta round trip', () => {
+	it('reads every entry back in commit order with stamped positions', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		const first = await backend.appendBatch(drafts(3, 0));
+		const second = await backend.appendBatch(drafts(2, 10));
+		const third = await backend.appendBatch([draft('special', { nested: [1, { deep: null }], flag: true }, 'pi.assistant')]);
+
+		expect(commitSeqs([first, second, third])).toEqual([1, 2, 3]);
+		expect(backend.head).toBe(3);
+
+		const all = backend.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER);
+		expect(all.map((entry) => entry.id)).toEqual(['e-0', 'e-1', 'e-2', 'e-10', 'e-11', 'special']);
+		expect(all.map((entry) => entry.seq)).toEqual([1, 1, 1, 2, 2, 3]);
+		expect(all.map((entry) => entry.ordinal)).toEqual([0, 1, 2, 0, 1, 0]);
+		expect(all[5]).toMatchObject({ kind: 'pi.assistant', payload: { nested: [1, { deep: null }], flag: true } });
+		expect(all[0]?.payload).toMatchObject({ position: 0, note: 'запись №0' });
+		await backend.close();
+	});
+
+	it('windows the delta by afterSeq and by the byte budget', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		const first = await backend.appendBatch(drafts(3, 0));
+		const second = await backend.appendBatch(drafts(2, 10));
+		await backend.appendBatch(drafts(4, 20));
+
+		const rest = backend.readDelta(first.seq, Number.MAX_SAFE_INTEGER);
+		expect(rest.map((entry) => entry.id)).toEqual(['e-10', 'e-11', 'e-20', 'e-21', 'e-22', 'e-23']);
+
+		const both = backend.readDelta(SEQ_AT_START, first.uncompressedBytes + second.uncompressedBytes);
+		expect(both).toHaveLength(5);
+		const one = backend.readDelta(SEQ_AT_START, first.uncompressedBytes + 1);
+		expect(one.map((entry) => entry.seq)).toEqual([1, 1, 1]);
+		// Batches are atomic units, but the first batch past afterSeq is always
+		// served so a reader can never stall on an over-budget batch.
+		const progress = backend.readDelta(first.seq, 1);
+		expect(progress.map((entry) => entry.seq)).toEqual([2, 2]);
+		expect(backend.readDelta(backend.head, Number.MAX_SAFE_INTEGER)).toEqual([]);
+		await backend.close();
+	});
+
+	it('validates arguments and entry drafts before writing', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		expect(() => backend.readDelta(0, 0)).toThrow(RangeError);
+		expect(() => backend.readDelta(-1, 1024)).toThrow(RangeError);
+		expect(() => backend.readDelta(1.5, 1024)).toThrow(RangeError);
+		await expect(backend.appendBatch([])).rejects.toThrow(TypeError);
+		await expect(backend.appendBatch([draft('', {})])).rejects.toThrow(TypeError);
+		await expect(backend.appendBatch([{ id: 'x', kind: 'k', payload: undefined as never }])).rejects.toThrow(TypeError);
+		await expect(backend.appendBatch([{ id: 'y', kind: 'k', payload: Number.NaN }])).rejects.toThrow(TypeError);
+		expect(backend.head).toBe(SEQ_AT_START);
+		await backend.close();
+	});
+
+	it('stores the contract schema: one frame per commit, index rows, head', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		await backend.appendBatch(drafts(3, 0));
+		await backend.appendBatch(drafts(2, 10));
+		await backend.close();
+
+		const raw = new Database(join(workDir, 'sessions.g1.db'), { readonly: true, fileMustExist: true });
+		try {
+			const batchColumns = (raw.prepare('PRAGMA table_info(batches)').all() as Array<{ name: string }>).map((column) => column.name);
+			expect(batchColumns).toEqual(['batch_id', 'created_ms', 'compressed', 'payload']);
+			const indexColumns = (raw.prepare('PRAGMA table_info(entries)').all() as Array<{ name: string }>).map((column) => column.name);
+			expect(indexColumns).toEqual(['entry_id', 'seq', 'ordinal', 'batch_id']);
+
+			const batches = raw.prepare('SELECT batch_id, created_ms, compressed, payload FROM batches ORDER BY batch_id').all() as Array<{
+				batch_id: number;
+				created_ms: number;
+				compressed: number;
+				payload: Buffer;
+			}>;
+			expect(batches).toHaveLength(2);
+			for (const batch of batches) {
+				expect(batch.compressed).toBe(batch.payload.length);
+				expect(batch.payload.subarray(0, 4).toString('ascii')).toBe('MZS1');
+			}
+			const indexRows = raw.prepare('SELECT entry_id, seq, ordinal, batch_id FROM entries ORDER BY seq, ordinal').all() as Array<{
+				entry_id: string;
+				seq: number;
+				ordinal: number;
+				batch_id: number;
+			}>;
+			expect(indexRows).toHaveLength(5);
+			expect(indexRows[3]).toMatchObject({ entry_id: 'e-10', seq: 2, ordinal: 0, batch_id: 2 });
+			const head = raw.prepare("SELECT value FROM meta WHERE key = 'head'").get() as { value: string };
+			expect(Number(head.value)).toBe(2);
+			const format = raw.prepare("SELECT value FROM meta WHERE key = 'format'").get() as { value: string };
+			expect(format.value).toBe(FORMAT_ID);
+		} finally {
+			raw.close();
+		}
+	});
+
+	it('keeps failed commits atomic: duplicate ids leave head and rows untouched', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		await backend.appendBatch(drafts(2, 0));
+		await expect(backend.appendBatch([draft('e-0', 'duplicate')])).rejects.toThrow(/UNIQUE/i);
+		expect(backend.head).toBe(1);
+		expect(backend.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER)).toHaveLength(2);
+		// The failed batch consumed no sequence: the next commit takes head + 1.
+		const next = await backend.appendBatch(drafts(1, 50));
+		expect(next.seq).toBe(2);
+		await backend.close();
+	});
+
+	it('rejects batches over the uncompressed cap without writing', async () => {
+		const backend = SqliteZstdBackend.open(workDir, { maxBatchUncompressedBytes: 128 });
+		expect(MAX_BATCH_UNCOMPRESSED_BYTES).toBe(256 * 1024);
+		const oversized = Array.from({ length: 16 }, (_, index) => draft(`big-${index}`, 'x'.repeat(32)));
+		await expect(backend.appendBatch(oversized)).rejects.toThrow(/uncompressed cap/);
+		expect(backend.head).toBe(SEQ_AT_START);
+		expect(backend.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER)).toEqual([]);
+		await backend.close();
+	});
+});
+
+describe('head monotonicity', () => {
+	it('keeps the sequence strictly increasing across commits and reopens', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		const commits: Commit[] = [];
+		for (let round = 0; round < 3; round += 1) commits.push(await backend.appendBatch(drafts(2, round * 10)));
+		expect(commitSeqs(commits)).toEqual([1, 2, 3]);
+		expect(backend.head).toBe(3);
+		await backend.close();
+
+		const reopened = SqliteZstdBackend.open(workDir);
+		expect(reopened.generation).toBe(1);
+		expect(reopened.head).toBe(3); // head survives reopen; no reset to zero
+		const next = await reopened.appendBatch(drafts(2, 100));
+		expect(next.seq).toBe(4);
+		expect(reopened.head).toBe(4);
+		expect(reopened.readDelta(3, Number.MAX_SAFE_INTEGER).map((entry) => entry.id)).toEqual(['e-100', 'e-101']);
+		await reopened.close();
+	});
+
+	it('advances the head only when the open batch is flushed', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		backend.stage(drafts(2, 0));
+		expect(backend.head).toBe(SEQ_AT_START);
+		expect(backend.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER)).toEqual([]);
+
+		const flushed = await backend.checkpoint();
+		expect(flushed?.seq).toBe(1);
+		expect(flushed?.entryCount).toBe(2);
+		expect(backend.head).toBe(1);
+		expect(await backend.checkpoint()).toBeUndefined(); // nothing staged: no write, no commit
+
+		// appendBatch and the open batch share one monotonic sequence.
+		backend.stage(drafts(1, 10));
+		const direct = await backend.appendBatch(drafts(1, 20));
+		expect(direct.seq).toBe(2);
+		const stagedFlush = await backend.checkpoint();
+		expect(stagedFlush?.seq).toBe(3);
+		expect(backend.head).toBe(3);
+		await backend.close();
+	});
+
+	it('flushes the open batch on close and rejects operations afterwards', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		backend.stage(drafts(2, 0));
+		await backend.close();
+		await expect(backend.appendBatch(drafts(1, 50))).rejects.toThrow(SqliteZstdError);
+		expect(() => backend.head).toThrow(SqliteZstdError);
+
+		const reopened = SqliteZstdBackend.open(workDir);
+		expect(reopened.head).toBe(1);
+		expect(reopened.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER)).toHaveLength(2);
+		await reopened.close();
+		await backend.close(); // idempotent
+	});
+});
+
+describe('torn tail', () => {
+	it('never serves a batch whose frame failed the checksum', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		await backend.appendBatch(drafts(2, 0));
+		await backend.appendBatch(drafts(2, 10));
+		const last = await backend.appendBatch(drafts(2, 20));
+		await backend.close();
+
+		// The corrupting connection is deliberately read-write: it stands in
+		// for a torn or bit-rotted write reaching the file.
+		const raw = new Database(join(workDir, 'sessions.g1.db'), { fileMustExist: true });
+		const stored = raw.prepare('SELECT payload FROM batches WHERE batch_id = ?').get(last.seq) as { payload: Buffer };
+		const torn = flipLastByte(stored.payload); // flip a checksum byte: the frame cannot verify
+		raw.prepare('UPDATE batches SET payload = ? WHERE batch_id = ?').run(torn, last.seq);
+		raw.close();
+
+		const reopened = SqliteZstdBackend.open(workDir, { generation: 1 });
+		expect(reopened.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER).map((entry) => entry.id)).toEqual(['e-0', 'e-1', 'e-10', 'e-11']);
+		expect(reopened.readDelta(last.seq - 1, Number.MAX_SAFE_INTEGER)).toEqual([]); // tail gone: nothing readable past the tear
+		await reopened.close();
+	});
+
+	it('never serves a batch with a truncated payload', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		await backend.appendBatch(drafts(2, 0));
+		const last = await backend.appendBatch(drafts(2, 10));
+		await backend.close();
+
+		const raw = new Database(join(workDir, 'sessions.g1.db'), { fileMustExist: true });
+		const stored = raw.prepare('SELECT payload FROM batches WHERE batch_id = ?').get(last.seq) as { payload: Buffer };
+		raw.prepare('UPDATE batches SET payload = ? WHERE batch_id = ?').run(stored.payload.subarray(0, 3), last.seq);
+		raw.close();
+
+		const reopened = SqliteZstdBackend.open(workDir, { generation: 1 });
+		expect(reopened.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER)).toHaveLength(2);
+		await reopened.close();
+	});
+
+	it('never serves a batch whose entry index disagrees with the payload', async () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		await backend.appendBatch(drafts(2, 0));
+		await backend.appendBatch(drafts(2, 10));
+		await backend.appendBatch(drafts(2, 20));
+		await backend.close();
+
+		const raw = new Database(join(workDir, 'sessions.g1.db'), { fileMustExist: true });
+		raw.prepare('DELETE FROM entries WHERE batch_id = 2 AND ordinal = 1').run();
+		raw.close();
+
+		const reopened = SqliteZstdBackend.open(workDir, { generation: 1 });
+		const delta = reopened.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER);
+		expect(delta.map((entry) => entry.seq)).toEqual([1, 1]); // scan stops before the inconsistent batch
+		// A window past the torn batch reads only intact batches it touches.
+		expect(reopened.readDelta(2, Number.MAX_SAFE_INTEGER).map((entry) => entry.seq)).toEqual([3, 3]);
+		await reopened.close();
+	});
+});
+
+describe('format generations', () => {
+	it('creates g1 for an empty directory and opens the highest generation by default', async () => {
+		const first = SqliteZstdBackend.open(workDir);
+		expect(first.generation).toBe(1);
+		expect(first.path).toBe(join(workDir, 'sessions.g1.db'));
+		expect(existsSync(join(workDir, 'sessions.g1.db'))).toBe(true);
+		await first.appendBatch(drafts(1, 0));
+		await first.close();
+
+		const second = SqliteZstdBackend.openNextGeneration(workDir);
+		expect(second.generation).toBe(2);
+		expect(second.head).toBe(SEQ_AT_START); // a new generation starts empty
+		const commit = await second.appendBatch(drafts(1, 100));
+		expect(commit.seq).toBe(1);
+		await second.close();
+
+		const latest = SqliteZstdBackend.open(workDir);
+		expect(latest.generation).toBe(2);
+		expect(latest.head).toBe(1);
+		await latest.close();
+	});
+
+	it('sealing a generation keeps reads and refuses writes', async () => {
+		const first = SqliteZstdBackend.open(workDir);
+		const committed = await first.appendBatch(drafts(2, 0));
+		const second = secondGeneration();
+		expect(first.sealed).toBe(true);
+		await expect(first.appendBatch(drafts(1, 50))).rejects.toThrow(SealedGenerationError);
+		expect(() => first.stage(drafts(1, 51))).toThrow(SealedGenerationError);
+		await expect(first.checkpoint()).rejects.toThrow(SealedGenerationError);
+		// Sealed generations stay readable, byte-for-byte.
+		expect(first.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER).map((entry) => entry.id)).toEqual(['e-0', 'e-1']);
+		expect(first.head).toBe(committed.seq);
+
+		if (process.platform !== 'win32') {
+			const mode = statSync(join(workDir, 'sessions.g1.db')).mode;
+			expect(mode & 0o222).toBe(0); // no write bits for anyone
+		}
+		await first.close();
+
+		// A fresh handle on the sealed file opens read-only and stays sealed.
+		const reopened = SqliteZstdBackend.open(workDir, { generation: 1 });
+		expect(reopened.sealed).toBe(true);
+		expect(reopened.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER)).toHaveLength(2);
+		await expect(reopened.appendBatch(drafts(1, 60))).rejects.toThrow(SealedGenerationError);
+		await reopened.close();
+
+		// The writer that asked for the new generation is unsealed and fresh.
+		expect(second.sealed).toBe(false);
+		const commit = await second.appendBatch(drafts(1, 100));
+		expect(commit.seq).toBe(1); // a new generation numbers its own log from one
+		expect(second.head).toBe(1);
+		await second.close();
+	});
+
+	it('flushes a staged open batch when a newer generation seals the handle', async () => {
+		const first = SqliteZstdBackend.open(workDir);
+		first.stage(drafts(2, 0));
+		secondGeneration();
+		expect(first.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER)).toHaveLength(2);
+		expect(first.head).toBe(1);
+		await first.close();
+	});
+
+	it('rejects opening a generation that does not exist', () => {
+		const backend = SqliteZstdBackend.open(workDir);
+		expect(backend.generation).toBe(1);
+		expect(() => SqliteZstdBackend.open(workDir, { generation: 7 })).toThrow(SqliteZstdError);
+		return backend.close();
+	});
+
+	it('reads batches written by mixed codecs through the envelope', async () => {
+		const preferred = isZstdSupported() ? undefined : ('gzip' as const);
+		const backend = SqliteZstdBackend.open(workDir, preferred ? { codec: preferred } : {});
+		await backend.appendBatch(drafts(2, 0));
+		await backend.close();
+
+		const other: 'gzip' | 'zstd' = isZstdSupported() ? 'gzip' : 'zstd';
+		if (other === 'zstd' && !isZstdSupported()) return; // cannot force zstd without runtime support
+		const mixed = SqliteZstdBackend.open(workDir, { codec: other });
+		const commit = await mixed.appendBatch(drafts(2, 10));
+		expect(commit.codec).toBe(other);
+		const delta = mixed.readDelta(SEQ_AT_START, Number.MAX_SAFE_INTEGER);
+		expect(delta.map((entry) => entry.id)).toEqual(['e-0', 'e-1', 'e-10', 'e-11']);
+		await mixed.close();
+
+		const raw = new Database(join(workDir, 'sessions.g1.db'), { readonly: true, fileMustExist: true });
+		const payloads = (raw.prepare('SELECT batch_id, payload FROM batches ORDER BY batch_id').all() as Array<{ payload: Buffer }>).map(
+			(row) => decodeFrame(row.payload).name,
+		);
+		raw.close();
+		const expectedFirst = isZstdSupported() ? 'zstd' : 'gzip';
+		expect(payloads).toEqual([expectedFirst, other]);
+	});
+
+	it('rejects a foreign file format instead of rewriting it', async () => {
+		const foreign = new Database(join(workDir, 'sessions.g1.db'));
+		foreign.exec('CREATE TABLE other (x)');
+		foreign.close();
+		expect(() => SqliteZstdBackend.open(workDir)).toThrow(new RegExp(FORMAT_ID));
+		expect(readFileSync(join(workDir, 'sessions.g1.db'), 'latin1')).toContain('other');
+	});
+});
+
+/** Open the next generation; declared as a function so each call site reads clearly. */
+function secondGeneration(): SqliteZstdBackend {
+	return SqliteZstdBackend.openNextGeneration(workDir);
+}

@@ -231,7 +231,15 @@
       "packages/browser-core/test/browser-script-runner.test.ts",
       "packages/local-runtime-v2/test/unit/plugin/plugin-agents.test.ts",
       "packages/local-runtime-v2/test/unit/plugin/plugin-agent-delegation.test.ts",
-      "packages/local-runtime-v2/test/unit/plugin/plugin-agent-snapshot.test.ts"
+      "packages/local-runtime-v2/test/unit/plugin/plugin-agent-snapshot.test.ts",
+      "packages/cas/test/unit/cas.test.ts",
+      "packages/durable-backend-sqlite-zstd/test/unit/backend.test.ts",
+      "packages/storage-worker/test/unit/batch-window.test.ts",
+      "packages/storage-worker/test/unit/client.test.ts",
+      "packages/storage-worker/test/unit/single-flight.test.ts",
+      "packages/storage-worker/test/unit/worker-thread.test.ts",
+      "packages/v2-adapter/test/unit/v2-session-reader.test.ts",
+      "packages/v2-adapter/test/unit/v2-session-import.test.ts"
     ],
     "status-contract": [
       "packages/tui/test/unit/tui-build-mode-contract.test.ts"
