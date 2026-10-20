@@ -51,16 +51,23 @@ export interface Commit {
  * The persistence surface the worker drives. `appendBatch` must persist the
  * whole batch as ONE durable unit and is always invoked with at most one call
  * in flight (single-flight, see `createStorageWorker`).
+ *
+ * `appendBatch` is never invoked with an empty array: the backend contract
+ * (`durable-backend-sqlite-zstd`) rejects empty batches, and a flush with
+ * nothing to lose goes through {@link StorageWorkerBackend.checkpoint} instead.
  */
 export interface StorageWorkerBackend {
   appendBatch(entries: Entry[]): Promise<Commit>;
   /**
    * Forces the backend to flush any open batch it still holds (WAL/fsync
-   * barrier in the sqlite-zstd backend). Optional: a backend without an open
-   * batch concept can omit it, `StorageWorker.checkpoint()` then reduces to a
-   * full drain.
+   * barrier in the sqlite-zstd backend). May report the flushed open batch's
+   * commit when the backend produced one, or `undefined`/`void` when nothing
+   * was staged. Optional: a backend without an open batch concept can omit
+   * it. Doubles as the liveness probe of a trivial flush (empty window,
+   * nothing ever committed): a sealed or closed backend must throw here so
+   * the lost write surface is noticed instead of silently flushed nothing.
    */
-  checkpoint?(): void | Promise<void>;
+  checkpoint?(): Commit | null | void | Promise<Commit | null | void>;
 }
 
 /** Batch-window tuning. Defaults match the durable-core spec. */
@@ -81,6 +88,35 @@ export interface StorageWorkerOptions {
    * from source (vitest, tsx).
    */
   workerUrl?: URL | string;
+  /**
+   * Uncompressed-size cap of one backend batch, in bytes. Entries whose
+   * `bytes` exceed it are rejected at admission (they could never be part of
+   * a committable batch), and the append path splits batches that serialize
+   * above it. Must not exceed the backend's own cap
+   * (`MAX_BATCH_UNCOMPRESSED_BYTES` in `durable-backend-sqlite-zstd`). The
+   * default mirrors that backend: 256 KiB.
+   */
+  maxBatchUncompressedBytes?: number;
+  /**
+   * How many consecutive failures of the exact same batch composition are
+   * tolerated before the batch is quarantined and its flush rejects with a
+   * terminal {@link BatchStuckError}. Default: 3.
+   */
+  maxConsecutiveFlushFailures?: number;
+  /**
+   * Called on the caller thread whenever entries are quarantined (a single
+   * entry above the cap, or a batch stuck after repeated failures).
+   * Quarantined entries are never retried; their `enqueue` promises already
+   * resolved ("safely queued"), so this callback — the `quarantined` handle
+   * field, and the rejecting `flush` are the terminal report.
+   */
+  onQuarantined?: (entries: readonly Entry[], error: Error) => void;
+  /**
+   * Extra `execArgv` for the spawned worker thread — for example
+   * `['--import', 'tsx']` when the backend factory module of an off-thread
+   * worker is TypeScript source. Default: inherit.
+   */
+  workerExecArgv?: readonly string[];
 }
 
 /** Handle returned by `createStorageWorker`. */
@@ -92,22 +128,36 @@ export interface StorageWorker {
    * ceiling is reached the returned promise stays pending (backpressure)
    * until committed bytes free room; the entry itself is never dropped.
    *
+   * Rejects without queueing when the entry is invalid or can never be
+   * persisted (larger than the batch cap) — admission failures are terminal,
+   * not retried.
+   *
    * The promise says "safely queued", not "durable" — await `flush()` or
    * `checkpoint()` for durability.
    */
   enqueue(entry: Entry): Promise<void>;
   /**
    * Drains the queue and waits for the batch covering every entry whose
-   * `enqueue` has resolved. Resolves with that batch's commit. Rejects if the
-   * backend is unavailable — entries stay queued and are retried.
+   * `enqueue` has resolved. Resolves with that batch's commit, or `null`
+   * when there was nothing to commit (empty queue; the durability barrier
+   * then comes from `checkpoint()`), so a caller is never tempted to mistake
+   * a fabricated commit for a real one. Rejects if the backend is
+   * unavailable — entries stay queued and are retried, until the batch is
+   * declared stuck (see `maxConsecutiveFlushFailures`).
    */
-  flush(): Promise<Commit>;
+  flush(): Promise<Commit | null>;
   /**
    * Fail-closed durability barrier: drains everything, then calls
    * `backend.checkpoint()`. Throws whenever the backend cannot confirm
    * durability (worker gone, `appendBatch` failing, `checkpoint` throwing).
    */
   checkpoint(): Promise<void>;
+  /**
+   * Entries removed from the retry queue as dead letters: a single entry
+   * above the batch cap, or a batch that failed too many consecutive times
+   * with the same composition. Quarantined entries are never retried.
+   */
+  readonly quarantined: readonly Entry[];
   /**
    * Stops the worker: drains what is queued, terminates the thread, and
    * rejects all later calls. Rejects (after still terminating) if the final

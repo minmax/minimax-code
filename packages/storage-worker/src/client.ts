@@ -7,7 +7,12 @@
  * worker cuts them into batches (<= 200 ms / <= 256 KiB, single-flight) and
  * asks this thread to run `backend.appendBatch` — exactly one call per batch,
  * never two in flight. The backend handle itself always stays on the thread
- * that created it.
+ * that created it. (To move the backend off this thread entirely, see
+ * `createOffThreadStorageWorker`.)
+ *
+ * Admission is terminal for entries that can never be persisted: an entry
+ * whose `bytes` exceed the backend batch cap is rejected by `enqueue`
+ * immediately instead of wedging the retry loop forever.
  *
  * @module
  */
@@ -15,6 +20,7 @@
 import { existsSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 
+import { EntryExceedsBatchCapError } from './errors.js';
 import type {
   Commit,
   Entry,
@@ -23,27 +29,37 @@ import type {
   StorageWorkerOptions,
 } from './contracts.js';
 import { createBoundedByteQueue } from './queue.js';
-import { DEFAULT_WINDOW_BYTES, DEFAULT_WINDOW_MS } from './worker.js';
+import {
+  DEFAULT_MAX_BATCH_UNCOMPRESSED_BYTES,
+  DEFAULT_WINDOW_BYTES,
+  DEFAULT_WINDOW_MS,
+} from './worker.js';
 
 const DEFAULT_QUEUE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_CONSECUTIVE_FLUSH_FAILURES = 3;
 
 // Messages this thread posts to the worker: entry pump, flush requests, and
-// the replies to the worker's append requests (the backend runs here).
+// the replies to the worker's append/checkpoint requests (the backend runs
+// here).
 type ClientToWorkerMessage =
   | { type: 'entries'; entries: Entry[] }
   | { type: 'flush'; requestId: number }
+  | { type: 'checkpoint'; requestId: number }
   | { type: 'appendResult'; requestId: number; commit: Commit }
-  | { type: 'appendError'; requestId: number; message: string };
+  | { type: 'appendError'; requestId: number; message: string; errorName?: string; errorEntryId?: unknown }
+  | { type: 'checkpointResult'; requestId: number; commit: Commit | null }
+  | { type: 'checkpointError'; requestId: number; message: string };
 
-// Messages the worker posts to this thread: batch append requests and the
-// replies to flush requests.
+// Messages the worker posts to this thread: batch append requests, quarantine
+// reports, and the replies to flush requests.
 type WorkerToMainMessage =
   | { type: 'append'; requestId: number; entries: Entry[] }
-  | { type: 'flushResult'; requestId: number; commit: Commit }
-  | { type: 'flushError'; requestId: number; message: string };
+  | { type: 'flushResult'; requestId: number; commit: Commit | null }
+  | { type: 'flushError'; requestId: number; message: string; errorName?: string }
+  | { type: 'quarantined'; entries: Entry[]; message: string; errorName?: string };
 
 interface PendingFlush {
-  resolve(commit: Commit): void;
+  resolve(commit: Commit | null): void;
   reject(error: unknown): void;
 }
 
@@ -55,7 +71,18 @@ function defaultWorkerUrl(): URL {
   return new URL('worker.ts', import.meta.url);
 }
 
-function validateEntry(entry: Entry, queueBytes: number): void {
+/** Rebuilds a terminal-class error from its protocol wire shape. */
+function rehydrateError(message: string, errorName: string | undefined): Error {
+  if (errorName === 'EntryTooLargeError' || errorName === 'BatchStuckError') {
+    const rebuilt = new Error(message);
+    rebuilt.name = errorName;
+    return rebuilt;
+  }
+  return new Error(message);
+}
+
+/** Admission validation shared by both worker clients (main-side backends and off-thread hosts). */
+export function validateEntry(entry: Entry, queueBytes: number, batchCapBytes: number): void {
   if (entry === null || typeof entry !== 'object') {
     throw new TypeError('entry must be an object');
   }
@@ -77,6 +104,11 @@ function validateEntry(entry: Entry, queueBytes: number): void {
         'it could never be admitted',
     );
   }
+  // Terminal at admission: an entry above the batch cap can never be part of
+  // a committable batch, so queueing it would only wedge the retry loop.
+  if (entry.bytes > batchCapBytes) {
+    throw new EntryExceedsBatchCapError(entry.entryId, entry.bytes, batchCapBytes);
+  }
 }
 
 export function createStorageWorker(
@@ -89,10 +121,15 @@ export function createStorageWorker(
   const queueBytes = options.queueBytes ?? DEFAULT_QUEUE_BYTES;
   const windowMs = options.windowMs ?? DEFAULT_WINDOW_MS;
   const windowBytes = options.windowBytes ?? DEFAULT_WINDOW_BYTES;
+  const maxBatchUncompressedBytes =
+    options.maxBatchUncompressedBytes ?? DEFAULT_MAX_BATCH_UNCOMPRESSED_BYTES;
+  const maxConsecutiveFlushFailures =
+    options.maxConsecutiveFlushFailures ?? DEFAULT_MAX_CONSECUTIVE_FLUSH_FAILURES;
 
   const queue = createBoundedByteQueue(queueBytes);
   const worker = new Worker(options.workerUrl ?? defaultWorkerUrl(), {
-    workerData: { windowMs, windowBytes },
+    workerData: { windowMs, windowBytes, maxConsecutiveFlushFailures },
+    execArgv: options.workerExecArgv === undefined ? undefined : [...options.workerExecArgv],
   });
 
   let closed = false;
@@ -101,6 +138,7 @@ export function createStorageWorker(
   let nextRequestId = 0;
   let lastCommit: Commit | null = null;
   const queued: Entry[] = [];
+  const quarantinedEntries: Entry[] = [];
   const pendingFlushes = new Map<number, PendingFlush>();
 
   function failAll(error: Error): void {
@@ -144,13 +182,13 @@ export function createStorageWorker(
     }
   }
 
-  function flushInternal(): Promise<Commit> {
+  function flushInternal(): Promise<Commit | null> {
     if (broken) return Promise.reject(broken);
     if (closed) return Promise.reject(new Error('storage worker is disposed'));
     sendNow();
     if (broken) return Promise.reject(broken); // pump may have failed closed
     const requestId = nextRequestId++;
-    return new Promise<Commit>((resolve, reject) => {
+    return new Promise<Commit | null>((resolve, reject) => {
       pendingFlushes.set(requestId, { resolve, reject });
       post({ type: 'flush', requestId });
     });
@@ -174,8 +212,38 @@ export function createStorageWorker(
             type: 'appendError',
             requestId,
             message: error instanceof Error ? error.message : String(error),
+            errorName: error instanceof Error ? error.name : undefined,
+            errorEntryId: (error as { readonly entryId?: unknown } | null)?.entryId,
           });
         });
+      return;
+    }
+    if (raw.type === 'checkpoint') {
+      const { requestId } = raw;
+      void Promise.resolve()
+        .then(() => backend.checkpoint?.())
+        .then((produced) => {
+          // An empty-window flush rides on this probe; a commit it produced
+          // becomes the worker's lastCommit just like a batch commit would.
+          if (produced) lastCommit = produced;
+          post({ type: 'checkpointResult', requestId, commit: produced ?? null });
+        })
+        .catch((error: unknown) => {
+          post({
+            type: 'checkpointError',
+            requestId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        });
+      return;
+    }
+    if (raw.type === 'quarantined') {
+      // Dead letters leave the retry path for good: release their bytes back
+      // to the admission queue so they cannot wedge backpressure forever.
+      const bytes = raw.entries.reduce((total, entry) => total + entry.bytes, 0);
+      quarantinedEntries.push(...raw.entries);
+      queue.release(bytes);
+      options.onQuarantined?.(raw.entries, rehydrateError(raw.message, raw.errorName));
       return;
     }
     // flushResult/flushError carry request ids issued by this thread;
@@ -185,10 +253,10 @@ export function createStorageWorker(
       if (!flush) return;
       pendingFlushes.delete(raw.requestId);
       if (raw.type === 'flushResult') {
-        lastCommit = raw.commit;
+        if (raw.commit) lastCommit = raw.commit;
         flush.resolve(raw.commit);
       } else {
-        flush.reject(new Error(raw.message));
+        flush.reject(rehydrateError(raw.message, raw.errorName));
       }
     }
   });
@@ -205,7 +273,7 @@ export function createStorageWorker(
       if (broken) return Promise.reject(broken);
       if (closed) return Promise.reject(new Error('storage worker is disposed'));
       try {
-        validateEntry(entry, queueBytes);
+        validateEntry(entry, queueBytes, maxBatchUncompressedBytes);
       } catch (error) {
         return Promise.reject(error);
       }
@@ -215,7 +283,7 @@ export function createStorageWorker(
       });
     },
 
-    flush(): Promise<Commit> {
+    flush(): Promise<Commit | null> {
       return flushInternal();
     },
 
@@ -223,8 +291,15 @@ export function createStorageWorker(
       // Fail-closed barrier: everything queued must be committed first, then
       // the backend must confirm its own open-batch flush. Any failure (or a
       // dead worker thread) propagates — never report unverified durability.
-      await flushInternal();
-      if (backend.checkpoint) await backend.checkpoint();
+      // A `null` commit means the drain took the empty-window path, which
+      // already probed `backend.checkpoint` through the bridge; after a real
+      // batch commit the explicit barrier call is still required here.
+      const commit = await flushInternal();
+      if (commit !== null && backend.checkpoint) await backend.checkpoint();
+    },
+
+    get quarantined(): readonly Entry[] {
+      return quarantinedEntries;
     },
 
     async dispose(): Promise<void> {
