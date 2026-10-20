@@ -26,10 +26,12 @@ function collectingTarget(): V2ImportTarget & { entries: V2Envelope[] } {
 }
 
 describe('importTo', () => {
-  it('passes every envelope through unchanged when no hook is given', async () => {
+  it('passes every envelope through unchanged when image externalization is off (`cas: null`)', async () => {
     const reader = openV2Session(fixtureDir);
     const target = collectingTarget();
-    const stats = await reader.importTo(target);
+    // Image externalization is ON by default; `cas: null` is the documented
+    // off switch (see `resolveImageHook`).
+    const stats = await reader.importTo(target, { cas: null });
 
     const original: V2Envelope[] = [];
     await reader.readEnvelopes((envelope) => {

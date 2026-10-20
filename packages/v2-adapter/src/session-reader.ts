@@ -10,6 +10,7 @@ import {
   type V2ContentBlock,
   type V2Envelope,
 } from './envelope.js';
+import { resolveImageHook, type CasImageOption } from './cas-image-hook.js';
 
 /** Name of the canonical history file inside a v2 session directory. */
 export const V2_MESSAGES_FILE = 'messages.jsonl';
@@ -51,15 +52,24 @@ export interface V2ImportTarget {
 /**
  * Image externalization hook: the CAS integration point of the import.
  *
- * It receives the raw base64 payload of an `image` content block (a CAS
+ * It receives the raw base64 payload of an `image` content block (the CAS
  * implementation decodes it with `Buffer.from(base64, 'base64')` before
- * `CAS.putImage`). Returning a blob descriptor replaces the block with
+ * storing). Returning a blob descriptor replaces the block with
  * `{ type: 'image_ref', blob }`; returning `undefined` keeps the block inline.
  */
 export type V2ImageHook = (base64: string) => Promise<string | undefined>;
 
+/**
+ * Import options. Image externalization is ON by default: without an explicit
+ * `onImage`, inline base64 `image` blocks are stored in the CAS at the
+ * durable data root and replaced with `image_ref` blocks (see
+ * `resolveImageHook`). Pass `cas: null` (or an explicit `onImage`) to change
+ * that: `cas` may be a store instance, a CAS root directory, or `null`.
+ */
 export interface V2ImportOptions {
-  readonly onImage?: V2ImageHook;
+	readonly onImage?: V2ImageHook;
+	/** Store instance, CAS root directory, or `null` to keep images inline. */
+	readonly cas?: CasImageOption;
 }
 
 export interface ImportStats {
@@ -117,7 +127,9 @@ async function importTo(
   target: V2ImportTarget,
   options?: V2ImportOptions,
 ): Promise<ImportStats> {
-  const onImage = options?.onImage;
+  // Default ON: without an explicit hook, image blocks are externalized to
+  // the CAS (see `resolveImageHook`); `cas: null` keeps them inline.
+  const onImage = options?.onImage ?? (await resolveImageHook(options?.cas));
   const { size } = await stat(messagesPath);
   const counters = { envelopes: 0, imageBlocks: 0, imagesMigrated: 0, imagesInline: 0 };
   let lines = 0;

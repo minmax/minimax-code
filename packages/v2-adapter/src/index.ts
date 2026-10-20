@@ -21,3 +21,10 @@ export {
   type V2SessionReader,
   type V2SessionStats,
 } from './session-reader.js';
+export {
+  createCasImageHook,
+  DEFAULT_CAS_ROOT,
+  resolveImageHook,
+  type CasImageOption,
+  type CasStoreLike,
+} from './cas-image-hook.js';
