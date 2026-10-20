@@ -185,6 +185,7 @@
       "packages/config/test/builtin-model-fallback.test.ts",
       "packages/config/test/config-update-preservation.test.ts",
       "packages/config/test/context-management-config.test.ts",
+      "packages/config/test/durable-paths.test.ts",
       "packages/agent-modules/context-manager/test/compaction-usage.test.ts",
       "packages/local-runtime/test/unit/session-diff-fallback.test.ts",
       "test/history-processing.test.ts",

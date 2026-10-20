@@ -92,6 +92,23 @@ export {
 } from './auth-profile.js';
 export type { DataDirProfilePaths, DiscoveredProfile } from './auth-profile.js';
 export {
+  DEFAULT_SESSIONS_GENERATION,
+  DURABLE_CAS_DIR_BASENAME,
+  DURABLE_ROOT_BASENAME,
+  DURABLE_RUNTIME_DB_BASENAME,
+  DURABLE_SESSIONS_DB_BASENAME,
+  DURABLE_SOCKET_BASENAME,
+  LEGACY_ROOT,
+  LegacyWriteError,
+  assertNoLegacyWrite,
+  ensureDurableLayout,
+  resolveCasDirPath,
+  resolveDurableRoot,
+  resolveMcodedSocketPath,
+  resolveRuntimeDbPath,
+  resolveSessionsDbPath,
+} from './durable-paths.js';
+export {
   isLegacyManagedMinimaxProvider,
   isManagedProviderBaseUrl,
   resolveProviderAuthMode,
