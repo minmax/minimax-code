@@ -28,6 +28,8 @@
     "packages/protocol",
     "packages/shared",
     "packages/tui",
+    "third_party/chord",
+    "third_party/pi-durable",
     "third_party/pi-mono/packages/agent",
     "third_party/pi-mono/packages/ai",
     "third_party/pi-mono/packages/coding-agent",

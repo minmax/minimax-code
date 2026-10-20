@@ -30,3 +30,5 @@ packages:
   - packages/oauth-core
   - packages/oauth-lease-protocol
   - packages/mcode-tools-host
+  - third_party/pi-durable
+  - third_party/chord
