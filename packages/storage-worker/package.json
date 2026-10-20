@@ -23,6 +23,11 @@
   "scripts": {
     "test": "vitest run --config vitest.config.ts"
   },
-  "devDependencies": {},
+  "devDependencies": {
+    "@mavis/durable-backend-sqlite-zstd": "workspace:*",
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
   "private": true
 }

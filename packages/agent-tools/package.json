@@ -63,7 +63,8 @@
     "@types/shell-quote": "^1.7.5",
     "typescript": "^5",
     "vitest": "^2",
-    "@mavis/protocol": "workspace:*"
+    "@mavis/protocol": "workspace:*",
+    "@mavis/cas": "workspace:*"
   },
   "private": true,
   "license": "MIT"
