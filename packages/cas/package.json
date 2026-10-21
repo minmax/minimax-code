@@ -9,6 +9,16 @@
       "types": "./src/index.ts",
       "development": "./src/index.ts",
       "import": "./dist/index.js"
+    },
+    "./cas-ref": {
+      "types": "./src/cas-ref.ts",
+      "development": "./src/cas-ref.ts",
+      "import": "./dist/cas-ref.js"
+    },
+    "./store-errors": {
+      "types": "./src/store-errors.ts",
+      "development": "./src/store-errors.ts",
+      "import": "./dist/store-errors.js"
     }
   },
   "scripts": {
