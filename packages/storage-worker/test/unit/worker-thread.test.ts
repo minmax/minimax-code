@@ -57,4 +57,34 @@ describe('storage worker thread (end-to-end)', () => {
     await worker.dispose();
     expect(backend.appendBatch).toHaveBeenCalledTimes(1); // dispose drained it
   });
+
+  it('transfers buffer payloads across the bridge and restores them on retry (OPT-B1)', async () => {
+    // Array payloads with plain ArrayBuffers are TRANSFERRED, not cloned, in
+    // both directions. The engine retains a failed batch for retry, so on an
+    // appendError the buffers must ride the rejection back — otherwise the
+    // retried batch would carry detached (empty) payloads.
+    let attempt = 0;
+    const firstBytes: number[] = [];
+    const backend = {
+      appendBatch: vi.fn(async (entries: Entry[]) => {
+        attempt += 1;
+        const blob = (entries[0]?.payload as { blob?: ArrayBuffer } | undefined)?.blob;
+        firstBytes.push(blob instanceof ArrayBuffer ? (new Uint8Array(blob)[0] ?? -1) : -2);
+        if (attempt === 1) throw new Error('transient');
+        return makeCommit(entries.length);
+      }),
+    };
+    const worker = createStorageWorker(backend, { windowMs: 5, maxConsecutiveFlushFailures: 3 });
+
+    const blob = new Uint8Array([42]).buffer;
+    await worker.enqueue({ entryId: 'binary', parentId: null, kind: 'test', payload: { blob }, bytes: 16 });
+    await expect(worker.flush()).rejects.toThrow('transient');
+    const commit = await worker.flush();
+    expect(commit).toEqual(makeCommit(1));
+
+    // Byte 42 survived the transfer out, the failed append, the restore, and
+    // the retried transfer — not a detached zero-length buffer.
+    expect(firstBytes).toEqual([42, 42]);
+    await worker.dispose();
+  });
 });

@@ -7,21 +7,33 @@
  * This file is loaded DIRECTLY by `node:worker_threads` (`new Worker(url)`),
  * including from TypeScript source on Node >= 22.19 where type stripping is
  * enabled by default. It therefore imports only `node:*` builtins at runtime
- * (its `./engine.ts` import is likewise builtin-only); type-only imports are
- * erased.
+ * (its `./engine.ts` and `./errors.ts` imports are likewise builtin-only);
+ * type-only imports are erased.
+ *
+ * This thread is NOT the production default: `createOffThreadStorageWorker`
+ * (whose worker body owns the backend handle) is — the append bridge here
+ * drags every batch across the thread boundary twice and serializes it on the
+ * main thread. It remains for hosts that must keep the backend handle on the
+ * creating thread (backends bound to main-thread resources, tests).
  *
  * Protocol (see `client.ts` for the main-thread side):
  *   main -> worker: { type: 'entries', entries: Entry[] }
  *                   { type: 'flush', requestId }
  *                   { type: 'checkpoint', requestId }
  *                   { type: 'checkpointResult', requestId, commit | null }
- *                   { type: 'checkpointError', requestId, message }
+ *                   { type: 'checkpointError', requestId, error }
  *                   { type: 'appendResult', requestId, commit }
- *                   { type: 'appendError', requestId, message, errorName? }
+ *                   { type: 'appendError', requestId, error }
  *   worker -> main: { type: 'append', requestId, entries }
  *                   { type: 'flushResult', requestId, commit | null }
- *                   { type: 'flushError', requestId, message, errorName? }
- *                   { type: 'quarantined', entries, message, errorName? }
+ *                   { type: 'flushError', requestId, error }
+ *                   { type: 'terminalError', error }
+ *                   { type: 'quarantined', entries, error }
+ *
+ * Errors cross as `SerializedWorkerError` shapes and are rebuilt through
+ * `deserializeWorkerError`, so terminal backend refusals
+ * (`OwnerLostError`, `SealedGenerationError`) and `BatchStuckError.cause`
+ * keep their classification across the bridge (IC-F1-004).
  *
  * The backend handle always stays on the thread that created it; the worker
  * initiates each append and the main thread sees exactly one
@@ -34,7 +46,18 @@
 import { parentPort, workerData } from 'node:worker_threads';
 
 import type { Commit, Entry } from './contracts.js';
-import { createBatchEngine, DEFAULT_WINDOW_BYTES, DEFAULT_WINDOW_MS } from './engine.ts';
+import {
+	collectTransferableBuffers,
+	createBatchEngine,
+	DEFAULT_WINDOW_BYTES,
+	DEFAULT_WINDOW_MS,
+	restoreTransferredBuffers,
+} from './engine.ts';
+import {
+	deserializeWorkerError,
+	serializeWorkerError,
+	type SerializedWorkerError,
+} from './errors.ts';
 
 // The engine is the package's public batching surface; keep it reachable from
 // this module too (index.ts re-exports from here for backwards compat).
@@ -57,7 +80,12 @@ function startWorkerThread(
   let nextRequestId = 0;
   const pendingAppends = new Map<
     number,
-    { resolve(commit: Commit): void; reject(error: unknown): void }
+    {
+      resolve(commit: Commit): void;
+      reject(error: unknown): void;
+      /** Buffers this thread transferred out with the batch entries. */
+      plan: { buffers: ArrayBuffer[]; slots: Array<{ container: Record<string, unknown>; key: string }> };
+    }
   >();
   const pendingCheckpoints = new Map<
     number,
@@ -76,20 +104,36 @@ function startWorkerThread(
           port.postMessage({ type: 'checkpoint', requestId });
         });
       },
+      onTerminal: (error) => {
+        // Terminal backend refusal: tell the main thread to fail its admission
+        // queue closed — new enqueues must reject, not pile into a window that
+        // can never commit.
+        port.postMessage({ type: 'terminalError', error: serializeWorkerError(error) });
+      },
       onQuarantine: (entries, error) => {
         port.postMessage({
           type: 'quarantined',
           entries,
-          message: error.message,
-          errorName: error.name,
+          error: serializeWorkerError(error),
         });
       },
     },
     (entries) => {
       const requestId = nextRequestId++;
-      return new Promise<Commit>((resolve, reject) => {
-        pendingAppends.set(requestId, { resolve, reject });
+      // Transfer buffer payloads instead of copying them (OPT-B1). The engine
+      // retains the batch for retry, so on `appendError` the main thread hands
+      // the buffers back through the reply's transfer list and they are
+      // restored here — a retried batch never carries detached payloads.
+      const plan = collectTransferableBuffers(entries);
+      try {
+        port.postMessage({ type: 'append', requestId, entries }, plan.buffers);
+      } catch {
+        // Transfer-unfriendly payload (or a dead port): fall back to cloning.
+        restoreTransferredBuffers(plan);
         port.postMessage({ type: 'append', requestId, entries });
+      }
+      return new Promise<Commit>((resolve, reject) => {
+        pendingAppends.set(requestId, { resolve, reject, plan });
       });
     },
   );
@@ -99,9 +143,8 @@ function startWorkerThread(
     requestId?: number;
     entries?: Entry[];
     commit?: Commit | null;
-    message?: string;
-    errorName?: string;
-    errorEntryId?: unknown;
+    error?: SerializedWorkerError;
+    returnedBuffers?: ArrayBuffer[];
   }) => {
     if (message.type === 'entries' && Array.isArray(message.entries)) {
       for (const entry of message.entries) engine.add(entry);
@@ -117,8 +160,7 @@ function startWorkerThread(
           port.postMessage({
             type: 'flushError',
             requestId: message.requestId,
-            message: error instanceof Error ? error.message : String(error),
-            errorName: error instanceof Error ? error.name : undefined,
+            error: serializeWorkerError(error),
           }),
         );
       return;
@@ -133,24 +175,36 @@ function startWorkerThread(
         if (!pendingCheckpoint) return;
         pendingCheckpoints.delete(message.requestId);
         if (message.type === 'checkpointResult') pendingCheckpoint.resolve(message.commit ?? null);
-        else pendingCheckpoint.reject(new Error(message.message ?? 'backend.checkpoint failed'));
+        else {
+          pendingCheckpoint.reject(
+            message.error ? deserializeWorkerError(message.error) : new Error('backend.checkpoint failed'),
+          );
+        }
         return;
       }
       const pending = pendingAppends.get(message.requestId);
       if (!pending) return;
       pendingAppends.delete(message.requestId);
-      if (message.type === 'appendResult' && message.commit) pending.resolve(message.commit);
-      else {
-        const text = message.message ?? 'backend.appendBatch failed';
-        const rebuilt = new Error(text);
-        if (message.errorName === 'EntryTooLargeError' || message.errorName === 'BatchStuckError') {
-          rebuilt.name = message.errorName;
-        }
-        if (message.errorEntryId !== undefined) {
-          (rebuilt as { entryId?: unknown }).entryId = message.errorEntryId;
-        }
-        pending.reject(rebuilt);
+      if (message.type === 'appendResult' && message.commit) {
+        pending.resolve(message.commit);
+        return;
       }
+      // The main thread transferred the buffers back with the rejection (same
+      // collection order as this thread's plan): put them back into the
+      // retained batch so a retry re-sends intact payloads.
+      const returned = message.returnedBuffers;
+      if (Array.isArray(returned) && returned.length === pending.plan.slots.length) {
+        for (let index = 0; index < returned.length; index += 1) {
+          const slot = pending.plan.slots[index]!;
+          const buffer = returned[index];
+          if (buffer instanceof ArrayBuffer && !buffer.detached) {
+            slot.container[slot.key] = buffer;
+          }
+        }
+      }
+      pending.reject(
+        message.error ? deserializeWorkerError(message.error) : new Error('backend.appendBatch failed'),
+      );
     }
   });
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { EntryTooLargeError } from '../../src/errors.js';
+import { EntryTooLargeError, SqliteZstdAdapterStateError } from '../../src/errors.js';
 import {
   commitFromSqliteZstd,
   sqliteZstdStorageBackend,
@@ -86,5 +86,83 @@ describe('sqlite-zstd adapter replay safety', () => {
     expect(seen[1]).toEqual(['e3', 'e4']);
     expect(seen[2]).toEqual(['e3', 'e4']);
     expect(commit.batchId).toBe('3');
+  });
+
+  it('returns a commit covering the whole split range: first seq, last head', async () => {
+    // IC-F1-006: a resume cursor anchored at the returned commit must not
+    // skip middle sub-batches. The aggregate carries the FIRST sub-batch's
+    // seq and the LAST sub-batch's head; single-commit calls are untouched.
+    const cap = 256 * 1024;
+    let seq = 0;
+    const backend: SqliteZstdBackendLike = {
+      maxBatchUncompressedBytes: cap,
+      appendBatch: async () => {
+        seq += 1;
+        return { batchId: seq, seq, head: seq };
+      },
+    };
+    const adapter = sqliteZstdStorageBackend(backend);
+    const batch = [entry('e1', 80), entry('e2', 80), entry('e3', 80), entry('e4', 80)];
+
+    const commit: Commit = await adapter.appendBatch(batch);
+    // Split into [e1,e2] (seq 1) + [e3,e4] (seq 2): first seq, last head.
+    expect(commit).toEqual({ batchId: '2', seq: 1, head: '2' });
+  });
+
+  it('consumes a duplicate-insert refusal as idempotent success (SW-04)', async () => {
+    // The in-memory committedIds Set is the fast path; the backend's domain
+    // duplicate error is the backstop when bookkeeping missed (another
+    // adapter instance over the same backend, a replayed batch).
+    let call = 0;
+    const seen: string[][] = [];
+    const backend: SqliteZstdBackendLike = {
+      maxBatchUncompressedBytes: 256 * 1024,
+      appendBatch: async (drafts) => {
+        call += 1;
+        const ids = drafts.map((draft) => draft.id);
+        seen.push(ids);
+        // "dupe" was committed by someone else; the raw sqlite wording is
+        // what today's backend raises before a domain class lands.
+        if (ids.includes('dupe')) {
+          const error = new Error('UNIQUE constraint failed: entries.entry_id');
+          throw error;
+        }
+        return { batchId: call, seq: call, head: call };
+      },
+    };
+    const adapter = sqliteZstdStorageBackend(backend);
+    // Fits one cap: the first append attempt throws on the duplicate, the
+    // adapter bisects entry by entry, skips the durable one as success.
+    const commit: Commit = await adapter.appendBatch([
+      entry('fresh-1', 10),
+      entry('dupe', 10),
+      entry('fresh-2', 10),
+    ]);
+
+    expect(seen).toEqual([
+      ['fresh-1', 'dupe', 'fresh-2'], // whole batch -> duplicate refusal
+      ['fresh-1'], // left half appends
+      ['dupe', 'fresh-2'], // right half -> duplicate refusal again
+      ['dupe'], // isolated -> idempotent success, nothing sent... recorded refusal
+      ['fresh-2'], // right tail appends
+    ]);
+    // The aggregate covers the appended range around the skipped duplicate:
+    // first appended commit's seq (call 2), last appended commit's head (call 5).
+    expect(commit.seq).toBe(2);
+    expect(commit.head).toBe('5');
+  });
+
+  it('fails loudly when every entry of the batch is already durable', async () => {
+    const backend: SqliteZstdBackendLike = {
+      maxBatchUncompressedBytes: 256 * 1024,
+      appendBatch: async () => {
+        throw new Error('UNIQUE constraint failed: entries.entry_id');
+      },
+    };
+    const adapter = sqliteZstdStorageBackend(backend);
+    // Nothing appended -> no commit exists to return; never fabricate one.
+    await expect(adapter.appendBatch([entry('dupe', 10)])).rejects.toThrow(
+      SqliteZstdAdapterStateError,
+    );
   });
 });

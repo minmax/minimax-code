@@ -8,18 +8,22 @@
  * therefore imports only `node:*` builtins statically. The backend factory is
  * loaded through the module specifier in `workerData` (a built `dist` path or
  * a plain-JS factory; for TypeScript source pass `execArgv: ['--import',
- * 'tsx']` via `workerExecArgv`). The sqlite-zstd adapter logic is inlined
- * here on purpose: this file must stay loadable by raw Node, and the main
- * module graph (which also serves main-thread backends) must not leak into
- * the thread.
+ * 'tsx']` via `workerExecArgv`). The split/replay logic is NOT inlined here:
+ * the dynamically imported `sqlite-zstd-adapter.ts` is builtin-only at
+ * runtime (like `engine.ts`), so this thread reuses the exact same
+ * replay-safe splitting, duplicate backstop, and commit aggregation as the
+ * main-thread adapter — one implementation, no divergent copy (IC-F1-005 /
+ * SW-01 / OPT-H4).
  *
  * Protocol (see `off-thread.ts` for the main-thread side):
  *   worker -> main: { type: 'ready' } | { type: 'readyError', message }
  *                   { type: 'flushResult', requestId, commit | null }
- *                   { type: 'flushError', requestId, message, errorName? }
+ *                   { type: 'flushError', requestId, error }
  *                   { type: 'checkpointResult', requestId }
- *                   { type: 'checkpointError', requestId, message }
- *                   { type: 'quarantined', entries, message, errorName? }
+ *                   { type: 'checkpointError', requestId, error }
+ *                   { type: 'terminalError', error }
+ *                   { type: 'quarantined', entries, error }
+ *                   { type: 'committed', bytes }
  *                   { type: 'disposed' }
  *   main -> worker: { type: 'entries', entries }
  *                   { type: 'flush', requestId }
@@ -29,69 +33,21 @@
  * @module
  */
 
-import { Buffer } from 'node:buffer';
 import { parentPort, workerData } from 'node:worker_threads';
 
-interface WorkerEntry {
-	entryId: string;
-	parentId: string | null;
-	kind: string;
-	payload: unknown;
-	bytes: number;
-}
+import type { Entry } from './contracts.js';
+import type {
+	SqliteZstdBackendLike,
+	SqliteZstdCommitLike,
+} from './sqlite-zstd-adapter.ts';
 
-interface WorkerCommit {
-	batchId: string;
-	seq: number;
-	head: string;
-}
-
-interface Draft {
-	id: string;
-	parentId?: string | null;
-	kind: string;
-	payload: unknown;
-}
-
-interface RawCommit {
-	batchId: number | string;
-	seq: number;
-	head: number;
-}
-
-interface RawBackend {
-	appendBatch(drafts: readonly Draft[]): Promise<RawCommit>;
-	checkpoint?(): unknown | Promise<unknown>;
-	readonly maxBatchUncompressedBytes?: number;
-}
-
-/** Same classification contract as `errors.ts`; names must not diverge. */
-class EntryTooLargeError extends Error {
-	readonly entryId: string;
-	readonly serializedBytes: number;
-	readonly capBytes: number;
-
-	constructor(entryId: string, serializedBytes: number, capBytes: number) {
-		super(
-			`entry ${entryId} serializes to ${serializedBytes} bytes, above the backend ` +
-				`batch cap of ${capBytes} bytes; quarantined instead of retrying forever`,
-		);
-		this.name = 'EntryTooLargeError';
-		this.entryId = entryId;
-		this.serializedBytes = serializedBytes;
-		this.capBytes = capBytes;
-	}
-}
+/** Structural surface of the factory-produced backend this thread drives. */
+type RawBackend = SqliteZstdBackendLike & {
+	close?(): unknown | Promise<unknown>;
+	checkpoint?(): SqliteZstdCommitLike | undefined | Promise<SqliteZstdCommitLike | undefined>;
+};
 
 const DEFAULT_BATCH_CAP_BYTES = 256 * 1024;
-
-function toDraft(entry: WorkerEntry): Draft {
-	return { id: entry.entryId, parentId: entry.parentId, kind: entry.kind, payload: entry.payload };
-}
-
-function fromRawCommit(commit: RawCommit): WorkerCommit {
-	return { batchId: String(commit.batchId), seq: commit.seq, head: String(commit.head) };
-}
 
 async function start(port: NonNullable<typeof parentPort>): Promise<void> {
 	const data = workerData as {
@@ -112,28 +68,27 @@ async function start(port: NonNullable<typeof parentPort>): Promise<void> {
 	if (typeof raw?.appendBatch !== 'function') {
 		throw new TypeError('backend factory did not produce a backend with appendBatch()');
 	}
-	const cap = raw.maxBatchUncompressedBytes ?? DEFAULT_BATCH_CAP_BYTES;
-	const committedIds = new Set<string>();
 
-	async function appendWithinCap(drafts: readonly Draft[]): Promise<WorkerCommit> {
-		if (drafts.length === 0) throw new TypeError('batch must contain at least one entry');
-		const serializedBytes = Buffer.byteLength(JSON.stringify(drafts), 'utf8');
-		if (cap <= 0 || serializedBytes <= cap) {
-			return fromRawCommit(await raw.appendBatch(drafts));
-		}
-		if (drafts.length === 1) {
-			throw new EntryTooLargeError(drafts[0].id, serializedBytes, cap);
-		}
-		const midpoint = drafts.length >> 1;
-		await appendWithinCap(drafts.slice(0, midpoint));
-		return appendWithinCap(drafts.slice(midpoint));
-	}
-
-	// The engine module is builtin-only at runtime, so it loads under raw Node
+	// Both modules are builtin-only at runtime, so they load under raw Node
 	// type stripping exactly like this file does; `worker.ts` is NOT imported
 	// here on purpose — its module top-level wires the main-thread append
 	// bridge, which this thread must not start (it owns the backend itself).
-	const { createBatchEngine } = await import('./engine.ts');
+	const [
+		{ createBatchEngine, DEAD_LETTER_ENTRY_KIND, buildDeadLetterEntry },
+		{ sqliteZstdStorageBackend, commitFromSqliteZstd },
+		{ serializeWorkerError },
+	] = await Promise.all([
+		import('./engine.ts'),
+		import('./sqlite-zstd-adapter.ts'),
+		import('./errors.ts'),
+	]);
+
+	// The adapter is the SINGLE split/replay implementation of this package:
+	// draft mapping, replay-safe committed-id tracking (marks only after a
+	// sub-batch commits), duplicate-insert backstop, cap splitting over
+	// once-measured sizes, and firstSeq..head commit aggregation all live
+	// there. This thread just hands it the raw backend.
+	const seam = sqliteZstdStorageBackend(raw);
 
 	const engine = createBatchEngine(
 		{
@@ -142,15 +97,24 @@ async function start(port: NonNullable<typeof parentPort>): Promise<void> {
 			maxConsecutiveFlushFailures: data.maxConsecutiveFlushFailures,
 			checkpoint: async () => {
 				const produced = await raw.checkpoint?.();
-				return (produced ?? null) as WorkerCommit | null;
+				// Map the raw commit onto the wire shape (the plain cast used to
+				// leak branded numeric batchId/head to the caller).
+				return produced ? commitFromSqliteZstd(produced) : null;
 			},
-			onQuarantine: (entries, error) => {
-				port.postMessage({
-					type: 'quarantined',
-					entries,
-					message: error.message,
-					errorName: error.name,
-				});
+			onTerminal: (error) => {
+				// Terminal backend refusal: tell the main thread to fail its
+				// admission queue closed (IC-F1-004).
+				port.postMessage({ type: 'terminalError', error: serializeWorkerError(error) });
+			},
+			onQuarantine: (entries: readonly Entry[], error: Error) => {
+				port.postMessage({ type: 'quarantined', entries, error: serializeWorkerError(error) });
+				// Durable dead letters (SW-03): a metadata record of the buried
+				// entries rides the SAME engine into the SAME backend log, so a
+				// crash cannot erase the fact of the quarantine. Dead letters
+				// are never re-wrapped (that would recurse forever on a backend
+				// that rejects dead letters too).
+				const sources = entries.filter((entry) => entry.kind !== DEAD_LETTER_ENTRY_KIND);
+				if (sources.length > 0) engine.add(buildDeadLetterEntry(sources, error));
 			},
 			onCommit: (bytes) => {
 				// Release admission bytes as soon as the batch is durable; without
@@ -159,32 +123,14 @@ async function start(port: NonNullable<typeof parentPort>): Promise<void> {
 				port.postMessage({ type: 'committed', bytes });
 			},
 		},
-		async (entries: WorkerEntry[]) => {
-			const drafts = entries.map(toDraft).filter((draft) => {
-				if (committedIds.has(draft.id)) return false;
-				committedIds.add(draft.id);
-				return true;
-			});
-			if (drafts.length === 0) {
-				const replayed = new Error(
-					`all ${entries.length} entries of the batch are already committed by this worker`,
-				);
-				replayed.name = 'SqliteZstdAdapterStateError';
-				throw replayed;
-			}
-			try {
-				return await appendWithinCap(drafts);
-			} catch (error) {
-				for (const draft of drafts) committedIds.delete(draft.id);
-				throw error;
-			}
-		},
+		// The adapter seam speaks the worker's Entry/Commit contract directly.
+		(entries: Entry[]) => seam.appendBatch(entries),
 	);
 
 	port.on('message', (message: {
 		type: string;
 		requestId?: number;
-		entries?: WorkerEntry[];
+		entries?: Entry[];
 	}) => {
 		if (message.type === 'entries' && Array.isArray(message.entries)) {
 			for (const entry of message.entries) engine.add(entry);
@@ -198,8 +144,7 @@ async function start(port: NonNullable<typeof parentPort>): Promise<void> {
 					port.postMessage({
 						type: 'flushError',
 						requestId: message.requestId,
-						message: error instanceof Error ? error.message : String(error),
-						errorName: error instanceof Error ? error.name : undefined,
+						error: serializeWorkerError(error),
 					}),
 				);
 			return;
@@ -212,7 +157,7 @@ async function start(port: NonNullable<typeof parentPort>): Promise<void> {
 					port.postMessage({
 						type: 'checkpointError',
 						requestId: message.requestId,
-						message: error instanceof Error ? error.message : String(error),
+						error: serializeWorkerError(error),
 					}),
 				);
 			return;

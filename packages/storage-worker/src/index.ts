@@ -12,12 +12,21 @@
  *
  * The `sqlite-zstd` durable backend connects through
  * `sqliteZstdStorageBackend(backend)`; to move the backend handle off the
- * calling thread entirely, use `createOffThreadStorageWorker`.
+ * calling thread entirely, use `createOffThreadStorageWorker`. To wire the
+ * fail-closed barrier into a turn loop — before every LLM request and before
+ * every tool effect, with `TOOL_OUTCOME_UNKNOWN` for interrupted calls —
+ * compose `createCheckpointBarrier(worker)` around the worker.
  *
  * @module
  */
 
 export { createStorageWorker, validateEntry } from './client.js';
+export {
+  createCheckpointBarrier,
+  type CheckpointBarrier,
+  type RunToolEffectOptions,
+  type ToolEffect,
+} from './checkpoint-policy.js';
 export {
   createBatchEngine,
   DEFAULT_MAX_BATCH_UNCOMPRESSED_BYTES,
@@ -52,4 +61,7 @@ export type {
   StorageWorker,
   StorageWorkerBackend,
   StorageWorkerOptions,
+  ToolEffectOutcome,
+  ToolOutcome,
 } from './contracts.js';
+export { TOOL_OUTCOME_UNKNOWN } from './contracts.js';

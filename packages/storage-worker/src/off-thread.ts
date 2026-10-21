@@ -1,8 +1,11 @@
 /**
- * Off-thread storage worker: the backend handle lives on a dedicated worker
- * thread, so the whole durable write path — batch serialization, compression,
- * the SQLite fsync — executes OFF the caller's main thread. The caller only
- * pays for the byte-bounded queue and message passing.
+ * Off-thread storage worker: THE production write path. The backend handle
+ * lives on a dedicated worker thread, so the whole durable write path — batch
+ * serialization, compression, the SQLite fsync — executes OFF the caller's
+ * main thread. The caller only pays for the byte-bounded queue and message
+ * passing. (`createStorageWorker` keeps the backend on the creating thread
+ * and bridges every batch across twice — use it only when the handle cannot
+ * move.)
  *
  * Difference from `createStorageWorker`: instead of a backend instance (which
  * always stays on the creating thread) this takes a backend FACTORY SPEC —
@@ -14,7 +17,11 @@
  *
  * The queue/window/poison contract is identical to `createStorageWorker`:
  * byte-bounded admission, 200 ms / 256 KiB windows, single-flight appends,
- * terminal quarantine instead of eternal retries.
+ * terminal quarantine instead of eternal retries. Quarantined entries are
+ * additionally recorded durably: the worker drops a metadata dead-letter
+ * entry (`storage-worker.dead-letter` kind) into the same backend log for
+ * every quarantine event, so a crash cannot erase the fact of the quarantine
+ * (the payloads stay with the caller: bounded in-memory buffer + callback).
  *
  * @example
  * ```ts
@@ -36,8 +43,10 @@ import { Worker } from 'node:worker_threads';
 import { pathToFileURL } from 'node:url';
 
 import type { Commit, Entry, StorageWorker, StorageWorkerOptions } from './contracts.js';
+import { deserializeWorkerError, serializeWorkerError, type SerializedWorkerError } from './errors.js';
 import { validateEntry } from './client.js';
 import { createBoundedByteQueue } from './queue.js';
+import { appendBoundedQuarantine, collectTransferableBuffers, restoreTransferredBuffers } from './engine.js';
 import {
   DEFAULT_MAX_BATCH_UNCOMPRESSED_BYTES,
   DEFAULT_WINDOW_BYTES,
@@ -67,11 +76,12 @@ type WorkerToMainMessage =
   | { type: 'ready' }
   | { type: 'readyError'; message: string }
   | { type: 'flushResult'; requestId: number; commit: Commit | null }
-  | { type: 'flushError'; requestId: number; message: string; errorName?: string }
+  | { type: 'flushError'; requestId: number; error: SerializedWorkerError }
   | { type: 'checkpointResult'; requestId: number }
-  | { type: 'checkpointError'; requestId: number; message: string }
+  | { type: 'checkpointError'; requestId: number; error: SerializedWorkerError }
   | { type: 'committed'; bytes: number }
-  | { type: 'quarantined'; entries: Entry[]; message: string; errorName?: string }
+  | { type: 'terminalError'; error: SerializedWorkerError }
+  | { type: 'quarantined'; entries: Entry[]; error: SerializedWorkerError }
   | { type: 'disposed' };
 
 interface PendingFlush {
@@ -141,6 +151,8 @@ export async function createOffThreadStorageWorker(
   });
 
   let closed = false;
+  /** Set BEFORE the final drain starts; admission rejects while it holds. */
+  let closing = false;
   let broken: Error | null = null;
   let pumpScheduled = false;
   let nextRequestId = 0;
@@ -199,15 +211,21 @@ export async function createOffThreadStorageWorker(
   function sendNow(): void {
     if (queued.length === 0) return;
     const chunk = queued.splice(0);
-    if (!post({ type: 'entries', entries: chunk })) {
-      queued.unshift(...chunk);
+    // Buffer payloads transfer instead of copying (OPT-B1); on a failed post
+    // they are restored before the entries go back to the queue head.
+    const plan = collectTransferableBuffers(chunk);
+    if (!post({ type: 'entries', entries: chunk }, plan.buffers)) {
+      restoreTransferredBuffers(plan);
+      for (let index = chunk.length - 1; index >= 0; index -= 1) {
+        queued.unshift(chunk[index]!);
+      }
       failAll(new Error('off-thread storage worker is not accepting entries'));
     }
   }
 
-  function post(message: MainToWorkerMessage): boolean {
+  function post(message: MainToWorkerMessage, transferList?: ArrayBuffer[]): boolean {
     try {
-      worker.postMessage(message);
+      worker.postMessage(message, transferList);
       return true;
     } catch {
       return false;
@@ -232,7 +250,7 @@ export async function createOffThreadStorageWorker(
       if (!flush) return;
       pendingFlushes.delete(raw.requestId);
       if (raw.type === 'flushResult') flush.resolve(raw.commit);
-      else flush.reject(rehydrate(raw.message, raw.errorName));
+      else flush.reject(deserializeWorkerError(raw.error));
       return;
     }
     if (raw.type === 'checkpointResult' || raw.type === 'checkpointError') {
@@ -240,7 +258,7 @@ export async function createOffThreadStorageWorker(
       if (!checkpoint) return;
       pendingCheckpoints.delete(raw.requestId);
       if (raw.type === 'checkpointResult') checkpoint.resolve();
-      else checkpoint.reject(new Error(raw.message));
+      else checkpoint.reject(deserializeWorkerError(raw.error));
       return;
     }
     if (raw.type === 'committed') {
@@ -249,11 +267,17 @@ export async function createOffThreadStorageWorker(
       queue.release(raw.bytes);
       return;
     }
+    if (raw.type === 'terminalError') {
+      // The backend refused writes terminally (owner lost, generation sealed):
+      // fail the whole handle closed (IC-F1-004).
+      failAll(deserializeWorkerError(raw.error));
+      return;
+    }
     if (raw.type === 'quarantined') {
       const bytes = raw.entries.reduce((total, entry) => total + entry.bytes, 0);
-      quarantinedEntries.push(...raw.entries);
+      appendBoundedQuarantine(quarantinedEntries, raw.entries);
       queue.release(bytes);
-      options.onQuarantined?.(raw.entries, rehydrate(raw.message, raw.errorName));
+      options.onQuarantined?.(raw.entries, deserializeWorkerError(raw.error));
       return;
     }
     if (raw.type === 'disposed') {
@@ -272,7 +296,14 @@ export async function createOffThreadStorageWorker(
   return {
     enqueue(entry: Entry): Promise<void> {
       if (broken) return Promise.reject(broken);
+      // Final state first (stable "disposed" wording after teardown), then the
+      // in-flight drain state (SW-02).
       if (closed) return Promise.reject(new Error('off-thread storage worker is disposed'));
+      if (closing) {
+        return Promise.reject(
+          new Error('off-thread storage worker is disposing: the final drain is in progress'),
+        );
+      }
       try {
         validateEntry(entry, queueBytes, maxBatchUncompressedBytes);
       } catch (error) {
@@ -305,8 +336,21 @@ export async function createOffThreadStorageWorker(
     },
 
     async dispose(): Promise<void> {
+      // Mark closing BEFORE the drain (SW-02): concurrent enqueues reject
+      // immediately instead of slipping entries past the final flush, and the
+      // drain re-checks the pump queue afterwards so an entry admitted by an
+      // in-flight backpressure release is still flushed, never silently lost.
+      closing = true;
+      let drainError: Error | null = null;
       try {
-        if (queue.pendingBytes > 0) await flushInternal();
+        while ((queue.pendingBytes > 0 || queued.length > 0) && broken === null) {
+          try {
+            await flushInternal();
+          } catch (error) {
+            drainError = error instanceof Error ? error : new Error(String(error));
+            break;
+          }
+        }
       } finally {
         closed = true;
         queue.failAll(new Error('off-thread storage worker is disposed'));
@@ -327,19 +371,11 @@ export async function createOffThreadStorageWorker(
         await Promise.race([disposedAck, delay(1_000)]);
         await worker.terminate();
       }
+      if (drainError !== null) throw drainError;
     },
   };
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function rehydrate(message: string, errorName: string | undefined): Error {
-  if (errorName === 'EntryTooLargeError' || errorName === 'BatchStuckError') {
-    const rebuilt = new Error(message);
-    rebuilt.name = errorName;
-    return rebuilt;
-  }
-  return new Error(message);
 }

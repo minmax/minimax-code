@@ -50,6 +50,42 @@ describe('batch engine window', () => {
     expect(engine.windowBytes).toBe(0);
   });
 
+  it('holds the size cut below the nominal window by the serialization reserve', async () => {
+    // OPT-H3: a window cut at EXACTLY the backend cap splits guaranteed in
+    // half when entry.bytes under-reports the serialized size. The default
+    // reserve (windowBytes / 16) cuts early enough that moderate inflation
+    // still fits one backend batch.
+    const append = vi.fn(async (_entries: Entry[]) => makeCommit(0));
+    const engine = createBatchEngine({ windowMs: 60_000, windowBytes: 160 }, append);
+
+    engine.add(makeEntry(100));
+    await delay(10);
+    expect(append).not.toHaveBeenCalled(); // 100 < 150 (160 - 160/16)
+
+    engine.add(makeEntry(60)); // 160 >= 150 -> size cut below the nominal window
+    await until(() => append.mock.calls.length > 0);
+    engine.dispose();
+    expect(append).toHaveBeenCalledOnce();
+    expect(append.mock.calls[0]?.[0]).toHaveLength(2);
+  });
+
+  it('cuts exactly at the nominal window when the reserve is set to zero', async () => {
+    const append = vi.fn(async (_entries: Entry[]) => makeCommit(0));
+    const engine = createBatchEngine(
+      { windowMs: 60_000, windowBytes: 100, windowBytesReserve: 0 },
+      append,
+    );
+
+    engine.add(makeEntry(99));
+    await delay(10);
+    expect(append).not.toHaveBeenCalled(); // 99 < 100
+
+    engine.add(makeEntry(1)); // 100 >= 100 -> exact cut
+    await until(() => append.mock.calls.length > 0);
+    engine.dispose();
+    expect(append).toHaveBeenCalledOnce();
+  });
+
   it('keeps accumulating a new window while a batch is in flight', async () => {
     const gate = deferred<void>();
     let seq = 0;

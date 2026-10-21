@@ -1,18 +1,28 @@
 /**
  * Main-thread side of the storage worker.
  *
+ * NOTE: this backend-on-main-thread bridge is NOT the production default —
+ * `createOffThreadStorageWorker` is (the worker thread there owns the backend
+ * handle, so serialization + compression + fsync never run on the caller's
+ * thread, and batches cross the boundary once instead of twice). Use this
+ * host only when the backend handle must stay on the creating thread.
+ *
  * `createStorageWorker(backend)` returns a handle whose `enqueue` only writes
  * to an internal byte-bounded queue (sub-millisecond) while a worker thread
  * owns the batch-window policy. Entries are pumped to the worker thread; the
  * worker cuts them into batches (<= 200 ms / <= 256 KiB, single-flight) and
  * asks this thread to run `backend.appendBatch` — exactly one call per batch,
  * never two in flight. The backend handle itself always stays on the thread
- * that created it. (To move the backend off this thread entirely, see
- * `createOffThreadStorageWorker`.)
+ * that created it.
  *
  * Admission is terminal for entries that can never be persisted: an entry
  * whose `bytes` exceed the backend batch cap is rejected by `enqueue`
  * immediately instead of wedging the retry loop forever.
+ *
+ * Entries cross the thread boundary with their plain-`ArrayBuffer` payloads
+ * TRANSFERRED, not copied (OPT-B1): ownership moves once, and on a failed
+ * append the buffers ride the rejection back so the engine's retained retry
+ * copy stays intact.
  *
  * @module
  */
@@ -20,7 +30,7 @@
 import { existsSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 
-import { EntryExceedsBatchCapError } from './errors.js';
+import { EntryExceedsBatchCapError, deserializeWorkerError, serializeWorkerError, type SerializedWorkerError } from './errors.js';
 import type {
   Commit,
   Entry,
@@ -29,6 +39,11 @@ import type {
   StorageWorkerOptions,
 } from './contracts.js';
 import { createBoundedByteQueue } from './queue.js';
+import {
+  appendBoundedQuarantine,
+  collectTransferableBuffers,
+  restoreTransferredBuffers,
+} from './engine.js';
 import {
   DEFAULT_MAX_BATCH_UNCOMPRESSED_BYTES,
   DEFAULT_WINDOW_BYTES,
@@ -40,23 +55,26 @@ const DEFAULT_MAX_CONSECUTIVE_FLUSH_FAILURES = 3;
 
 // Messages this thread posts to the worker: entry pump, flush requests, and
 // the replies to the worker's append/checkpoint requests (the backend runs
-// here).
+// here). Errors travel as `SerializedWorkerError` shapes so their class,
+// fields, and cause survive the boundary.
 type ClientToWorkerMessage =
   | { type: 'entries'; entries: Entry[] }
   | { type: 'flush'; requestId: number }
   | { type: 'checkpoint'; requestId: number }
   | { type: 'appendResult'; requestId: number; commit: Commit }
-  | { type: 'appendError'; requestId: number; message: string; errorName?: string; errorEntryId?: unknown }
+  | { type: 'appendError'; requestId: number; error: SerializedWorkerError; returnedBuffers?: ArrayBuffer[] }
   | { type: 'checkpointResult'; requestId: number; commit: Commit | null }
-  | { type: 'checkpointError'; requestId: number; message: string };
+  | { type: 'checkpointError'; requestId: number; error: SerializedWorkerError };
 
-// Messages the worker posts to this thread: batch append requests, quarantine
-// reports, and the replies to flush requests.
+// Messages the worker posts to this thread: batch append and checkpoint
+// requests, quarantine reports, and the replies to flush requests.
 type WorkerToMainMessage =
   | { type: 'append'; requestId: number; entries: Entry[] }
+  | { type: 'checkpoint'; requestId: number }
   | { type: 'flushResult'; requestId: number; commit: Commit | null }
-  | { type: 'flushError'; requestId: number; message: string; errorName?: string }
-  | { type: 'quarantined'; entries: Entry[]; message: string; errorName?: string };
+  | { type: 'flushError'; requestId: number; error: SerializedWorkerError }
+  | { type: 'terminalError'; error: SerializedWorkerError }
+  | { type: 'quarantined'; entries: Entry[]; error: SerializedWorkerError };
 
 interface PendingFlush {
   resolve(commit: Commit | null): void;
@@ -69,16 +87,6 @@ function defaultWorkerUrl(): URL {
   const built = new URL('worker.js', import.meta.url);
   if (existsSync(built)) return built;
   return new URL('worker.ts', import.meta.url);
-}
-
-/** Rebuilds a terminal-class error from its protocol wire shape. */
-function rehydrateError(message: string, errorName: string | undefined): Error {
-  if (errorName === 'EntryTooLargeError' || errorName === 'BatchStuckError') {
-    const rebuilt = new Error(message);
-    rebuilt.name = errorName;
-    return rebuilt;
-  }
-  return new Error(message);
 }
 
 /** Admission validation shared by both worker clients (main-side backends and off-thread hosts). */
@@ -133,6 +141,8 @@ export function createStorageWorker(
   });
 
   let closed = false;
+  /** Set BEFORE the final drain starts; admission rejects while it holds. */
+  let closing = false;
   let broken: Error | null = null;
   let pumpScheduled = false;
   let nextRequestId = 0;
@@ -160,20 +170,24 @@ export function createStorageWorker(
   function sendNow(): void {
     if (queued.length === 0) return;
     const chunk = queued.splice(0);
-    if (!post({ type: 'entries', entries: chunk })) {
-      // The entries could not be handed to the thread. Put them back at the
-      // head of the queue (byte accounting still counts them as uncommitted)
-      // and fail closed: flush/checkpoint reject so nobody mistakes the data
-      // for durable, and it stays recoverable instead of being dropped.
-      queued.unshift(...chunk);
+    // Buffer payloads transfer instead of copying (OPT-B1); on a failed post
+    // they are restored before the entries go back to the queue head.
+    const plan = collectTransferableBuffers(chunk);
+    if (!post({ type: 'entries', entries: chunk }, plan.buffers)) {
+      restoreTransferredBuffers(plan);
+      // Back to the head, in order, without a spread push (the chunk can
+      // exceed the frame-call stack).
+      for (let index = chunk.length - 1; index >= 0; index -= 1) {
+        queued.unshift(chunk[index]!);
+      }
       failAll(new Error('storage worker thread is not accepting entries'));
     }
   }
 
   /** Returns false when the message could not be handed to the thread. */
-  function post(message: ClientToWorkerMessage): boolean {
+  function post(message: ClientToWorkerMessage, transferList?: ArrayBuffer[]): boolean {
     try {
-      worker.postMessage(message);
+      worker.postMessage(message, transferList);
       return true;
     } catch {
       // The thread can terminate between dispose() and an in-flight callback;
@@ -208,13 +222,13 @@ export function createStorageWorker(
           queue.release(bytes);
         })
         .catch((error: unknown) => {
-          post({
-            type: 'appendError',
-            requestId,
-            message: error instanceof Error ? error.message : String(error),
-            errorName: error instanceof Error ? error.name : undefined,
-            errorEntryId: (error as { readonly entryId?: unknown } | null)?.entryId,
-          });
+          // The transferred buffers must go back with the rejection, or the
+          // engine's retained retry copy would re-send detached payloads.
+          const plan = collectTransferableBuffers(entries);
+          post(
+            { type: 'appendError', requestId, error: serializeWorkerError(error), returnedBuffers: plan.buffers },
+            plan.buffers,
+          );
         });
       return;
     }
@@ -229,21 +243,24 @@ export function createStorageWorker(
           post({ type: 'checkpointResult', requestId, commit: produced ?? null });
         })
         .catch((error: unknown) => {
-          post({
-            type: 'checkpointError',
-            requestId,
-            message: error instanceof Error ? error.message : String(error),
-          });
+          post({ type: 'checkpointError', requestId, error: serializeWorkerError(error) });
         });
+      return;
+    }
+    if (raw.type === 'terminalError') {
+      // The backend refused writes terminally (owner lost, generation sealed):
+      // fail the whole handle closed — parked and future calls reject with the
+      // backend's own error instead of spinning or quarantining (IC-F1-004).
+      failAll(deserializeWorkerError(raw.error));
       return;
     }
     if (raw.type === 'quarantined') {
       // Dead letters leave the retry path for good: release their bytes back
       // to the admission queue so they cannot wedge backpressure forever.
       const bytes = raw.entries.reduce((total, entry) => total + entry.bytes, 0);
-      quarantinedEntries.push(...raw.entries);
+      appendBoundedQuarantine(quarantinedEntries, raw.entries);
       queue.release(bytes);
-      options.onQuarantined?.(raw.entries, rehydrateError(raw.message, raw.errorName));
+      options.onQuarantined?.(raw.entries, deserializeWorkerError(raw.error));
       return;
     }
     // flushResult/flushError carry request ids issued by this thread;
@@ -256,7 +273,7 @@ export function createStorageWorker(
         if (raw.commit) lastCommit = raw.commit;
         flush.resolve(raw.commit);
       } else {
-        flush.reject(rehydrateError(raw.message, raw.errorName));
+        flush.reject(deserializeWorkerError(raw.error));
       }
     }
   });
@@ -271,7 +288,13 @@ export function createStorageWorker(
   return {
     enqueue(entry: Entry): Promise<void> {
       if (broken) return Promise.reject(broken);
+      // Final state first (stable "disposed" wording after teardown), then the
+      // in-flight drain state: admission during the final drain rejects
+      // instead of slipping entries past the last flush (SW-02).
       if (closed) return Promise.reject(new Error('storage worker is disposed'));
+      if (closing) {
+        return Promise.reject(new Error('storage worker is disposing: the final drain is in progress'));
+      }
       try {
         validateEntry(entry, queueBytes, maxBatchUncompressedBytes);
       } catch (error) {
@@ -303,12 +326,24 @@ export function createStorageWorker(
     },
 
     async dispose(): Promise<void> {
+      // Mark closing BEFORE the drain (SW-02): concurrent enqueues reject
+      // immediately instead of slipping entries past the final flush, and the
+      // drain re-checks the pump queue afterwards so an entry admitted by an
+      // in-flight backpressure release is still flushed, never silently lost.
+      closing = true;
+      let drainError: Error | null = null;
       try {
-        // Final drain BEFORE marking closed so the flush below is allowed to
-        // run; its failure still propagates (fail-closed) after teardown.
-        // Skipped when nothing is uncommitted — dispose never pokes the
-        // backend with an empty batch just to produce a commit.
-        if (queue.pendingBytes > 0) await flushInternal();
+        // Drain everything that was admitted before closing began. Skipped
+        // when nothing is uncommitted — dispose never pokes the backend with
+        // an empty batch just to produce a commit.
+        while ((queue.pendingBytes > 0 || queued.length > 0) && broken === null) {
+          try {
+            await flushInternal();
+          } catch (error) {
+            drainError = error instanceof Error ? error : new Error(String(error));
+            break;
+          }
+        }
       } finally {
         closed = true;
         queue.failAll(new Error('storage worker is disposed'));
@@ -318,6 +353,7 @@ export function createStorageWorker(
         pendingFlushes.clear();
         await worker.terminate();
       }
+      if (drainError !== null) throw drainError;
     },
   };
 }

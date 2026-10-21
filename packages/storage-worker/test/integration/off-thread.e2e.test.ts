@@ -66,6 +66,47 @@ export async function openRecordingBackend(stateFile) {
   return pathToFileURL(factoryPath).href;
 }
 
+/**
+ * Same recording surface, but the append whose batch contains `failId` dies
+ * exactly once — reproducing a mid-split suffix failure inside the worker
+ * thread and the retry that must re-append ONLY the failed suffix.
+ */
+function writeSplitFailingFactory(dir: string, stateFile: string, failId: string): string {
+  const factoryPath = join(dir, 'split-failing-backend.mjs');
+  writeFileSync(
+    factoryPath,
+    `
+export async function openSplitFailingBackend(stateFile, failId) {
+  const { appendFileSync } = await import('node:fs');
+  let seq = 0;
+  let failed = false;
+  const record = (line) => appendFileSync(stateFile, JSON.stringify({ ...line, threadId: process.threadId }) + '\\n');
+  return {
+    maxBatchUncompressedBytes: 256 * 1024,
+    async appendBatch(drafts) {
+      const ids = drafts.map((draft) => draft.id);
+      if (!failed && ids.includes(failId)) {
+        failed = true;
+        throw new Error('backend died mid-split');
+      }
+      seq += 1;
+      record({ kind: 'append', ids, seq });
+      return { batchId: seq, seq, head: seq };
+    },
+    async checkpoint() {
+      record({ kind: 'checkpoint' });
+      return undefined;
+    },
+    async close() {
+      record({ kind: 'close' });
+    },
+  };
+}
+`,
+  );
+  return pathToFileURL(factoryPath).href;
+}
+
 function readEvents(stateFile: string): Array<{ kind: string; ids?: string[]; threadId: number }> {
   return readFileSync(stateFile, 'utf8')
     .split('\n')
@@ -120,7 +161,10 @@ describe('off-thread storage worker (backend owned by the worker thread)', () =>
 
     const appends = readEvents(stateFile).filter((event) => event.kind === 'append');
     expect(appends).toHaveLength(1);
-    expect(appends[0]?.ids).toEqual(['after']);
+    // The application payload survives exactly once; the durable dead letter
+    // (metadata only, `dl:`-prefixed id) rode the same log (SW-03).
+    expect(appends[0]?.ids.filter((id) => !id.startsWith('dl:'))).toEqual(['after']);
+    expect(appends[0]?.ids.some((id) => id.startsWith('dl:'))).toBe(true);
   }, 30_000);
 
   it('keeps admitting past the 8 MiB queue ceiling: committed bytes are released (deadlock regression)', async () => {
@@ -153,8 +197,44 @@ describe('off-thread storage worker (backend owned by the worker thread)', () =>
     );
   }, 30_000);
 
-  it('persists the real sqlite-zstd backend from inside the thread', async () => {
+  it('re-appends only the failed suffix when a split dies mid-batch inside the thread', async () => {
+    // IC-F1-005 / SW-01 / OPT-H4 through the REAL off-thread host: the first
+    // attempt commits the prefix [e1,e2] and dies on the suffix [e3,e4]; the
+    // worker retry must send exactly the suffix — the in-thread replay logic
+    // is the shared adapter (marks ids after commit, never un-marks a
+    // committed prefix).
     const dir = freshDirectory();
+    const stateFile = join(dir, 'state.jsonl');
+    const module = writeSplitFailingFactory(dir, stateFile, 'e3');
+    const worker = await createOffThreadStorageWorker(
+      { module, exportName: 'openSplitFailingBackend', args: [stateFile, 'e3'] },
+      // One window carrying all four entries; the 256 KiB backend cap forces
+      // the post-stringify split inside the adapter.
+      { windowMs: 60_000, windowBytes: 512 * 1024 },
+    );
+
+    // 80 KiB payloads per entry: the four serialized drafts overflow the
+    // backend's 256 KiB cap, so the adapter splits the window's batch.
+    const batch = [
+      entry('e1', 80 * 1024, { text: 'z'.repeat(80 * 1024) }),
+      entry('e2', 80 * 1024, { text: 'z'.repeat(80 * 1024) }),
+      entry('e3', 80 * 1024, { text: 'z'.repeat(80 * 1024) }),
+      entry('e4', 80 * 1024, { text: 'z'.repeat(80 * 1024) }),
+    ];
+    for (const item of batch) await worker.enqueue(item);
+
+    await expect(worker.flush()).rejects.toThrow('backend died mid-split');
+    const commit = await worker.flush();
+    expect(commit).not.toBeNull();
+    await worker.dispose();
+
+    const appends = readEvents(stateFile).filter((event) => event.kind === 'append');
+    // The failing suffix attempt threw before recording; what reached the
+    // backend is exactly the committed prefix once and the suffix once.
+    expect(appends.map((event) => event.ids)).toEqual([['e1', 'e2'], ['e3', 'e4']]);
+  }, 30_000);
+
+  it('persists the real sqlite-zstd backend from inside the thread', async () => {    const dir = freshDirectory();
     // The backend sources are TypeScript whose internal imports use `.js`
     // specifiers — raw Node type stripping resolves neither. A tiny shim
     // loaded via `--import` teaches the worker's resolver the `.js -> .ts`

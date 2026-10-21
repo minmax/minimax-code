@@ -25,13 +25,23 @@
  * @module
  */
 
-import { BatchStuckError } from './errors.ts';
+import { BatchStuckError, isTerminalBridgeErrorName } from './errors.ts';
 import type { Commit, Entry } from './contracts.js';
 
 /** Default batch window duration (ms) — durable-core spec: <= 200 ms. */
 export const DEFAULT_WINDOW_MS = 200;
 /** Default batch window size (bytes) — durable-core spec: <= 256 KiB. */
 export const DEFAULT_WINDOW_BYTES = 256 * 1024;
+/**
+ * Default fraction of the window held back at the size cut, as a divisor of
+ * `windowBytes` (16 -> the engine cuts at 15/16 of the window). A window cut
+ * at EXACTLY the backend cap splits guaranteed in half whenever the declared
+ * `entry.bytes` under-reports the true serialized size (draft wrappers, JSON
+ * escaping) — two fsyncs where one was intended. The reserve keeps the normal
+ * path at one fsync; the post-stringify split in the sqlite-zstd adapter
+ * remains the correctness net behind it.
+ */
+export const DEFAULT_WINDOW_BYTES_RESERVE_DIVISOR = 16;
 /**
  * Default uncompressed-size cap of one backend batch. Mirrors
  * `MAX_BATCH_UNCOMPRESSED_BYTES` of `@mavis/durable-backend-sqlite-zstd`
@@ -41,6 +51,22 @@ export const DEFAULT_WINDOW_BYTES = 256 * 1024;
 export const DEFAULT_MAX_BATCH_UNCOMPRESSED_BYTES = 256 * 1024;
 /** Default consecutive same-composition failures before a batch is quarantined. */
 export const DEFAULT_MAX_CONSECUTIVE_FLUSH_FAILURES = 3;
+/**
+ * How many quarantined entries keep their payload in memory (per buffer — the
+ * engine's and each host's). Beyond it, the oldest dead letters are evicted to
+ * metadata-only stubs: an unbounded quarantine buffer would let a poison
+ * flood grow the heap without limit (DS-B4).
+ */
+export const QUARANTINED_PAYLOAD_LIMIT = 1000;
+/** Total quarantined records (payloads + metadata stubs) kept per buffer. */
+export const QUARANTINED_METADATA_LIMIT = 4000;
+/**
+ * `kind` of the metadata dead-letter entry the off-thread worker drops into
+ * the same backend log for every quarantine event (SW-03): a crash then loses
+ * at most the payload of the in-memory stub, never the fact that entries were
+ * buried. Log readers filter this kind out of application deltas.
+ */
+export const DEAD_LETTER_ENTRY_KIND = 'storage-worker.dead-letter';
 
 export interface BatchEngine {
   /** Adds one entry to the current window, cutting the window if it is full. */
@@ -76,6 +102,21 @@ export interface BatchEngineOptions {
   checkpoint?: () => Promise<Commit | null>;
   /** Consecutive same-composition failures tolerated before quarantine. Default: 3. */
   maxConsecutiveFlushFailures?: number;
+  /**
+   * Bytes held back at the size cut so serialization overhead cannot push a
+   * full window past the backend cap. Default: `windowBytes /
+   * DEFAULT_WINDOW_BYTES_RESERVE_DIVISOR`. `0` restores exact cutting.
+   */
+  windowBytesReserve?: number;
+  /**
+   * Notified (in-thread) when the backend refuses writes terminally
+   * (`OwnerLostError`, `SealedGenerationError`). The engine then fails CLOSED:
+   * no retry (a stale writer can never win), no quarantine (committable
+   * entries are not buried over a backend-level refusal), every flush rejects
+   * with the backend error and new entries are ignored. The host uses this
+   * hook to fail its admission queue with the same error.
+   */
+  onTerminal?: (error: Error) => void;
   /** Notified (in-thread) whenever entries are quarantined as dead letters. */
   onQuarantine?: (entries: Entry[], error: Error) => void;
   /**
@@ -96,6 +137,12 @@ function isPoisonError(error: unknown): boolean {
   return error instanceof Error && error.name === 'EntryTooLargeError';
 }
 
+/**
+ * Terminal backend refusals (`OwnerLostError`, `SealedGenerationError`) are
+ * neither retried nor quarantined — they break the engine, fail-closed. The
+ * check inlines `instanceof Error` so TypeScript narrows the caught value.
+ */
+
 export function createBatchEngine(
   options: BatchEngineOptions,
   append: (entries: Entry[]) => Promise<Commit>,
@@ -115,6 +162,16 @@ export function createBatchEngine(
       `maxConsecutiveFlushFailures must be a positive integer, got ${maxConsecutiveFlushFailures}`,
     );
   }
+  const windowBytesReserve =
+    options.windowBytesReserve ?? Math.floor(options.windowBytes / DEFAULT_WINDOW_BYTES_RESERVE_DIVISOR);
+  if (!Number.isFinite(windowBytesReserve) || windowBytesReserve < 0 || windowBytesReserve > options.windowBytes) {
+    throw new RangeError(
+      `windowBytesReserve must be a non-negative number not above windowBytes, got ${windowBytesReserve}`,
+    );
+  }
+  // Size-cut threshold below the nominal window: a full window then survives
+  // moderate serialization inflation without a post-stringify split.
+  const sizeCutBytes = Math.max(1, options.windowBytes - windowBytesReserve);
 
   let window: Entry[] = [];
   let openWindowBytes = 0;
@@ -123,6 +180,8 @@ export function createBatchEngine(
   let appending = false;
   let trivialInFlight = false;
   let disposed = false;
+  /** Set by a terminal backend refusal; the engine fails closed from then on. */
+  let brokenError: Error | null = null;
   let lastCommit: Commit | null = null;
   let lastFailureSignature: string | null = null;
   let failureStreak = 0;
@@ -156,7 +215,7 @@ export function createBatchEngine(
    * empty batch (the backend rejects empty batches by contract).
    */
   function drainForFlushWaiters(): void {
-    if (disposed || appending || trivialInFlight || flushWaiters.length === 0) return;
+    if (disposed || brokenError || appending || trivialInFlight || flushWaiters.length === 0) return;
     if (window.length > 0) {
       void cut();
       return;
@@ -193,23 +252,45 @@ export function createBatchEngine(
 
   /** Removes the batch from the retry path forever and reports it. */
   function quarantine(batch: Entry[], error: Error): void {
-    quarantined.push(...batch);
+    // Bounded, loop-push retention (DS-B4): no spread (a quarantine batch can
+    // exceed the frame-call stack), no unbounded payload memory.
+    appendBoundedQuarantine(quarantined, batch);
     lastFailureSignature = null;
     failureStreak = 0;
     options.onQuarantine?.(batch, error);
     for (const waiter of flushWaiters.splice(0)) waiter.reject(error);
-    // Whatever is left of the window still deserves its timer.
-    ensureWindowTimer();
   }
 
   async function cut(): Promise<void> {
-    if (appending || disposed || window.length === 0) return;
+    if (appending || disposed || brokenError || window.length === 0) return;
     appending = true;
     const batch = takeWindow();
+    let poisonSurvivorsPending = false;
     try {
       lastCommit = await append(batch);
     } catch (error) {
-      if (isPoisonError(error)) {
+      if (error instanceof Error && isTerminalBridgeErrorName(error.name)) {
+        // OwnerLostError / SealedGenerationError: the backend refused writes
+        // for good. Retrying can never succeed and quarantining would bury
+        // committable entries over a backend-level refusal — fail CLOSED
+        // instead: the batch returns to the window, the engine is broken, and
+        // every flush (current and future) rejects with the backend error.
+        window = [...batch, ...window];
+        openWindowBytes += batch.reduce((total, entry) => total + entry.bytes, 0);
+        brokenError = error;
+        if (windowTimer) {
+          clearTimeout(windowTimer);
+          windowTimer = null;
+        }
+        if (retryTimer) {
+          clearTimeout(retryTimer);
+          retryTimer = null;
+        }
+        for (const waiter of flushWaiters.splice(0)) waiter.reject(error);
+        options.onTerminal?.(error);
+        return;
+      }
+      if (error instanceof Error && isPoisonError(error)) {
         // ONE entry can never fit: quarantine only the offender (by id, the
         // field survives the thread bridge) and put the rest of the batch
         // back, so committable neighbors are not buried with the poison.
@@ -221,44 +302,55 @@ export function createBatchEngine(
           quarantine(offender, error);
           window = [...survivors, ...window];
           openWindowBytes += survivors.reduce((total, entry) => total + entry.bytes, 0);
-          drainForFlushWaiters();
+          poisonSurvivorsPending = true;
+        } else {
+          // No id (or the whole batch is poison): quarantine the batch as one.
+          quarantine(batch, error);
           return;
         }
-        // No id (or the whole batch is poison): quarantine the batch as one.
-        quarantine(batch, error);
+        // The `finally` below clears `appending` first; the survivors then get
+        // their timer and flush settling at the tail of this function.
+      } else {
+        const signature = batch.map((entry) => entry.entryId).join('\u0000');
+        failureStreak = signature === lastFailureSignature ? failureStreak + 1 : 1;
+        lastFailureSignature = signature;
+        if (failureStreak >= maxConsecutiveFlushFailures) {
+          quarantine(
+            batch,
+            new BatchStuckError(
+              batch.map((entry) => entry.entryId),
+              failureStreak,
+              error,
+            ),
+          );
+          return;
+        }
+        // Put the batch back at the head so retry order matches enqueue order
+        // (entries may have been added while the failed append was in flight),
+        // then retry after one window tick. Flush callers learn about the
+        // failure immediately (fail-closed); the data itself stays queued.
+        window = [...batch, ...window];
+        openWindowBytes += batch.reduce((total, entry) => total + entry.bytes, 0);
+        if (retryTimer) clearTimeout(retryTimer);
+        // Retry after one window tick, so a dead backend is probed at the same
+        // cadence batches would normally flow.
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          void cut();
+        }, options.windowMs);
+        for (const waiter of flushWaiters.splice(0)) waiter.reject(error);
         return;
       }
-      const signature = batch.map((entry) => entry.entryId).join('\u0000');
-      failureStreak = signature === lastFailureSignature ? failureStreak + 1 : 1;
-      lastFailureSignature = signature;
-      if (failureStreak >= maxConsecutiveFlushFailures) {
-        quarantine(
-          batch,
-          new BatchStuckError(
-            batch.map((entry) => entry.entryId),
-            failureStreak,
-            error,
-          ),
-        );
-        return;
-      }
-      // Put the batch back at the head so retry order matches enqueue order
-      // (entries may have been added while the failed append was in flight),
-      // then retry after one window tick. Flush callers learn about the
-      // failure immediately (fail-closed); the data itself stays queued.
-      window = [...batch, ...window];
-      openWindowBytes += batch.reduce((total, entry) => total + entry.bytes, 0);
-      if (retryTimer) clearTimeout(retryTimer);
-      // Retry after one window tick, so a dead backend is probed at the same
-      // cadence batches would normally flow.
-      retryTimer = setTimeout(() => {
-        retryTimer = null;
-        void cut();
-      }, options.windowMs);
-      for (const waiter of flushWaiters.splice(0)) waiter.reject(error);
-      return;
     } finally {
       appending = false;
+    }
+    if (poisonSurvivorsPending) {
+      // Survivors of a poison split were restored to the window while this cut
+      // was still `appending`; only now can they get a timer and settle flush
+      // waiters (both no-op while an append is in flight).
+      ensureWindowTimer();
+      drainForFlushWaiters();
+      return;
     }
     lastFailureSignature = null;
     failureStreak = 0;
@@ -266,20 +358,25 @@ export function createBatchEngine(
     // Chain the next cut immediately when the window filled up while we were
     // appending; otherwise make sure whatever is left still flushes on time
     // and settle any flush barrier.
-    if (openWindowBytes >= options.windowBytes) void cut();
+    if (openWindowBytes >= sizeCutBytes) void cut();
     else ensureWindowTimer();
     drainForFlushWaiters();
   }
 
   return {
     add(entry: Entry): void {
-      if (disposed) return;
+      // A broken engine is fail-closed: the host was notified through
+      // `onTerminal` and must have stopped admitting; entries past that point
+      // are ignored rather than accumulated into a window that can never
+      // commit.
+      if (disposed || brokenError) return;
       window.push(entry);
       openWindowBytes += entry.bytes;
       ensureWindowTimer();
-      if (openWindowBytes >= options.windowBytes) void cut();
+      if (openWindowBytes >= sizeCutBytes) void cut();
     },
     flush(): Promise<Commit | null> {
+      if (brokenError) return Promise.reject(brokenError);
       if (disposed) return Promise.reject(new Error('storage worker engine is disposed'));
       return new Promise<Commit | null>((resolve, reject) => {
         flushWaiters.push({ resolve, reject });
@@ -310,4 +407,145 @@ export function createBatchEngine(
       }
     },
   };
+}
+
+function isQuarantineStub(entry: Entry): boolean {
+  return (
+    (entry.payload as { deadLetterPayloadEvicted?: unknown } | null)?.deadLetterPayloadEvicted ===
+    true
+  );
+}
+
+/**
+ * Appends quarantined entries to an in-memory dead-letter buffer under a
+ * memory bound (DS-B4): pushes in a plain loop (a quarantine batch can exceed
+ * the frame-call stack, so no spread), evicts the oldest payloads to
+ * metadata-only stubs past {@link QUARANTINED_PAYLOAD_LIMIT}, and drops the
+ * oldest stubs entirely past {@link QUARANTINED_METADATA_LIMIT}. The durable
+ * record of a quarantine is the dead-letter entry (off-thread path) and the
+ * host's `onQuarantined` callback — this buffer is only the caller-side mirror.
+ */
+export function appendBoundedQuarantine(buffer: Entry[], incoming: readonly Entry[]): void {
+  for (const entry of incoming) buffer.push(entry);
+  if (buffer.length > QUARANTINED_METADATA_LIMIT) {
+    buffer.splice(0, buffer.length - QUARANTINED_METADATA_LIMIT);
+  }
+  let livePayloads = 0;
+  for (const entry of buffer) {
+    if (!isQuarantineStub(entry)) livePayloads += 1;
+  }
+  for (let index = 0; index < buffer.length && livePayloads > QUARANTINED_PAYLOAD_LIMIT; index += 1) {
+    const entry = buffer[index]!;
+    if (isQuarantineStub(entry)) continue;
+    buffer[index] = {
+      ...entry,
+      payload: { deadLetterPayloadEvicted: true, bytes: entry.bytes },
+      bytes: 0,
+    };
+    livePayloads -= 1;
+  }
+}
+
+let deadLetterSequence = 0;
+
+/**
+ * Builds the metadata dead-letter entry for one quarantine event (SW-03): a
+ * small, payload-free record the off-thread worker drops into the same backend
+ * log under {@link DEAD_LETTER_ENTRY_KIND}. The full payloads stay with the
+ * caller (in-memory buffer + `onQuarantined`); the durable record preserves
+ * WHO was buried and WHY — enough to audit and re-materialize from upstream.
+ */
+export function buildDeadLetterEntry(entries: readonly Entry[], error: Error): Entry {
+  deadLetterSequence += 1;
+  const first = entries[0];
+  return {
+    entryId: `dl:${deadLetterSequence}:${first?.entryId ?? 'unknown'}`,
+    parentId: null,
+    kind: DEAD_LETTER_ENTRY_KIND,
+    payload: {
+      error: { name: error.name, message: error.message },
+      entries: entries.map((entry) => ({ entryId: entry.entryId, kind: entry.kind, bytes: entry.bytes })),
+    },
+    // Metadata-only: dead letters do not charge the byte budgets.
+    bytes: 0,
+  };
+}
+
+/**
+ * Ownership plan for one `postMessage` of entries whose payloads carry plain
+ * `ArrayBuffer`s (OPT-B1): the buffers are TRANSFERRED instead of copied, and
+ * the recorded slots let the sender put them back when the post failed or the
+ * receiving side rejected the append (the engine retains failed batches for
+ * retry — detached buffers there would corrupt the retry). Payloads without
+ * plain ArrayBuffers — the JSON-normal case — produce an empty plan and behave
+ * exactly like a plain post. Depth-limited: deep payloads keep clone semantics.
+ */
+export interface TransferPlan {
+  readonly buffers: ArrayBuffer[];
+  readonly slots: Array<{ container: Record<string, unknown>; key: string }>;
+}
+
+const TRANSFER_SCAN_DEPTH_LIMIT = 8;
+
+export function collectTransferableBuffers(entries: readonly Entry[]): TransferPlan {
+  const buffers: ArrayBuffer[] = [];
+  const slots: Array<{ container: Record<string, unknown>; key: string }> = [];
+  const seenBuffers = new Set<ArrayBuffer>();
+  const seenObjects = new Set<unknown>();
+
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > TRANSFER_SCAN_DEPTH_LIMIT || value === null || typeof value !== 'object') return;
+    if (value instanceof ArrayBuffer) return; // bare buffers have no writable slot; only container properties do
+    if (seenObjects.has(value)) return;
+    seenObjects.add(value);
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        const item = value[index];
+        if (item instanceof ArrayBuffer) {
+          if (!seenBuffers.has(item) && !item.detached) {
+            seenBuffers.add(item);
+            buffers.push(item);
+            slots.push({ container: value as unknown as Record<string, unknown>, key: String(index) });
+          }
+          continue;
+        }
+        visit(item, depth + 1);
+      }
+      return;
+    }
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      const child = (value as Record<string, unknown>)[key];
+      if (child instanceof ArrayBuffer) {
+        if (!seenBuffers.has(child) && !child.detached) {
+          seenBuffers.add(child);
+          buffers.push(child);
+          slots.push({ container: value as Record<string, unknown>, key });
+        }
+        continue;
+      }
+      visit(child, depth + 1);
+    }
+  };
+
+  for (const entry of entries) {
+    if (entry.payload instanceof ArrayBuffer) {
+      if (!seenBuffers.has(entry.payload) && !entry.payload.detached) {
+        seenBuffers.add(entry.payload);
+        buffers.push(entry.payload);
+        slots.push({ container: entry as unknown as Record<string, unknown>, key: 'payload' });
+      }
+      continue;
+    }
+    visit(entry.payload, 1);
+  }
+  return { buffers, slots };
+}
+
+/** Puts transferred buffers back into their original payload slots. */
+export function restoreTransferredBuffers(plan: TransferPlan): void {
+  for (let index = 0; index < plan.slots.length; index += 1) {
+    const slot = plan.slots[index]!;
+    const buffer = plan.buffers[index];
+    if (buffer !== undefined) slot.container[slot.key] = buffer;
+  }
 }

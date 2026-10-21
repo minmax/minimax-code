@@ -149,12 +149,22 @@ describe('createStorageWorker -> sqlite-zstd (end to end)', () => {
     const wholeBatch = JSON.stringify(entries.map(toEntryDraft));
     expect(Buffer.byteLength(wholeBatch, 'utf8')).toBeGreaterThan(256 * 1024);
 
-    await worker.flush();
+    const commit = await worker.flush();
 
     // The adapter split it: more than one commit, every entry durable, none lost.
     expect(backend.head).toBeGreaterThanOrEqual(2);
     const delta = backend.readDelta(0, 8 * 1024 * 1024);
     expect(delta.map((item) => item.id)).toEqual(entries.map((item) => item.entryId));
+
+    // IC-F1-006: the returned commit covers the WHOLE split range. Resuming
+    // from its seq serves the entire tail (no middle sub-batch skipped), and
+    // its head is the backend's durable head.
+    expect(commit).not.toBeNull();
+    expect(Number(commit?.head)).toBe(backend.head);
+    const tail = backend.readDelta(commit!.seq, 8 * 1024 * 1024).map((item) => item.id);
+    expect(tail.length).toBeGreaterThan(0);
+    expect(tail).toEqual(delta.slice(delta.length - tail.length).map((item) => item.id));
+    expect(backend.readDelta(Number(commit!.head), 8 * 1024 * 1024)).toEqual([]);
 
     await worker.dispose();
     await backend.close();
