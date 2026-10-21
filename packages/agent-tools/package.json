@@ -25,6 +25,10 @@
       "types": "./src/shared/read-contract.ts",
       "import": "./dist/shared/read-contract.js"
     },
+    "./truncation/cas-spill": {
+      "types": "./src/truncation/cas-spill.ts",
+      "import": "./dist/truncation/cas-spill.js"
+    },
     "./plugin-hooks": {
       "types": "./src/plugin-hooks/index.ts",
       "import": "./dist/plugin-hooks/index.js"

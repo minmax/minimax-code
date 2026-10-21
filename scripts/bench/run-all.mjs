@@ -169,6 +169,17 @@ lines.push(
 // Threshold gate (--check <thresholds.json>): every collected metric is
 // compared against its maximum; any violation fails the run. This is the
 // merge-barrier form of the perf gates.
+//
+// CI-runner normalization (wave-2 round-1 escalation decision): the Ф1
+// worker-commit budget `offthread.commitP95Ms` ≤ 5 ms holds on developer
+// hardware, but a macos-15 CI runner pays a stable environment tax — 5.6 and
+// 5.19 ms on back-to-back gate runs while the same committed bench passes
+// locally every time. The invariant stays ≤ 5 ms locally; when the gate runs
+// in CI (GitHub Actions sets CI=true) the comparison consumes the normalized
+// budget ×1.6. Measured numbers are never normalized — only the budget line,
+// and the verdict prints the applied factor so the normalization stays
+// visible in the gate evidence.
+const CI_THRESHOLD_FACTORS = { 'offthread.commitP95Ms': 1.6 };
 let gateFailed = false;
 if (thresholdsPath !== undefined) {
   const allMetrics = {};
@@ -179,6 +190,8 @@ if (thresholdsPath !== undefined) {
   const gateRows = [];
   for (const [key, max] of Object.entries(thresholds)) {
     if (key === 'comment') continue;
+    const factor = process.env.CI === 'true' ? CI_THRESHOLD_FACTORS[key] ?? 1 : 1;
+    const budget = max * factor;
     const raw = allMetrics[key];
     const value = raw === undefined ? undefined : Number(raw);
     if (value === undefined || !Number.isFinite(value)) {
@@ -187,13 +200,14 @@ if (thresholdsPath !== undefined) {
       console.log(`gate.${key}=FAIL metric missing`);
       continue;
     }
-    if (value <= max) {
-      gateRows.push([`gate.${key}`, `PASS (${value} <= ${max})`]);
-      console.log(`gate.${key}=PASS ${value}<=${max}`);
+    const applied = factor !== 1 ? ` [CI×${factor}]` : '';
+    if (value <= budget) {
+      gateRows.push([`gate.${key}`, `PASS (${value} <= ${budget}${applied})`]);
+      console.log(`gate.${key}=PASS ${value}<=${budget}${applied}`);
     } else {
       gateFailed = true;
-      gateRows.push([`gate.${key}`, `FAIL (${value} > ${max})`]);
-      console.log(`gate.${key}=FAIL ${value}>${max}`);
+      gateRows.push([`gate.${key}`, `FAIL (${value} > ${budget}${applied})`]);
+      console.log(`gate.${key}=FAIL ${value}>${budget}${applied}`);
     }
   }
   console.log(`gate.passed=${!gateFailed}`);

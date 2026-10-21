@@ -124,6 +124,9 @@
       "@mavis/agent-tools/read-contract": [
         "./packages/agent-tools/src/shared/read-contract.ts"
       ],
+      "@mavis/agent-tools/truncation/cas-spill": [
+        "./packages/agent-tools/src/truncation/cas-spill.ts"
+      ],
       "@mavis/background-task": [
         "./packages/agent-modules/background-task/src/index.ts"
       ],
@@ -132,6 +135,12 @@
       ],
       "@mavis/cas": [
         "./packages/cas/src/index.ts"
+      ],
+      "@mavis/cas/cas-ref": [
+        "./packages/cas/src/cas-ref.ts"
+      ],
+      "@mavis/cas/store-errors": [
+        "./packages/cas/src/store-errors.ts"
       ],
       "@mavis/config": [
         "./packages/config/src/index.ts"

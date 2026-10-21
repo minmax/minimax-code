@@ -76,31 +76,52 @@ interface ZstdBindings {
 	readonly zstdCompressSync?: (data: Uint8Array, options?: { readonly params?: Readonly<Record<number, number>> }) => Buffer;
 	readonly zstdDecompressSync?: (data: Uint8Array, options?: { readonly maxOutputLength?: number }) => Buffer;
 	readonly ZSTD_c_checksumFlag?: number;
+	/**
+	 * The checksum flag constant lives here on the module-namespace (ESM)
+	 * surface: on the target runtime (Node 22.22.2, verified) the top-level
+	 * `ZSTD_c_checksumFlag` is undefined while `constants.ZSTD_c_checksumFlag`
+	 * is 201 — in the main thread AND in worker threads. The detector reads
+	 * both locations.
+	 */
+	readonly constants?: { readonly ZSTD_c_checksumFlag?: number } | undefined;
 }
 
 const zlibBindings = zlib as typeof zlib & ZstdBindings;
+
+/**
+ * The zstd frame-checksum flag parameter, resolved from whichever surface the
+ * running runtime exposes it on: `constants.ZSTD_c_checksumFlag` first, the
+ * top-level `ZSTD_c_checksumFlag` second (the CJS surface of some runtimes).
+ * `undefined` when the runtime exposes neither — then there is no checksummed
+ * zstd and the codec falls back to gzip.
+ */
+const ZSTD_CHECKSUM_FLAG: number | undefined = (() => {
+	const fromConstants = zlibBindings.constants?.ZSTD_c_checksumFlag;
+	if (typeof fromConstants === 'number') return fromConstants;
+	const topLevel = zlibBindings.ZSTD_c_checksumFlag;
+	return typeof topLevel === 'number' ? topLevel : undefined;
+})();
 
 /** Whether this runtime's `node:zlib` provides checksummed Zstandard frames. */
 export function isZstdSupported(): boolean {
 	return (
 		typeof zlibBindings.zstdCompressSync === 'function' &&
 		typeof zlibBindings.zstdDecompressSync === 'function' &&
-		typeof zlibBindings.ZSTD_c_checksumFlag === 'number'
+		typeof ZSTD_CHECKSUM_FLAG === 'number'
 	);
 }
 
 function createZstdCodec(): Codec | undefined {
 	const compress = zlibBindings.zstdCompressSync;
 	const decompress = zlibBindings.zstdDecompressSync;
-	const checksumFlag = zlibBindings.ZSTD_c_checksumFlag;
-	if (typeof compress !== 'function' || typeof decompress !== 'function' || typeof checksumFlag !== 'number') {
+	if (typeof compress !== 'function' || typeof decompress !== 'function' || ZSTD_CHECKSUM_FLAG === undefined) {
 		return undefined;
 	}
 	return {
 		name: 'zstd',
 		// The checksum flag marks the frame header so the XXH64 content
 		// checksum that follows the frame body is written and verified.
-		compress: (data) => compress(data, { params: { [checksumFlag]: 1 } }),
+		compress: (data) => compress(data, { params: { [ZSTD_CHECKSUM_FLAG]: 1 } }),
 		decompress: (data, options) => decompress(data, options),
 	};
 }
