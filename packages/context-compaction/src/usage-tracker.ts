@@ -84,6 +84,13 @@ function isPayloadObject(payload: unknown): payload is Record<string, unknown> {
 function parseCompactionPayload(payload: unknown): CompactionEntryPayload | undefined {
   if (!isPayloadObject(payload)) return undefined;
   if (typeof payload.summary !== 'string' || typeof payload.firstKeptEntryId !== 'string') return undefined;
+  // Same malformed rule as the projection's parser: `systemMessage` must be a
+  // string or null. A missing (or non-string) field used to slip through,
+  // `consumeCompaction` froze `undefined` as the system prompt, and `usage()`
+  // threw `Cannot read properties of undefined (reading 'length')` on every
+  // later call — resync included, both sides preserving the undefined. The
+  // record stays audit noise, exactly like a payload without a summary.
+  if (typeof payload.systemMessage !== 'string' && payload.systemMessage !== null) return undefined;
   return payload as unknown as CompactionEntryPayload;
 }
 

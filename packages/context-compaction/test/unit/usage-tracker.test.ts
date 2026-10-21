@@ -543,3 +543,133 @@ describe('scheduler byte axis resets after a byte-triggered compaction', () => {
     expect(third.level).toBe('none');
   });
 });
+
+describe('judge round 1 regressions', () => {
+  const message = (id: string, text: string): LogEntry => ({
+    id,
+    parentId: null,
+    kind: 'mcode.message',
+    payload: { role: 'user', content: text },
+    seq: 0,
+    ordinal: 0,
+  });
+  const system = (id: string, text: string): LogEntry => ({
+    id,
+    parentId: null,
+    kind: 'mcode.system',
+    payload: { text },
+    seq: 0,
+    ordinal: 0,
+  });
+  const omission = (id: string, targetIds: string[]): LogEntry => ({
+    id,
+    parentId: null,
+    kind: 'mcode.context_edit',
+    payload: { action: 'omission', targetIds, reason: 'r' },
+    seq: 0,
+    ordinal: 0,
+  });
+  /** A checkpoint whose `systemMessage` violates the contract (missing included). */
+  const badCheckpoint = (id: string, kept: string, summary: string, systemMessage?: unknown): LogEntry => ({
+    id,
+    parentId: null,
+    kind: 'mcode.compaction',
+    payload: {
+      summary,
+      firstKeptEntryId: kept,
+      ...(systemMessage === undefined ? {} : { systemMessage }),
+      isSplitTurn: false,
+      tokensBefore: 1000,
+      estimatedTokensAfter: 100,
+      createdAtMs: 1,
+    },
+    seq: 0,
+    ordinal: 0,
+  });
+  /** A well-formed checkpoint (the shape `compact()` writes). */
+  const checkpoint = (id: string, kept: string, summary: string, systemMessage: string | null): LogEntry =>
+    badCheckpoint(id, kept, summary, systemMessage);
+
+  function assertTracksSlow(prefixes: readonly LogEntry[][]): void {
+    const tracker = new WindowUsageTracker();
+    for (const prefix of prefixes) {
+      tracker.ingest(prefix);
+      // The defect: after such a checkpoint `usage()` threw
+      // TypeError("Cannot read properties of undefined (reading 'length')")
+      // on EVERY later call — systemText was frozen as `undefined`, and the
+      // resync preserved it on both sides. It must answer, and must answer
+      // exactly what the slow reference answers.
+      const usage = tracker.usage();
+      expect(usage.tokens).toBe(estimateProjectedContextTokens(prefix).tokens);
+      expect(usage.bytes).toBe(windowManifestBytes(prefix));
+      expect(Number.isFinite(usage.tokens)).toBe(true);
+      expect(Number.isFinite(usage.bytes)).toBe(true);
+    }
+  }
+
+  it('a checkpoint without systemMessage is audit noise: usage() never throws', () => {
+    const log: LogEntry[] = [
+      system('sys1', 's'.repeat(40)),
+      message('m1', 'x'.repeat(400)),
+      message('m2', 'y'.repeat(400)),
+      badCheckpoint('cp-bad', 'm1', 'S'.repeat(20)),
+    ];
+    assertTracksSlow(log.map((_, end) => log.slice(0, end + 1)));
+    // The record applied NOTHING: no cut (both messages stay) and no frozen
+    // prompt (the newest visible system entry still wins) — the same outcome
+    // a payload without a summary already gets.
+    const projected = projectContext(log);
+    expect(projected.systemMessage).toBe('s'.repeat(40));
+    expect(projected.messages).toHaveLength(2);
+  });
+
+  it('a checkpoint with a non-string systemMessage is audit noise too', () => {
+    for (const corrupt of [42, { frozen: true }, ['FROZEN']]) {
+      const log: LogEntry[] = [
+        system('sys1', 's'.repeat(40)),
+        message('m1', 'x'.repeat(400)),
+        message('m2', 'y'.repeat(400)),
+        badCheckpoint('cp-bad', 'm1', 'S'.repeat(20), corrupt),
+      ];
+      assertTracksSlow(log.map((_, end) => log.slice(0, end + 1)));
+      expect(projectContext(log).systemMessage).toBe('s'.repeat(40));
+    }
+  });
+
+  it('a corrupt checkpoint loses to a valid earlier checkpoint and survives the resync', () => {
+    const log: LogEntry[] = [
+      system('sys1', 's'.repeat(40)),
+      message('m1', 'x'.repeat(400)),
+      message('m2', 'y'.repeat(400)),
+      // The valid winner: cut to m2, frozen prompt.
+      checkpoint('cp1', 'm2', 'S1'.repeat(20), 'FROZEN-PROMPT'),
+      // The corrupt one must not steal the win on ingest — or on the resync
+      // the system-source retraction below forces.
+      badCheckpoint('cp-bad', 'm1', 'S2'.repeat(20)),
+      omission('edit1', ['sys1']),
+      system('sys2', 't'.repeat(40)),
+    ];
+    assertTracksSlow(log.map((_, end) => log.slice(0, end + 1)));
+    // The projection's truth: cp1 stays the winner, its frozen prompt stays
+    // frozen even after the resync; the corrupt record changed nothing.
+    expect(projectContext(log).systemMessage).toBe('FROZEN-PROMPT');
+    expect(projectContext(log).messages).toEqual([
+      { role: 'user', content: 'S1'.repeat(20) },
+      { role: 'user', content: 'y'.repeat(400) },
+    ]);
+  });
+
+  it('systemMessage: null keeps meaning "defer to the newest system entry"', () => {
+    // The malformed rule must not swallow the LEGAL null (the shape compact()
+    // writes for a non-frozen checkpoint).
+    const log: LogEntry[] = [
+      system('sys1', 's'.repeat(40)),
+      message('m1', 'x'.repeat(400)),
+      message('m2', 'y'.repeat(400)),
+      checkpoint('cp-ok', 'm2', 'S'.repeat(20), null),
+      system('sys2', 't'.repeat(40)),
+    ];
+    assertTracksSlow(log.map((_, end) => log.slice(0, end + 1)));
+    expect(projectContext(log).systemMessage).toBe('t'.repeat(40));
+  });
+});

@@ -51,6 +51,15 @@ function parseCompactionPayload(entry: LogEntry): CompactionEntryPayload | undef
   if (entry.kind !== COMPACTION_ENTRY_KIND || !isPayloadObject(entry.payload)) return undefined;
   const payload = entry.payload;
   if (typeof payload.summary !== 'string' || typeof payload.firstKeptEntryId !== 'string') return undefined;
+  // `systemMessage: string | null` is part of the declared payload contract.
+  // A non-string value — a missing field included — would otherwise reach the
+  // winner rule below (`undefined !== null`), project `undefined` as the
+  // system prompt, and desynchronize every consumer: the usage tracker froze
+  // it and its `usage()` threw on every later call while this oracle
+  // (`windowManifestBytes` / `estimateProjectedContextTokens`) tolerated the
+  // shape. The record is MALFORMED — plain audit noise, exactly like a
+  // payload without a summary.
+  if (typeof payload.systemMessage !== 'string' && payload.systemMessage !== null) return undefined;
   return payload as unknown as CompactionEntryPayload;
 }
 

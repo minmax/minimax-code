@@ -76,12 +76,22 @@ export function asCompactionPayload(payload: unknown, entryId: string): Compacti
 	if (typeof payload !== 'object' || payload === null) {
 		throw new TypeError(`mcode.compaction entry ${entryId}: payload must be an object`);
 	}
-	const { summary, firstKeptEntryId } = payload as Record<string, unknown>;
+	const { summary, firstKeptEntryId, systemMessage } = payload as Record<string, unknown>;
 	if (typeof summary !== 'string') {
 		throw new TypeError(`mcode.compaction entry ${entryId}: payload.summary must be a string`);
 	}
 	if (typeof firstKeptEntryId !== 'string' || firstKeptEntryId.length === 0) {
 		throw new TypeError(`mcode.compaction entry ${entryId}: payload.firstKeptEntryId must be a non-empty string`);
+	}
+	// The fold never reads `systemMessage` (it is the compaction core's frozen
+	// prompt, not the projection's), so an ABSENT field stays legal — this
+	// package's declared payload shape carries only the two fields above. A
+	// PRESENT but corrupt value, though, is the same writer-contract breach a
+	// corrupt summary is: the stricter compaction parsers treat such a
+	// checkpoint as malformed (audit noise), so accepting it here would let a
+	// record one consumer rejected apply a cut in another.
+	if (systemMessage !== undefined && typeof systemMessage !== 'string' && systemMessage !== null) {
+		throw new TypeError(`mcode.compaction entry ${entryId}: payload.systemMessage must be a string or null`);
 	}
 	return { summary, firstKeptEntryId };
 }

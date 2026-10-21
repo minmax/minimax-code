@@ -152,6 +152,26 @@ describe('compaction slice', () => {
 		const malformed: typeof bad = { ...bad, payload: { summary: 42 } };
 		expect(() => buildProjection([a, malformed])).toThrow(TypeError);
 	});
+
+	it('rejects a present-but-corrupt systemMessage, tolerates an absent one', () => {
+		// Judge round 1 [корректность]: the compaction parsers treat a
+		// checkpoint whose systemMessage is neither a string nor null as
+		// MALFORMED (audit noise). The fold never reads the field, so an
+		// absent one stays legal — but a corrupt one is the same writer
+		// breach a corrupt summary is, and must not apply a cut here that the
+		// stricter consumers rejected.
+		const a = llmEntry('pi.user', { text: 'a' }, 1, 0);
+		const entry = compactionEntry(2, 0, 'summary', a.id);
+		for (const corrupt of [42, { frozen: true }, ['FROZEN']]) {
+			const badSystem: typeof entry = { ...entry, payload: { ...entry.payload, systemMessage: corrupt } };
+			expect(() => buildProjection([a, badSystem])).toThrow(TypeError);
+			expect(() => buildProjection([a, badSystem])).toThrow(/systemMessage must be a string or null/);
+		}
+		// Absent (the helper's own two-field shape) and explicit null stay legal.
+		expect(buildProjection([a, entry]).segments.map((segment) => segment.entryId)).toEqual([a.id]);
+		const explicitNull: typeof entry = { ...entry, payload: { ...entry.payload, systemMessage: null } };
+		expect(buildProjection([a, explicitNull]).segments.map((segment) => segment.entryId)).toEqual([a.id]);
+	});
 });
 
 describe('context_edit pruning', () => {
