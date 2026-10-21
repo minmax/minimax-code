@@ -119,6 +119,13 @@ export type CompileOptions = {
    * work); a breach aborts the compile with {@link WireBudgetExceeded}.
    */
   readonly maxBytes: number;
+  /**
+   * Force the per-segment sha256 even on cache hits. Default `false`: a hit
+   * reuses the cached segment as-is and reports `sha256: undefined`, keeping
+   * the warm path free of O(payload) hashing; every miss always carries a
+   * fresh hash, so a first compile can publish a manifest directly.
+   */
+  readonly requireHashes?: boolean;
   /** Wire dialect driving per-entry normalization. Default: minimax-m3. */
   readonly dialect?: WireDialect;
   /**
@@ -135,8 +142,14 @@ export type SegmentStat = {
   readonly kind: EntryKind;
   /** Size of the segment in bytes. */
   readonly bytes: number;
-  /** Lowercase hex SHA-256 of the segment bytes (for manifest publication). */
-  readonly sha256: string;
+  /**
+   * Lowercase hex SHA-256 of the segment bytes, for manifest publication.
+   * Computed on every cache MISS and whenever `requireHashes` is set;
+   * `undefined` on a pure cache hit without `requireHashes` (the warm path
+   * pays no O(payload) hashing — reuse `hash` of the previously published
+   * manifest, or re-request with `requireHashes` to re-verify).
+   */
+  readonly sha256: string | undefined;
   /** Whether the segment came from the cache instead of being serialized. */
   readonly cacheHit: boolean;
 };

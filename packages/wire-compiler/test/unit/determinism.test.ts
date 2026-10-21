@@ -92,6 +92,27 @@ describe('wire compiler determinism', () => {
     expect(cold.totalBytes).toBe(cold.body.length);
   });
 
+  it('computes the per-segment sha256 on misses only, unless requireHashes is set', () => {
+    const cache = createLruSegmentCache(64);
+    const opts = { maxBytes: 1 << 20, cache } as const;
+
+    // Cold: every segment is a miss and carries a fresh hash.
+    const cold = compile(MANIFEST, fixtureEntries(), opts);
+    expect(cold.segments.every((stat) => typeof stat.sha256 === 'string')).toBe(true);
+
+    // Warm hits: the cached segment is reused AS-IS — no O(payload) hashing
+    // on the hot path, sha256 is undefined.
+    const warm = compile(MANIFEST, fixtureEntries(), opts);
+    expect(warm.segments.map((stat) => stat.cacheHit)).toEqual([true, true, true, true, true]);
+    expect(warm.segments.map((stat) => stat.sha256)).toEqual([undefined, undefined, undefined, undefined, undefined]);
+    expect(warm.body.equals(cold.body)).toBe(true);
+
+    // Manifest publication on demand: requireHashes re-hashes even on hits,
+    // byte-identically to the miss hashes.
+    const republished = compile(MANIFEST, fixtureEntries(), { ...opts, requireHashes: true });
+    expect(republished.segments.map((stat) => stat.sha256)).toEqual(cold.segments.map((stat) => stat.sha256));
+  });
+
   it('produces the documented normalized shapes for every per-entry stage', () => {
     const { body } = compile(MANIFEST, fixtureEntries(), {
       maxBytes: 1 << 20,

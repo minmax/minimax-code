@@ -172,3 +172,28 @@ export function projectContext(entries: readonly LogEntry[]): ProjectedContext {
 export function summarizableMessages(entry: ProjectedEntry): readonly CompactionMessage[] {
   return entry.isCompaction ? [] : entry.contextMessages;
 }
+
+/**
+ * Byte size of the PROJECTED WINDOW: Σ UTF-8 bytes of the serialized payload
+ * of every entry that currently contributes LLM-visible content (kept message
+ * entries, the winning checkpoint, the active system prompt), plus the
+ * serialized system-prompt payload. This is the byte truth of the compaction
+ * trigger's byte axis — the window the projection materializes, NOT the raw
+ * append-only log (audit/control bookkeeping contributes nothing, and a
+ * checkpoint RESETS the axis to its kept tail). O(log): the slow reference
+ * the incremental {@link WindowUsageTracker} is property-tested against;
+ * the scheduler itself consumes the tracker, never this function.
+ */
+export function windowManifestBytes(entries: readonly LogEntry[]): number {
+  const projected = projectContext(entries);
+  let bytes = 0;
+  for (let i = 0; i < entries.length; i += 1) {
+    if (projected.entries[i]!.contextMessages.length > 0) {
+      bytes += Buffer.byteLength(JSON.stringify(entries[i]!.payload), 'utf8');
+    }
+  }
+  if (projected.systemMessage !== null) {
+    bytes += Buffer.byteLength(JSON.stringify({ text: projected.systemMessage }), 'utf8');
+  }
+  return bytes;
+}

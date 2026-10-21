@@ -183,6 +183,7 @@ describe('capsule', () => {
 		expect(service.capsule()).toEqual({
 			head: SEQ_AT_START,
 			firstKeptEntryId: null,
+			compaction: null,
 			usageAnchor: null,
 			appliedSeq: SEQ_AT_START,
 		});
@@ -193,6 +194,7 @@ describe('capsule', () => {
 		expect(service.capsule()).toEqual({
 			head: 1,
 			firstKeptEntryId: null,
+			compaction: null,
 			usageAnchor: b.id,
 			appliedSeq: 1,
 		});
@@ -202,8 +204,147 @@ describe('capsule', () => {
 		expect(service.capsule()).toEqual({
 			head: 2,
 			firstKeptEntryId: b.id,
+			compaction: { summary: 'summary of a', firstKeptEntryId: b.id },
 			usageAnchor: b.id,
 			appliedSeq: 2,
 		});
+	});
+});
+
+describe('fromCapsule (lazy open on the retained slice)', () => {
+	/** Entries of the applied log from `firstKeptEntryId` (when set) to the head — the storage range read. */
+	function retainedSlice(log: readonly Entry[], firstKeptEntryId: string | null): Entry[] {
+		if (firstKeptEntryId === null) return [...log];
+		const start = log.findIndex((entry) => entry.id === firstKeptEntryId);
+		return start === -1 ? [] : log.slice(start);
+	}
+
+	it('round-trips a compacted history: the resumed manifest equals the live one', () => {
+		const service = new ProjectionService();
+		const log: Entry[] = [];
+		let seq = 0;
+		const append = (entries: Entry[]) => {
+			seq += 1;
+			log.push(...entries);
+			service.apply(commitOf(seq, entries));
+		};
+
+		const a = llmEntry('pi.user', { text: 'u1' }, 1, 0);
+		const b = llmEntry('pi.assistant', { text: 'a1' }, 1, 1);
+		append([a, b]);
+		append([compactionEntry(2, 0, 'summary of a', b.id)]);
+		const c = llmEntry('pi.user', { text: 'u2' }, 3, 0);
+		append([c, auditEntry(3, 1)]);
+
+		const resumed = ProjectionService.fromCapsule(service.capsule(), retainedSlice(log, service.capsule().firstKeptEntryId));
+		expect(resumed.manifest()).toEqual(service.manifest());
+		expect(resumed.capsule()).toEqual(service.capsule());
+
+		// The resumed service continues the log: the next commit applies and
+		// stays identical to a full rebuild over the whole log.
+		seq += 1;
+		const d = llmEntry('pi.assistant', { text: 'a2' }, seq, 0);
+		log.push(d);
+		const applied = resumed.apply(commitOf(seq, [d]));
+		expect(applied.delta.map((segment) => segment.entryId)).toEqual([d.id]);
+		expect(resumed.manifest()).toEqual(buildProjection(log));
+	});
+
+	it('resumes a fresh session from the start-of-log capsule', () => {
+		const service = new ProjectionService();
+		const resumed = ProjectionService.fromCapsule(service.capsule(), []);
+		expect(resumed.manifest()).toEqual(buildProjection([]));
+		expect(resumed.capsule().appliedSeq).toBe(SEQ_AT_START);
+	});
+
+	it('resumes an uncompacted window slice (the capsule describes the retained window)', () => {
+		const service = new ProjectionService();
+		const log: Entry[] = [];
+		for (let seq = 1; seq <= 4; seq += 1) {
+			const batch = [llmEntry('pi.user', { text: `u${seq}` }, seq, 0), auditEntry(seq, 1)];
+			log.push(...batch);
+			service.apply(commitOf(seq, batch));
+		}
+		const capsule = service.capsule();
+		expect(capsule.firstKeptEntryId).toBeNull();
+		const windowSlice = log.slice(-2); // the fixed window the storage layer serves
+		const resumed = ProjectionService.fromCapsule(capsule, windowSlice);
+		expect(resumed.manifest().segments.map((segment) => segment.entryId)).toEqual([windowSlice[0]!.id]);
+		expect(resumed.capsule().appliedSeq).toBe(capsule.appliedSeq);
+	});
+
+	it('rejects a slice inconsistent with its capsule', () => {
+		const service = new ProjectionService();
+		const a = llmEntry('pi.user', { text: 'u1' }, 1, 0);
+		const b = llmEntry('pi.assistant', { text: 'a1' }, 1, 1);
+		service.apply(commitOf(1, [a, b]));
+		const compaction = compactionEntry(2, 0, 'summary of a', b.id);
+		service.apply(commitOf(2, [compaction]));
+		const capsule = service.capsule();
+		const slice = retainedSliceOf([a, b, compaction], capsule.firstKeptEntryId);
+
+		// Slice missing the first kept entry.
+		expect(() => ProjectionService.fromCapsule(capsule, slice.slice(1))).toThrow(ProjectionError);
+		// Slice folded past the capsule head.
+		const extra = llmEntry('pi.user', { text: 'u2' }, 3, 0);
+		expect(() => ProjectionService.fromCapsule(capsule, [...slice, extra])).toThrow(ProjectionError);
+		// firstKeptEntryId without a compaction mark (and the reverse).
+		expect(() =>
+			ProjectionService.fromCapsule({ ...capsule, compaction: null }, slice),
+		).toThrow(ProjectionError);
+		// Stale usage anchor.
+		expect(() =>
+			ProjectionService.fromCapsule({ ...capsule, usageAnchor: 'stale' }, slice),
+		).toThrow(ProjectionError);
+		// appliedSeq behind the slice head.
+		expect(() =>
+			ProjectionService.fromCapsule({ ...capsule, appliedSeq: (capsule.appliedSeq - 1) as typeof capsule.appliedSeq }, slice),
+		).toThrow(ProjectionError);
+
+		function retainedSliceOf(log: Entry[], firstKeptEntryId: string | null): Entry[] {
+			const start = firstKeptEntryId === null ? 0 : log.findIndex((entry) => entry.id === firstKeptEntryId);
+			return log.slice(start);
+		}
+	});
+});
+
+describe('no retained log (bounded RAM)', () => {
+	it('holds no raw-entry retention: the service state is the derived window only', () => {
+		const service = new ProjectionService();
+		const a = llmEntry('pi.user', { text: 'u1' }, 1, 0);
+		service.apply(commitOf(1, [a]));
+		// The wave-2 review pins the structural property: no internal raw-log
+		// array survives an apply — RAM is bounded by the window, not history.
+		const internals = service as unknown as Record<string, unknown>;
+		expect(internals.log).toBeUndefined();
+		expect(internals.state).toBeDefined();
+	});
+
+	it('stays equivalent to a full rebuild across many control commits on a long stream', () => {
+		const service = new ProjectionService();
+		const log: Entry[] = [];
+		let seq = 0;
+		// A long plain stream, then a compaction, then more — the control
+		// commit must NOT re-fold (nor need) the dropped prefix.
+		for (let i = 0; i < 50; i += 1) {
+			seq += 1;
+			const batch = [llmEntry('pi.user', { text: `u${i}` }, seq, 0)];
+			log.push(...batch);
+			service.apply(commitOf(seq, batch));
+		}
+		const mid = log[25]!;
+		seq += 1;
+		const compaction = compactionEntry(seq, 0, 'summary', mid.id);
+		log.push(compaction);
+		service.apply(commitOf(seq, [compaction]));
+		for (let i = 0; i < 10; i += 1) {
+			seq += 1;
+			const batch = [llmEntry('pi.assistant', { text: `a${i}` }, seq, 0), auditEntry(seq, 1)];
+			log.push(...batch);
+			service.apply(commitOf(seq, batch));
+		}
+		expect(service.manifest()).toEqual(buildProjection(log));
+		// Only the kept window is manifest-visible.
+		expect(service.manifest().segments).toHaveLength(25 + 10);
 	});
 });

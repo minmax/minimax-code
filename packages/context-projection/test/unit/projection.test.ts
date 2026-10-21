@@ -17,6 +17,7 @@ describe('buildProjection (one-shot fold)', () => {
 		expect(buildProjection([])).toEqual({
 			head: SEQ_AT_START,
 			segments: [],
+			windowBytes: 0,
 			usageAnchor: null,
 			watermark: WATERMARK_AT_START,
 		});
@@ -60,6 +61,29 @@ describe('buildProjection (one-shot fold)', () => {
 			byteLen: Buffer.byteLength(JSON.stringify(cyrillic.payload), 'utf8'),
 			kind: 'pi.user',
 		});
+	});
+
+	it('maintains windowBytes as Σ segment byteLen through appends, cuts, and prunes', () => {
+		const byteLenOf = (entry: { payload: unknown }) => Buffer.byteLength(JSON.stringify(entry.payload), 'utf8');
+		const a = llmEntry('pi.user', { text: 'старый-пrefix' }, 1, 0);
+		const b = llmEntry('pi.assistant', { text: 'kept' }, 1, 1);
+		const c = llmEntry('pi.user', { text: 'newer' }, 2, 0);
+		const compaction = compactionEntry(2, 1, 'summary of a', b.id);
+
+		const grown = buildProjection([a, b, c]);
+		expect(grown.windowBytes).toBe(byteLenOf(a) + byteLenOf(b) + byteLenOf(c));
+
+		// The cut subtracts exactly the removed prefix — the byte axis resets.
+		const cut = buildProjection([a, b, c, compaction]);
+		expect(cut.windowBytes).toBe(byteLenOf(b) + byteLenOf(c));
+
+		// A prune subtracts exactly the pruned segments.
+		const pruned = buildProjection([b, c, editEntry(3, 0, [c.id])]);
+		expect(pruned.windowBytes).toBe(byteLenOf(b));
+
+		// Audit entries contribute nothing to the window bytes.
+		const audited = buildProjection([b, auditEntry(4, 0)]);
+		expect(audited.windowBytes).toBe(byteLenOf(b));
 	});
 
 	it('rejects a slice that does not strictly advance in log order', () => {
@@ -154,6 +178,46 @@ describe('context_edit pruning', () => {
 		const a = llmEntry('pi.user', { text: 'a' }, 1, 0);
 		const edit = editEntry(2, 0, ['missing-entry']);
 		expect(() => buildProjection([a, edit])).toThrow(ProjectionError);
+	});
+
+	it('applies the omission variant (the context-compaction writer format): hides its targets', () => {
+		const a = llmEntry('pi.user', { text: 'a' }, 1, 0);
+		const b = llmEntry('pi.assistant', { text: 'b' }, 1, 1);
+		const c = llmEntry('pi.user', { text: 'c' }, 2, 0);
+		const byteLenOf = (entry: { payload: unknown }) => Buffer.byteLength(JSON.stringify(entry.payload), 'utf8');
+		const omission = {
+			...editEntry(2, 1, []),
+			payload: { action: 'omission', targetIds: [a.id], reason: 'overflow', createdAtMs: 1 },
+		};
+
+		const manifest = buildProjection([a, b, c, omission]);
+		expect(manifest.segments.map((segment) => segment.entryId)).toEqual([b.id, c.id]);
+		// The hidden bytes leave the window byte axis too.
+		expect(manifest.windowBytes).toBe(byteLenOf(b) + byteLenOf(c));
+		// The usage anchor never regresses.
+		expect(manifest.usageAnchor).toBe(c.id);
+	});
+
+	it('omission of targets that are not current segments is a tolerated no-op', () => {
+		const a = llmEntry('pi.user', { text: 'a' }, 1, 0);
+		const compaction = compactionEntry(2, 0, 'cut a away', a.id);
+		const omission = {
+			...editEntry(2, 1, []),
+			payload: { action: 'omission', targetIds: ['already-cut-entry'], reason: 'late retraction' },
+		};
+
+		const manifest = buildProjection([a, compaction, omission]);
+		expect(manifest.segments.map((segment) => segment.entryId)).toEqual([a.id]);
+	});
+
+	it('rejects a context_edit payload of an unknown variant instead of ignoring it', () => {
+		const a = llmEntry('pi.user', { text: 'a' }, 1, 0);
+		const foreign = { ...editEntry(2, 0, []), payload: { action: 'replacement', targetIds: [a.id] } };
+		expect(() => buildProjection([a, foreign])).toThrow(TypeError);
+		const shapeless = { ...editEntry(2, 0, []), payload: { note: 'no recognized variant' } };
+		expect(() => buildProjection([a, shapeless])).toThrow(TypeError);
+		const nonArray = { ...editEntry(2, 0, []), payload: { action: 'omission', targetIds: 'a' } };
+		expect(() => buildProjection([a, nonArray])).toThrow(TypeError);
 	});
 });
 

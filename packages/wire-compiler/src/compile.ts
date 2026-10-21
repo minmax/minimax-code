@@ -54,6 +54,12 @@ function compileSegment(entry: Entry, dialect: WireDialect): Buffer {
  * Entries not referenced by the manifest are ignored; a manifest reference
  * without an entry, or duplicate entryIds inside `entries`, are caller bugs
  * and raise {@link WireCompilerError}.
+ *
+ * Cost model: on a cache hit the segment is reused AS-IS and no hashing runs
+ * (the sha256 is needed only to PUBLISH a manifest; it is computed on every
+ * miss, so a first compile always carries hashes). `requireHashes: true`
+ * forces hashing on hits too — the degraded equivalence mode's
+ * hash-verification path.
  */
 export function compile(
   manifest: ContextManifest,
@@ -66,6 +72,7 @@ export function compile(
 
   const dialect = opts.dialect ?? MINIMAX_M3_DIALECT;
   const cache: WireSegmentCache = opts.cache ?? defaultSegmentCache();
+  const requireHashes = opts.requireHashes === true;
 
   // Index entries by id; duplicates would make the manifest resolution
   // ambiguous, so they are rejected instead of silently picking a winner.
@@ -99,16 +106,20 @@ export function compile(
     const cached = cache.get(key);
     const cacheHit = cached !== undefined;
     // A cache hit skips the per-entry serialization entirely: the cached
-    // segment bytes are reused as-is (segments are immutable once compiled).
+    // segment bytes are reused as-is (segments are immutable once compiled),
+    // and the O(payload) sha256 with them — the warm path stays O(window)
+    // arithmetic, never re-hashing megabytes.
     const segment = cacheHit ? cached : compileSegment(entry, dialect);
     if (!cacheHit) cache.set(key, segment);
+    const sha256 =
+      cacheHit && !requireHashes ? undefined : createHash('sha256').update(segment).digest('hex');
 
     parts.push(segment);
     stats.push({
       entryId: entry.entryId,
       kind: entry.kind,
       bytes: segment.length,
-      sha256: createHash('sha256').update(segment).digest('hex'),
+      sha256,
       cacheHit,
     });
     totalBytes += segment.length;

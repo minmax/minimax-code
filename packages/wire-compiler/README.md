@@ -22,7 +22,20 @@ const { body, totalBytes, segments } = compile(
   segments. Returns the `body` (newline-delimited JSON, one normalized entry
   per line), its exact `totalBytes`, and a per-entry `segments` breakdown
   (`bytes`, `sha256`, `cacheHit`) that callers publish back into their
-  `[{entryId, segOff, len, hash}]` manifest.
+  `[{entryId, segOff, len, hash}]` manifest. The `sha256` is computed on
+  every cache MISS (so a first compile can publish a manifest directly) and
+  skipped on warm hits — `undefined` there, unless `opts.requireHashes`
+  forces re-hashing (the degraded mode's hash verification). The warm path
+  pays no O(payload) hashing.
+- Per-entry stage ownership — the per-entry conversion stage is OWNED by
+  `@mavis/convert-to-llm` (`convertEntry` → `CompiledEntry`;
+  `serializeCompiledEntry` is its pinned serialization). `src/contracts.ts`
+  pins that contract for this package: `compiledEntryToWireEntry` maps a
+  record onto the frozen-entry shape, `compiledRecordDialect()` compiles
+  records into segments BYTE-IDENTICAL to `serializeCompiledEntry` (+ the
+  trailing newline), and `compiledEntrySegment(record)` returns those bytes
+  directly. The bridge test (`test/unit/bridge.test.ts`) pins the
+  durable-entry → convert-to-llm → wire-segment equality.
 - Budget guard — `totalBytes > opts.maxBytes` aborts with `WireBudgetExceeded`
   carrying `totalBytes`, `maxBytes`, and the exact per-entry `breakdown`. The
   guard is arithmetic over segment lengths (no serialization work), so an

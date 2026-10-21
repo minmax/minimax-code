@@ -83,6 +83,15 @@ export interface ContextManifest {
 	readonly head: Seq;
 	/** LLM-visible context pages in log order; audit/control (`mcode.*`) entries never appear here. */
 	readonly segments: readonly Segment[];
+	/**
+	 * Σ `byteLen` over {@link segments} — the byte size of the projection
+	 * WINDOW, maintained incrementally (O(delta) per commit; a compaction
+	 * subtracts the cut prefix). This is the byte truth the compaction
+	 * trigger's byte axis consumes; it is NOT the provider payload size (the
+	 * wire compiler's `CompiledBody.totalBytes` measures the normalized
+	 * segments actually sent).
+	 */
+	readonly windowBytes: number;
 	/** Last compaction applied to the context, if any; later compactions replace earlier ones. */
 	readonly compaction?: CompactionMark;
 	/**
@@ -101,6 +110,8 @@ export interface ProjectionState {
 	readonly watermark: Watermark;
 	/** LLM-visible segments in log order; compaction cuts and context edits rewrite this list. */
 	readonly segments: readonly Segment[];
+	/** Σ `byteLen` over `segments`; maintained incrementally by {@link foldEntry}. */
+	readonly windowBytes: number;
 	readonly compaction: CompactionMark | null;
 	readonly usageAnchor: string | null;
 }
@@ -110,6 +121,7 @@ export const EMPTY_STATE: ProjectionState = {
 	head: SEQ_AT_LOG_START,
 	watermark: WATERMARK_AT_START,
 	segments: [],
+	windowBytes: 0,
 	compaction: null,
 	usageAnchor: null,
 };
@@ -153,17 +165,25 @@ export function foldEntry(state: ProjectionState, entry: Entry): ProjectionState
 		head: entry.seq,
 		watermark: { seq: entry.seq, ordinal: entry.ordinal },
 		segments: state.segments,
+		windowBytes: state.windowBytes,
 		compaction: state.compaction,
 		usageAnchor: state.usageAnchor,
 	};
 
 	if (!isControlKind(entry.kind)) {
-		const segment: Segment = { entryId: entry.id, byteLen: payloadByteLen(entry), kind: entry.kind };
-		return { ...base, segments: [...state.segments, segment], usageAnchor: entry.id };
+		const byteLen = payloadByteLen(entry);
+		const segment: Segment = { entryId: entry.id, byteLen, kind: entry.kind };
+		return {
+			...base,
+			segments: [...state.segments, segment],
+			windowBytes: state.windowBytes + byteLen,
+			usageAnchor: entry.id,
+		};
 	}
 
 	// Audit/control entry: filtered out of the LLM context; only the two
-	// control kinds rewrite the derived view.
+	// control kinds rewrite the derived view. Both maintain `windowBytes`
+	// over the REMOVED entries only — O(cut), never a fold of the whole log.
 	switch (entry.kind) {
 		case COMPACTION_KIND: {
 			const { summary, firstKeptEntryId } = asCompactionPayload(entry.payload, entry.id);
@@ -174,17 +194,31 @@ export function foldEntry(state: ProjectionState, entry: Entry): ProjectionState
 						'is not a segment of the current context',
 				);
 			}
+			let cutBytes = 0;
+			for (let i = 0; i < cutIndex; i += 1) cutBytes += state.segments[i]!.byteLen;
 			return {
 				...base,
 				segments: state.segments.slice(cutIndex),
+				windowBytes: state.windowBytes - cutBytes,
 				compaction: { summary, firstKeptEntryId },
 			};
 		}
 		case CONTEXT_EDIT_KIND: {
-			const { removedEntryIds } = asContextEditPayload(entry.payload, entry.id);
-			if (!removedEntryIds || removedEntryIds.length === 0) {
-				return base;
+			const payload = asContextEditPayload(entry.payload, entry.id);
+			if ('action' in payload) {
+				// Omission variant: hide whatever targets are current segments;
+				// targets already gone (cut by a compaction, or never projected)
+				// stay hidden without raising — the writer cannot know the fold's
+				// exact window when it records the retraction.
+				if (payload.targetIds.length === 0) return base;
+				const hidden = new Set(payload.targetIds);
+				const kept = state.segments.filter((segment) => !hidden.has(segment.entryId));
+				if (kept.length === state.segments.length) return base;
+				const keptBytes = kept.reduce((sum, segment) => sum + segment.byteLen, 0);
+				return { ...base, segments: kept, windowBytes: keptBytes };
 			}
+			const { removedEntryIds } = payload;
+			if (removedEntryIds.length === 0) return base;
 			const removed = new Set(removedEntryIds);
 			const kept = state.segments.filter((segment) => !removed.has(segment.entryId));
 			if (kept.length + removed.size !== state.segments.length) {
@@ -195,7 +229,8 @@ export function foldEntry(state: ProjectionState, entry: Entry): ProjectionState
 						unknown.map((id) => JSON.stringify(id)).join(', '),
 				);
 			}
-			return { ...base, segments: kept };
+			const keptBytes = kept.reduce((sum, segment) => sum + segment.byteLen, 0);
+			return { ...base, segments: kept, windowBytes: keptBytes };
 		}
 		default:
 			// Plain audit entry: observed by the watermark only.
@@ -217,6 +252,7 @@ export function toManifest(state: ProjectionState): ContextManifest {
 	const manifest: { -readonly [K in keyof ContextManifest]: ContextManifest[K] } = {
 		head: state.head,
 		segments: [...state.segments],
+		windowBytes: state.windowBytes,
 		usageAnchor: state.usageAnchor,
 		watermark: { ...state.watermark },
 	};

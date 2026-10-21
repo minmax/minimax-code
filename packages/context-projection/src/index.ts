@@ -17,6 +17,10 @@ export {
 	CONTROL_KIND_PREFIX,
 	type CompactionPayload,
 	type ContextEditPayload,
+	type OmissionEditPayload,
+	type PruneEditPayload,
+	asCompactionPayload,
+	asContextEditPayload,
 	isControlKind,
 } from './kinds.js';
 export {

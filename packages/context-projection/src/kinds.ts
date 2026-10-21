@@ -7,8 +7,9 @@
 //   - every kind prefixed with `mcode.` is an audit/control entry: it advances
 //     the fold position but NEVER becomes an LLM-visible segment;
 //   - `mcode.compaction` and `mcode.context_edit` additionally carry payload
-//     that rewrites the derived view, so the incremental cache is dropped and
-//     the manifest is fully refolded when they are applied.
+//     that rewrites the derived view (compaction cut / pruning); the fold
+//     applies them through the same single `foldEntry` step as every other
+//     kind, so incremental application stays identical to a full rebuild.
 //
 // All other kinds are LLM context: one segment per entry, in log order.
 
@@ -29,11 +30,41 @@ export interface CompactionPayload {
 	readonly firstKeptEntryId: string;
 }
 
-/** Payload of a {@link CONTEXT_EDIT_KIND} entry. */
-export interface ContextEditPayload {
-	/** Entry ids to drop from the current derived segments. Unknown ids are rejected. */
-	readonly removedEntryIds?: readonly string[];
+/**
+ * The omission variant of a {@link CONTEXT_EDIT_KIND} payload — the format
+ * `@mavis/context-compaction` writes (`createOmissionEntryDraft`, the
+ * overflow-recovery retraction). An omission HIDES its targets from the
+ * derived context; targets that are not current segments (already cut by a
+ * compaction, or never projected) stay hidden and do not raise.
+ */
+export interface OmissionEditPayload {
+	readonly action: 'omission';
+	/** Ids of the entries the projection must hide. */
+	readonly targetIds: readonly string[];
+	/** Human-readable cause (the overflow error, for example). Unused by the fold. */
+	readonly reason?: unknown;
+	/** Wall-clock stamp of the omission. Unused by the fold. */
+	readonly createdAtMs?: unknown;
 }
+
+/**
+ * The strict pruning variant of a {@link CONTEXT_EDIT_KIND} payload (the
+ * local `pi-context-edit` shape). Unknown ids REJECT the entry — unlike the
+ * omission variant, a strict prune asserts exact knowledge of the window.
+ */
+export interface PruneEditPayload {
+	/** Entry ids to drop from the current derived segments. Unknown ids are rejected. */
+	readonly removedEntryIds: readonly string[];
+}
+
+/**
+ * Payload of a {@link CONTEXT_EDIT_KIND} entry: either the cross-package
+ * omission format ({@link OmissionEditPayload}, what `@mavis/context-compaction`
+ * writes) or the local strict-prune format ({@link PruneEditPayload}).
+ * `asContextEditPayload` throws on any other shape — an unknown variant is a
+ * contract breach, never silently ignored.
+ */
+export type ContextEditPayload = OmissionEditPayload | PruneEditPayload;
 
 /** Whether `kind` marks an audit/control entry that must stay out of the LLM context. */
 export function isControlKind(kind: string): boolean {
@@ -55,16 +86,29 @@ export function asCompactionPayload(payload: unknown, entryId: string): Compacti
 	return { summary, firstKeptEntryId };
 }
 
-/** Narrows an unknown entry payload to a {@link ContextEditPayload}; throws when malformed. */
+/** Narrows an unknown entry payload to a {@link ContextEditPayload}; throws when malformed or of an unknown variant. */
 export function asContextEditPayload(payload: unknown, entryId: string): ContextEditPayload {
 	if (typeof payload !== 'object' || payload === null) {
 		throw new TypeError(`mcode.context_edit entry ${entryId}: payload must be an object`);
 	}
-	const { removedEntryIds } = payload as Record<string, unknown>;
-	if (removedEntryIds !== undefined) {
-		if (!Array.isArray(removedEntryIds) || removedEntryIds.some((id) => typeof id !== 'string')) {
+	const record = payload as Record<string, unknown>;
+	// Omission variant (the format `@mavis/context-compaction` writes).
+	if (record.action === 'omission') {
+		const { targetIds } = record;
+		if (!Array.isArray(targetIds) || targetIds.some((id) => typeof id !== 'string')) {
+			throw new TypeError(`mcode.context_edit entry ${entryId}: payload.targetIds must be a string array`);
+		}
+		return { action: 'omission', targetIds };
+	}
+	// Strict prune variant (the local `pi-context-edit` shape).
+	if (record.removedEntryIds !== undefined) {
+		if (!Array.isArray(record.removedEntryIds) || record.removedEntryIds.some((id) => typeof id !== 'string')) {
 			throw new TypeError(`mcode.context_edit entry ${entryId}: payload.removedEntryIds must be a string array`);
 		}
+		return { removedEntryIds: record.removedEntryIds };
 	}
-	return { removedEntryIds };
+	throw new TypeError(
+		`mcode.context_edit entry ${entryId}: unknown payload variant — expected ` +
+			`{action:"omission", targetIds:[...]} or {removedEntryIds:[...]}`,
+	);
 }

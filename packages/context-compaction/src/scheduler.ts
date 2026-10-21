@@ -5,7 +5,12 @@
  * - tokens: usage-anchored estimate of the projected window (last valid
  *   provider usage + `chars/4` of the trailing messages, images at 4800
  *   characters);
- * - bytes: the sum of serialized entry lengths of the session manifest.
+ * - bytes: Σ serialized bytes of the PROJECTED WINDOW — kept entries, the
+ *   winning checkpoint payload and the active system prompt. The axis is
+ *   maintained INCREMENTALLY (O(delta) per appended entry, memoized per
+ *   entry id) and RESETS when a checkpoint cuts the window: audit/control
+ *   bookkeeping contributes nothing, and entries behind a checkpoint leave
+ *   the axis instead of re-firing it forever.
  *
  * Either axis crossing 75% of its budget starts a BACKGROUND compaction: the
  * summarizer runs without any writer held, and only the final append of the
@@ -24,10 +29,9 @@ import {
   DEFAULT_BACKGROUND_THRESHOLD_RATIO,
   DEFAULT_BLOCKING_THRESHOLD_RATIO,
   DEFAULT_KEEP_RECENT_TOKENS,
-  estimateManifestBytes,
-  estimateProjectedContextTokens,
   evaluateTriggers,
 } from './estimate.js';
+import { WindowUsageTracker } from './usage-tracker.js';
 import { BACKGROUND_COMPACTION_PRIORITY, type ControlPlanePriority, type DurableEntryDraft, type LogEntry, type Summarizer } from './types.js';
 import type {
   CompactionBudgets,
@@ -100,16 +104,16 @@ export function createBackgroundCompactionScheduler(
   const gate = options.gate ?? createWriterGate();
   const appendPriority = options.appendPriority ?? BACKGROUND_COMPACTION_PRIORITY;
   const now = options.now ?? Date.now;
+  // The trigger counters are maintained incrementally: each call ingests only
+  // the entries appended since the previous call, so notify/evaluate/usage
+  // never re-read (let alone re-stringify) the whole log.
+  const usageTracker = new WindowUsageTracker();
 
   let inFlight: Promise<CompactionOutcome | null> | null = null;
 
   function usage(): { tokens: number; bytes: number } {
-    return {
-      // Anchor-aware of checkpoints: a usage record behind a compaction or
-      // omission is stale and falls back to the pure window estimate.
-      tokens: estimateProjectedContextTokens(session.entries).tokens,
-      bytes: estimateManifestBytes(session.entries),
-    };
+    usageTracker.ingest(session.entries);
+    return usageTracker.usage();
   }
 
   async function runCompaction(): Promise<CompactionOutcome | null> {

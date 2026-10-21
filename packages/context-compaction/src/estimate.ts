@@ -189,9 +189,17 @@ function pureEstimate(projected: ProjectedContext): ContextUsageEstimate {
 }
 
 /**
- * Byte size of the session manifest: the sum of serialized entry lengths —
- * UTF-8 bytes (`Buffer.byteLength`), NOT UTF-16 code units, so a byteBudget
- * expressed in bytes trips at the right point for non-ASCII payloads too.
+ * Byte size of the RAW append-only log: the sum of serialized entry lengths —
+ * UTF-8 bytes (`Buffer.byteLength`), NOT UTF-16 code units.
+ *
+ * LEGACY measure, kept for its unit tests and diagnostics. It is NOT the
+ * compaction trigger's byte axis anymore: the raw sum counts audit/control
+ * bookkeeping that never reaches the payload and entries a checkpoint already
+ * summarized away, and it never RESETS after a compaction — every later
+ * notify re-fired blocking forever. The trigger axis is the PROJECTED WINDOW
+ * size (`WindowUsageTracker`, incrementally maintained; slow reference
+ * `windowManifestBytes`), and the provider-payload truth is the wire
+ * compiler's `CompiledBody.totalBytes`.
  */
 export function estimateManifestBytes(entries: readonly LogEntry[]): number {
   let bytes = 0;

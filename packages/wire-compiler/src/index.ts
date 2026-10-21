@@ -21,3 +21,10 @@ export type {
   SegmentStat,
   ToolDefinition,
 } from './types.js';
+export {
+  COMPILED_RECORD_NORMALIZER_VERSION,
+  compiledEntrySegment,
+  compiledEntryToWireEntry,
+  compiledRecordDialect,
+} from './contracts.js';
+export type { CompiledEntry, DurableEntry, ProviderRole } from './contracts.js';

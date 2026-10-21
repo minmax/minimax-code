@@ -47,11 +47,20 @@ const { result } = await runWithOverflowRecovery({
   omission entry hiding the failed attempt's entries and propagates.
 - **Scheduler** — double trigger (tokens: usage anchor + `chars/4` of the
   trailing messages, image = 4800 characters; bytes: Σ UTF-8 byte lengths of
-  the serialized manifest). 75% of any budget -> background compaction; 90%
-  -> blocking (the caller awaits the returned job). Control-plane priorities
-  P0–P4: the background job holds the writer gate ONLY for the final append,
-  at P4 — the summarizer runs with no writer held, and every queued urgent
-  commit (P0–P3) is granted first.
+  the PROJECTED WINDOW — kept entries, the winning checkpoint payload and
+  the active system prompt). Both axes are maintained INCREMENTALLY
+  (`WindowUsageTracker`: O(delta) per appended entry, per-entry estimates
+  memoized — `notify()` never re-reads or re-stringifies the log), and the
+  byte axis RESETS when a checkpoint cuts the window: audit/control
+  bookkeeping (`mcode.owner-input.received` and friends) contributes
+  nothing, and entries behind a checkpoint leave the axis instead of
+  re-firing blocking forever. The provider-payload byte truth is the wire
+  compiler's `CompiledBody.totalBytes`; this window axis is the conservative
+  trigger. 75% of any budget -> background compaction; 90% -> blocking (the
+  caller awaits the returned job). Control-plane priorities P0–P4: the
+  background job holds the writer gate ONLY for the final append, at P4 —
+  the summarizer runs with no writer held, and every queued urgent commit
+  (P0–P3) is granted first.
 - **≤ 90% target (best effort)** — with `tokenBudget` set, `keepRecentTokens`
   is clamped (`resolveKeepRecentTokens`) so the requested kept tail plus a
   summary headroom (default 2048 tokens) stays within 90% of the budget.

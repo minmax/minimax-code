@@ -1,12 +1,16 @@
 // Incremental projection service.
 //
 // The service keeps the manifest fold warm: `apply()` folds ONLY the entries
-// of the incoming commit into the cached state (the head-keyed incremental
-// cache idea of pi-durable da866ada1), so the steady-state cost is
-// O(entries of the commit). A full refold of the retained log happens ONLY
-// when a commit carries a control entry that rewrites the derived view
-// (`mcode.compaction` / `mcode.context_edit`); the single shared fold step
-// keeps the result identical to `buildProjection` over the whole log.
+// of the incoming commit into the cached state through the single shared
+// `foldEntry` step (the head-keyed incremental cache idea of pi-durable
+// da866ada1), so the steady-state cost is O(entries of the commit) on EVERY
+// commit — including the control kinds (`mcode.compaction` /
+// `mcode.context_edit`), whose fold operates on the cached `state.segments`
+// alone. A control commit therefore never re-folds the history, and the
+// service holds NO retained raw log: RAM is bounded by the derived window,
+// not by the session length. The equivalence to `buildProjection` over the
+// whole log holds by construction (one fold step) and is pinned by a unit
+// test.
 //
 // The backend `Commit` is a write result and does not carry the batch
 // entries, while the projection fold needs their content — so `apply` takes
@@ -21,12 +25,12 @@ import { SEQ_AT_START } from '../../durable-backend-sqlite-zstd/src/types.js';
 
 import { COMPACTION_KIND, CONTEXT_EDIT_KIND } from './kinds.js';
 import {
+	type CompactionMark,
 	type ContextManifest,
 	EMPTY_STATE,
 	type ProjectionState,
 	type Segment,
 	ProjectionError,
-	foldAll,
 	foldEntry,
 	toManifest,
 } from './projection.js';
@@ -47,14 +51,23 @@ export interface ApplyResult {
 	 * none — they are filtered out of the LLM context).
 	 */
 	readonly delta: readonly Segment[];
-	/** Whether the commit forced a full refold (compaction / context edit). */
-	readonly rebuilt: boolean;
+		/**
+		 * Whether the commit carried a control entry that rewrote the derived
+		 * view (compaction cut / pruning). The fold itself is incremental on
+		 * every commit — this flag only marks the manifest rewrite.
+		 */
+		readonly rebuilt: boolean;
 }
 
 /**
  * Projection-level resume capsule: everything a consumer needs to resume the
- * derived context WITHOUT walking the log leaf→root — read the capsule, then
- * `buildProjection` the slice from `firstKeptEntryId` to `head`.
+ * derived context WITHOUT walking the log — read the capsule, then
+ * {@link ProjectionService.fromCapsule} the retained slice
+ * (`firstKeptEntryId` … `head`) the storage layer serves as a range read.
+ *
+ * Self-contained by design (≤ a few hundred bytes): the capsule carries the
+ * winning compaction mark, so the summary text survives without re-reading
+ * the checkpoint entry.
  *
  * Distinct from the backend's storage-level `ResumeCapsule`, which describes
  * the last durable batch.
@@ -64,6 +77,8 @@ export interface ResumeCapsule {
 	readonly head: Seq;
 	/** First entry still kept as a segment after the last compaction; `null` without compaction. */
 	readonly firstKeptEntryId: string | null;
+	/** The winning compaction mark (summary + first kept id); `null` without compaction. */
+	readonly compaction: CompactionMark | null;
 	/** Entry id usage accounting resumes from; `null` before the first LLM-visible entry. */
 	readonly usageAnchor: string | null;
 	/** Sequence of the last applied commit; `SEQ_AT_START` before the first commit. */
@@ -82,17 +97,79 @@ export interface ProjectionServiceOptions {
 /**
  * Incremental projector over one durable log. Apply commits in order; the
  * manifest, the resume capsule and the LLM context view stay current without
- * ever re-reading applied entries — except on the rare control commits that
- * rewrite the derived view, which trigger a full refold.
+ * ever re-reading applied entries — the fold is O(entries of the commit) on
+ * every commit, control kinds included, and nothing but the derived window is
+ * retained.
  */
 export class ProjectionService {
 	private state: ProjectionState = EMPTY_STATE;
-	private readonly log: Entry[] = [];
 	private lastSeq: Seq = SEQ_AT_START as Seq;
 	private readonly residency: ResidencyPolicy | undefined;
 
 	constructor(options?: ProjectionServiceOptions) {
 		this.residency = options?.residency;
+	}
+
+	/**
+	 * Rebuilds a service from a resume capsule and the retained log slice the
+	 * storage layer serves for it — the lazy-open path: read the capsule
+	 * (one meta row), range-read ONLY the slice (`firstKeptEntryId` … `head`),
+	 * fold it, and continue applying new commits; no full-log replay.
+	 *
+	 * The slice must be in ascending log order and must be exactly the window
+	 * the capsule describes: it starts at `capsule.firstKeptEntryId` (when
+	 * set), ends at `capsule.head`, and folds to the capsule's
+	 * `usageAnchor`. The capsule's compaction mark is overlaid after the
+	 * fold (the checkpoint entry itself sits BEFORE the slice and is not
+	 * re-read). Any inconsistency throws {@link ProjectionError} before the
+	 * service is built.
+	 */
+	static fromCapsule(capsule: ResumeCapsule, slice: readonly Entry[], options?: ProjectionServiceOptions): ProjectionService {
+		if ((capsule.firstKeptEntryId === null) !== (capsule.compaction === null)) {
+			throw new ProjectionError(
+				`capsule at head ${capsule.head}: firstKeptEntryId and compaction must be set together or both null`,
+			);
+		}
+		// Fold FIRST (it validates order and can throw), overlay the capsule
+		// metadata after; only then mutate the fresh service.
+		let state = EMPTY_STATE;
+		for (const entry of slice) {
+			state = foldEntry(state, entry);
+		}
+		if (capsule.firstKeptEntryId !== null) {
+			const first = slice[0];
+			if (first === undefined || first.id !== capsule.firstKeptEntryId) {
+				throw new ProjectionError(
+					`capsule at head ${capsule.head}: slice must start at firstKeptEntryId ` +
+						`${JSON.stringify(capsule.firstKeptEntryId)}, got ${JSON.stringify(first?.id ?? null)}`,
+				);
+			}
+		}
+		if (state.head !== capsule.head) {
+			throw new ProjectionError(
+				`capsule at head ${capsule.head}: slice folds to head ${state.head}`,
+			);
+		}
+		if (state.usageAnchor !== capsule.usageAnchor) {
+			throw new ProjectionError(
+				`capsule at head ${capsule.head}: slice folds to usageAnchor ` +
+					`${JSON.stringify(state.usageAnchor)}, capsule says ${JSON.stringify(capsule.usageAnchor)}`,
+			);
+		}
+		if (capsule.compaction !== null) {
+			state = { ...state, compaction: { ...capsule.compaction } };
+		}
+		const service = new ProjectionService(options);
+		// `lastSeq` accepts the appliedSeq+1 commit next; appliedSeq ≥ head is
+		// the only ordering this backend family guarantees beyond equality.
+		if (capsule.appliedSeq < capsule.head) {
+			throw new ProjectionError(
+				`capsule appliedSeq ${capsule.appliedSeq} is behind its own head ${capsule.head}`,
+			);
+		}
+		service.state = state;
+		service.lastSeq = capsule.appliedSeq;
+		return service;
 	}
 
 	/**
@@ -130,24 +207,20 @@ export class ProjectionService {
 			}
 		}
 
-		// Full rebuild ONLY on the control kinds that rewrite the derived view;
-		// everything else folds incrementally into the cached state.
+		// Every commit folds through the same single `foldEntry` step — control
+		// kinds included, whose fold operates on the cached segments alone. The
+		// flag only REPORTS that this commit rewrote the derived view.
 		const rebuilt = entries.some(
 			(entry) => entry.kind === COMPACTION_KIND || entry.kind === CONTEXT_EDIT_KIND,
 		);
 		// Fold FIRST, mutate LAST: the fold can throw (malformed control
 		// payload, unknown compaction target), and a failed apply must leave
-		// the retained log and the cached state untouched — otherwise the
-		// poisoned log would rethrow stale errors on every later rebuild.
+		// the cached state untouched — otherwise a poisoned state would
+		// surface stale errors on every later read.
 		let state = this.state;
-		if (rebuilt) {
-			state = foldAll([...this.log, ...entries]);
-		} else {
-			for (const entry of entries) {
-				state = foldEntry(state, entry);
-			}
+		for (const entry of entries) {
+			state = foldEntry(state, entry);
 		}
-		this.log.push(...entries);
 		this.state = state;
 		this.lastSeq = commit.seq;
 
@@ -166,11 +239,12 @@ export class ProjectionService {
 		return toManifest(this.state);
 	}
 
-	/** Resume capsule for the current fold position. */
+	/** Resume capsule for the current fold position (self-contained: carries the compaction mark). */
 	capsule(): ResumeCapsule {
 		return {
 			head: this.state.head,
 			firstKeptEntryId: this.state.compaction?.firstKeptEntryId ?? null,
+			compaction: this.state.compaction === null ? null : { ...this.state.compaction },
 			usageAnchor: this.state.usageAnchor,
 			appliedSeq: this.lastSeq,
 		};

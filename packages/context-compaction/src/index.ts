@@ -50,6 +50,7 @@ export {
   UnknownFirstKeptEntryError,
   projectContext,
   summarizableMessages,
+  windowManifestBytes,
 } from './project.js';
 export {
   createCompactionEntryDraft,
@@ -66,6 +67,8 @@ export {
 } from './overflow.js';
 export type { GateRelease, WriterGate } from './gate.js';
 export { createWriterGate } from './gate.js';
+export { WindowUsageTracker } from './usage-tracker.js';
+export type { WindowUsage } from './usage-tracker.js';
 export type {
   BackgroundCompactionScheduler,
   BackgroundCompactionSchedulerOptions,
