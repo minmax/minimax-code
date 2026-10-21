@@ -608,6 +608,7 @@
     "packages/convert-to-llm/test/unit/batching.test.ts",
     "packages/convert-to-llm/test/unit/convert-entry.test.ts",
     "packages/convert-to-llm/test/unit/helpers.ts",
+    "packages/convert-to-llm/test/unit/manifest.test.ts",
     "packages/convert-to-llm/test/unit/tail-entries.test.ts",
     "packages/convert-to-llm/tsconfig.json",
     "packages/convert-to-llm/vitest.config.ts",
