@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { SEQ_AT_START } from '../../../durable-backend-sqlite-zstd/src/types.js';
+import type { JsonValue } from '../../../durable-backend-sqlite-zstd/src/types.js';
 
 import {
 	WATERMARK_AT_START,
@@ -162,14 +163,20 @@ describe('compaction slice', () => {
 		// stricter consumers rejected.
 		const a = llmEntry('pi.user', { text: 'a' }, 1, 0);
 		const entry = compactionEntry(2, 0, 'summary', a.id);
+		const payloadWith = (systemMessage: JsonValue): typeof entry => ({
+			...entry,
+			// The helper types `payload` as JsonValue; the two-field shape it
+			// writes is an object, so the spread target is narrowed explicitly.
+			payload: { ...(entry.payload as Record<string, unknown>), systemMessage },
+		});
 		for (const corrupt of [42, { frozen: true }, ['FROZEN']]) {
-			const badSystem: typeof entry = { ...entry, payload: { ...entry.payload, systemMessage: corrupt } };
+			const badSystem = payloadWith(corrupt);
 			expect(() => buildProjection([a, badSystem])).toThrow(TypeError);
 			expect(() => buildProjection([a, badSystem])).toThrow(/systemMessage must be a string or null/);
 		}
 		// Absent (the helper's own two-field shape) and explicit null stay legal.
 		expect(buildProjection([a, entry]).segments.map((segment) => segment.entryId)).toEqual([a.id]);
-		const explicitNull: typeof entry = { ...entry, payload: { ...entry.payload, systemMessage: null } };
+		const explicitNull = payloadWith(null);
 		expect(buildProjection([a, explicitNull]).segments.map((segment) => segment.entryId)).toEqual([a.id]);
 	});
 });
