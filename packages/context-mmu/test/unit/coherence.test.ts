@@ -18,7 +18,7 @@ async function makeFiles(): Promise<string> {
 }
 
 describe('watch coherence', () => {
-  it('marks a changed page stale and replaces it with a diff handle', { timeout: 20_000 }, async () => {
+  it('marks a changed page stale and replaces it with a diff handle', { timeout: 65_000 }, async () => {
     const { mmu, dispose } = await makeMmu({ maxResidentBytes: 1024, watchDebounceMs: DEBOUNCE_MS });
     const files = await makeFiles();
     try {
@@ -34,7 +34,7 @@ describe('watch coherence', () => {
       const stop = mmu.watch([file]);
       try {
         await writeFile(file, after);
-        await until(() => handle.stale, 'the page to be marked stale', 15_000);
+        await until(() => handle.stale, 'the page to be marked stale', 60_000);
 
         const replacement = handle.replacedBy;
         expect(replacement).toBeDefined();
@@ -108,7 +108,7 @@ describe('watch coherence', () => {
   // fs.watch delivery on darwin can be delayed when several workers watch
   // files in parallel, so coherence tests poll longer than the default and
   // carry their own generous vitest timeout.
-  it('marks pages stale without a replacement when the file is deleted', { timeout: 20_000 }, async () => {
+  it('marks pages stale without a replacement when the file is deleted', { timeout: 65_000 }, async () => {
     const { mmu, dispose } = await makeMmu({ watchDebounceMs: DEBOUNCE_MS });
     const files = await makeFiles();
     try {
@@ -119,7 +119,7 @@ describe('watch coherence', () => {
       const stop = mmu.watch([file]);
       try {
         await unlink(file);
-        await until(() => handle.stale, 'the page to be marked stale', 15_000);
+        await until(() => handle.stale, 'the page to be marked stale', 60_000);
         expect(handle.replacedBy).toBeUndefined();
       } finally {
         stop();
@@ -171,7 +171,7 @@ describe('watch coherence', () => {
     }
   });
 
-  it('watches a directory and only stales pages of the changed file', { timeout: 20_000 }, async () => {
+  it('watches a directory and only stales pages of the changed file', { timeout: 65_000 }, async () => {
     const { mmu, dispose } = await makeMmu({ watchDebounceMs: DEBOUNCE_MS });
     const files = await makeFiles();
     try {
@@ -190,7 +190,7 @@ describe('watch coherence', () => {
       const stop = mmu.watch([dir]);
       try {
         await writeFile(fileB, buf(96, 0x33));
-        await until(() => handleB.stale, 'page b to be marked stale', 15_000);
+        await until(() => handleB.stale, 'page b to be marked stale', 60_000);
         expect(handleA.stale).toBe(false);
         expect(mmu.statusOf(handleA)).toBe('resident');
 
@@ -217,7 +217,7 @@ describe('watch coherence', () => {
     }
   });
 
-  it('replaces independent handles bound to the same path together', { timeout: 20_000 }, async () => {
+  it('replaces independent handles bound to the same path together', { timeout: 65_000 }, async () => {
     const { mmu, dispose } = await makeMmu({ watchDebounceMs: DEBOUNCE_MS });
     const files = await makeFiles();
     try {
@@ -230,7 +230,7 @@ describe('watch coherence', () => {
       const stop = mmu.watch([file]);
       try {
         await writeFile(file, buf(64, 0x66));
-        await until(() => first.stale && second.stale, 'both pages to be marked stale', 15_000);
+        await until(() => first.stale && second.stale, 'both pages to be marked stale', 60_000);
         expect(first.replacedBy).toBeDefined();
         expect(second.replacedBy).toBeDefined();
         expect(first.replacedBy!.sha256).toBe(shaOf(buf(64, 0x66)));

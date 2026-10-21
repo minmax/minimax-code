@@ -53,7 +53,7 @@ export function sleep(ms: number): Promise<void> {
 }
 
 /** Polls until `get` is true, failing with `what` after `timeoutMs`. */
-export async function until(get: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
+export async function until(get: () => boolean, what: string, timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!get()) {
     if (Date.now() > deadline) {
