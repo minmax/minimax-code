@@ -93,7 +93,10 @@ function tracedSqliteBackend(
 	return {
 		backend: {
 			appendBatch: async (drafts: readonly SqliteZstdEntryDraft[]): Promise<SqliteZstdCommitLike> => {
-				const commit = await real.appendBatch(drafts);
+				// The traced payloads are plain JSON by construction; the adapter's
+				// structural `payload: unknown` only loosens the backend's
+				// `EntryDraft.payload: JsonValue`, so the seam cast is honest.
+				const commit = await real.appendBatch(drafts as Parameters<typeof real.appendBatch>[0]);
 				events.push(`commit:${drafts.map((draft) => draft.id).join(',')}`);
 				return commit;
 			},
@@ -116,7 +119,7 @@ interface MemoryBackend {
 
 function memoryBackend(): MemoryBackend {
 	let seq = 0;
-	const state = { appendedIds: [], failCheckpoint: false };
+	const state: MemoryBackend['state'] = { appendedIds: [], failCheckpoint: false };
 	const backend: StorageWorkerBackend = {
 		async appendBatch(entries) {
 			state.appendedIds.push(...entries.map((item) => item.entryId));
