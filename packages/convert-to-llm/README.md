@@ -39,15 +39,21 @@ messages become `tool` records, images become deterministic placeholders.
   `hostMetadata.immediateSendBatchId` merge into one user record at the first
   member's position (`outbound-message-normalizer` semantics).
 
-`DurableEntry` mirrors `Entry` from `@mavis/durable-backend-sqlite-zstd`;
-`Segment` mirrors the context-projection segment shape (`{entryId, byteLen,
-kind}`). `CompiledEntry.byteLen` measures the serialized provider record (the
-wire segment body); the projection's `Segment.byteLen` measures the raw
-stored payload — both are kept available because budgeting (byte guard) and
-compilation (segment bytes) answer different questions. The contract types
-are declared locally on purpose: wave-2 packages do not link each other in
-`node_modules` until the integrator registers them (wave-1 precedent,
-`storage-worker/src/contracts.ts`).
+`DurableEntry` mirrors `Entry` from `@mavis/durable-backend-sqlite-zstd`
+(structural copy: the backend brands `seq` as `Seq`). `Segment` is re-exported
+type-only from `@mavis/context-projection`; `assembleManifestPayload`
+consumes that package's `ContextManifest` — but the name is deliberately NOT
+re-exported here, because `@mavis/wire-compiler` already exports an
+incompatible `ContextManifest` (its wire window: a readonly segment-reference
+array). Import the projection manifest type from `@mavis/context-projection`,
+its canonical owner. `CompiledEntry.byteLen` measures the serialized provider
+record (the wire segment body); the projection's `Segment.byteLen` measures
+the raw stored payload — both are kept available because budgeting (byte
+guard) and compilation (segment bytes) answer different questions.
+Cross-package imports are workspace-relative type-only on purpose: wave-2
+packages do not link each other in `node_modules` until the integrator
+registers them (wave-1 precedent, `storage-worker/src/contracts.ts`,
+`context-projection/src/projection.ts`).
 
 ## API
 
@@ -57,6 +63,7 @@ are declared locally on purpose: wave-2 packages do not link each other in
 | `convertEntryTails(entry, dialect?)` | Reminder blocks split out of a user entry (dedicated reminder entries return `[]`) |
 | `convertBatch(entries, dialect?)` | Merge a batch group into one user record |
 | `assemblePayload(entries, opts?)` | Ordered payload: stable prefix first, reminder tails last, with `AssembleStats` |
+| `assembleManifestPayload(entries, manifest, opts?)` | Assembly over the projection window: manifest segments plus the two model-visible control kinds (real manifests never carry `mcode.*` segments; `stats.modelVisibleSelected` reports the outside-the-window share), the compaction summary as the leading user record, duplicate/unresolved manifest segments rejected |
 | `serializeCompiledEntry(record)` | Fixed-key-order JSON body; `byteLen` measures exactly this |
 | `MINIMAX_M3_DIALECT`, `compileKey`, `compileBatchKey` | Dialect identity and cache keys |
 | `isAuditControlKind`, `isVisibleControlKind`, `isPlacedEntryKind`, `isReminderEntryKind` | Kind policy predicates |
@@ -77,4 +84,5 @@ pnpm typecheck
 
 Coverage mirrors the acceptance criteria: determinism (byte-identical records
 over repeated assembly), placed-entry dedup, tail positioning after the
-prefix (prefix bytes stable as reminders grow), audit exclusion, batching.
+prefix (prefix bytes stable as reminders grow), audit exclusion, batching,
+and manifest-window assembly.

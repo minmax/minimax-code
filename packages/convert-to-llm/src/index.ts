@@ -6,8 +6,10 @@
  *   compiler memoizes by `(entryId, dialect, normalizerVersion)`;
  * - {@link MINIMAX_M3_DIALECT} / {@link compileKey} — the built-in dialect
  *   and its cache-key rule;
- * - {@link assemblePayload} — ordered assembly with audit/control exclusion,
- *   placed-entry dedup, immediate-send batching and reminder tails;
+ * - {@link assemblePayload} / {@link assembleManifestPayload} — ordered
+ *   assembly with audit/control exclusion, placed-entry dedup, immediate-send
+ *   batching and reminder tails, over a raw entry list or over the projection
+ *   window (`ContextManifest`);
  * - helpers the wire compiler and the input-delivery-status projection reuse.
  */
 
@@ -20,8 +22,14 @@ export type {
   JsonValue,
   ProviderRole,
   ProviderToolCall,
-  Segment,
 } from './types.js';
+export type { Segment } from './types.js';
+// Note: `ContextManifest` is deliberately NOT re-exported here. The name is
+// already public from `@mavis/wire-compiler` with an INCOMPATIBLE shape (the
+// wire window: a readonly segment-reference array, `wire-compiler/src/types.ts`),
+// while `assembleManifestPayload` consumes the projection manifest (an object
+// with head/segments/compaction). Import that one from
+// `@mavis/context-projection` — its canonical owner.
 export type {
   DecodedEntryPayload,
   DecodedMessage,
@@ -53,4 +61,4 @@ export {
   serializeCompiledEntry,
   splitUserReminders,
 } from './reminders.js';
-export { assemblePayload, type AssembleOptions } from './assemble.js';
+export { assemblePayload, assembleManifestPayload, type AssembleOptions } from './assemble.js';

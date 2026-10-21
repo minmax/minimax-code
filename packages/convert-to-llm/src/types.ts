@@ -2,12 +2,13 @@
  * Contract types of the per-entry convert-to-llm stage.
  *
  * The input {@link DurableEntry} mirrors `Entry` from
- * `@mavis/durable-backend-sqlite-zstd/src/types.ts`, and {@link Segment}
- * mirrors the segment record of `@mavis/context-projection`
- * (`ContextManifest.segments`). The shapes are kept structurally identical on
- * purpose: wave-2 packages do not link each other in `node_modules` until the
- * integrator registers them, so every package declares the agreed contract
- * locally (same precedent as `packages/storage-worker/src/contracts.ts`).
+ * `@mavis/durable-backend-sqlite-zstd/src/types.ts` (structural copy: the
+ * backend's `seq` is a branded `Seq`, and per-entry test fixtures build plain
+ * numbers). {@link Segment} is NOT copied: it is re-exported type-only from
+ * `@mavis/context-projection` so the manifest contract stays single-sourced —
+ * the same workspace-relative type-only import precedent as
+ * `packages/storage-worker/src/contracts.ts` (durable-core) and
+ * `packages/context-projection/src/projection.ts` (backend types).
  */
 
 /**
@@ -39,15 +40,14 @@ export interface DurableEntry {
   readonly ordinal: number;
 }
 
-/** Manifest segment reference; mirrors the context-projection `Segment` shape. */
-export interface Segment {
-  /** Entry the segment was compiled from. */
-  readonly entryId: string;
-  /** Byte length as defined by the projection (raw payload serialization). */
-  readonly byteLen: number;
-  /** Entry kind the segment belongs to. */
-  readonly kind: string;
-}
+/**
+ * Manifest segment reference, single-sourced from `@mavis/context-projection`
+ * (`ContextManifest.segments`). Type-only: no runtime dependency on the
+ * projection package. Note that `Segment.byteLen` measures the raw stored
+ * payload for budgeting; {@link CompiledEntry.byteLen} measures the outgoing
+ * provider bytes — the two numbers are intentionally different axes.
+ */
+export type { Segment } from '../../context-projection/src/index.js';
 
 /** Provider-side tool call projected from an assistant `toolCall` content block. */
 export interface ProviderToolCall {
@@ -151,6 +151,20 @@ export interface AssembleStats {
   readonly tailBytes: number;
   /** Total serialized payload bytes. */
   readonly totalBytes: number;
+  /**
+   * Manifest-path only ({@link assembleManifestPayload}): segments the
+   * manifest declared, all of which were compiled.
+   */
+  readonly manifestSegments?: number;
+  /**
+   * Manifest-path only: entries admitted from the log because they are one of
+   * the two model-visible control kinds — real manifests never carry
+   * `mcode.*` segments, so this is the measurable signal of how much of the
+   * payload comes from outside the projection window.
+   */
+  readonly modelVisibleSelected?: number;
+  /** Manifest-path only: whether the compaction summary became the leading user record. */
+  readonly compactionSummaryIncluded?: boolean;
 }
 
 /** Ordered payload assembly over a list of durable entries. */
