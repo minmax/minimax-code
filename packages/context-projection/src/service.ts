@@ -18,7 +18,8 @@
 // caller of `appendBatch` already has in hand.
 
 // Types come straight from the backend's `src/types.ts` — see the note in
-// `projection.ts` for why the package specifier is avoided for now.
+// `projection.ts` for why the package specifier is avoided until `dist/`
+// exists.
 
 import type { Commit, Entry, Seq } from '../../durable-backend-sqlite-zstd/src/types.js';
 import { SEQ_AT_START } from '../../durable-backend-sqlite-zstd/src/types.js';
@@ -51,12 +52,12 @@ export interface ApplyResult {
 	 * none — they are filtered out of the LLM context).
 	 */
 	readonly delta: readonly Segment[];
-		/**
-		 * Whether the commit carried a control entry that rewrote the derived
-		 * view (compaction cut / pruning). The fold itself is incremental on
-		 * every commit — this flag only marks the manifest rewrite.
-		 */
-		readonly rebuilt: boolean;
+	/**
+	 * Whether the commit carried a control entry that rewrote the derived
+	 * view (compaction cut / pruning). The fold itself is incremental on
+	 * every commit — this flag only marks the manifest rewrite.
+	 */
+	readonly rebuilt: boolean;
 }
 
 /**

@@ -4,10 +4,12 @@ Derived context view over the durable delta log: one manifest fold, one
 incremental projector, one resume capsule. Types only — `Entry`/`Commit` are
 imported from `@mavis/durable-backend-sqlite-zstd`'s `src/types.ts` (the
 module the wave-1 contract pins); this package never opens a database.
-Until the backend's `backend.ts` passes this strict typecheck (a pre-existing
-wave-1 issue), the types are imported from the source file directly rather
-than through the package specifier, whose `index.ts` would drag `backend.ts`
-into the program.
+The types are imported from the workspace-relative source file rather than
+through the package specifier: the specifier's `import` condition resolves
+to `dist/index.js`, which does not exist until the integrator builds the
+workspace (and whose `index.ts` would also drag `backend.ts` into the
+program). Switching to the specifier is a two-line change once `dist/`
+exists.
 
 ## Contract
 

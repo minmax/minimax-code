@@ -9,10 +9,10 @@
 
 // Types come straight from the backend's `src/types.ts` — the module the
 // wave-1 contract pins — rather than through the package's `.` export,
-// because the export's `index.ts` transitively drags `backend.ts` (which
-// currently fails this strict typecheck, a pre-existing wave-1 issue) into
-// the program. Switching to the package specifier is a two-line change once
-// that is fixed.
+// because the export's `import` condition resolves to `dist/index.js`, which
+// does not exist until the integrator builds the workspace (and its `index.ts`
+// would also drag `backend.ts` into the program). Switching to the package
+// specifier is a two-line change once `dist/` exists.
 
 import type { Entry, Seq } from '../../durable-backend-sqlite-zstd/src/types.js';
 import { SEQ_AT_START } from '../../durable-backend-sqlite-zstd/src/types.js';
