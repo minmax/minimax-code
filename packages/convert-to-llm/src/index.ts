@@ -42,6 +42,7 @@ export {
   compileBatchKey,
   compileKey,
 } from './dialect.js';
+export { decodeEntryPayload } from './decode.js';
 export {
   isAuditControlKind,
   isPlacedEntryKind,

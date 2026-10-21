@@ -3,6 +3,16 @@
 // wire-compiler — and the composed pipeline satisfies the invariants the
 // gates rely on: incremental prepare ≡ one-shot prepare, window-bounded
 // content retention, byte-guard on the measured path, capsule resume.
+//
+// Wave-2 round-1 additions (steering D+C seam contract): the two
+// model-visible control kinds reach the provider payload exactly as
+// `assembleManifestPayload` (convert-to-llm) emits them —
+// `mcode.owner-input.placed` exactly once (inputEntryId dedup, first log
+// occurrence wins, recovery-artifact duplicates dropped) and
+// `mcode.system-reminder` strictly after the stable prefix — and the seam's
+// compiled body is BYTE-IDENTICAL to `assembleManifestPayload` on the same
+// window (pinned, not assumed: the two manifest assembly paths must never
+// fork).
 
 import { describe, expect, it } from 'vitest';
 
@@ -14,6 +24,10 @@ import {
   commitOfEntries,
   prepareContextWire,
 } from './context-wire.js';
+import {
+  assembleManifestPayload,
+  serializeCompiledEntry,
+} from '../../../../../convert-to-llm/src/index.js';
 import { WireBudgetExceeded } from '../../../../../wire-compiler/src/index.js';
 
 let counter = 0;
@@ -29,6 +43,25 @@ function turn(seq: number, text: string): Entry[] {
     entry('pi.user', { model: [{ role: 'user', content: text }] }, seq, 0),
     entry('pi.assistant', { model: [{ role: 'assistant', content: [{ type: 'text', text: `ok: ${text}` }] }] }, seq, 1),
   ];
+}
+
+/** The steering placed entry (`mcode.owner-input.placed`) — the executed user input. */
+function placed(text: string, inputEntryId: string, seq: number, ordinal: number): Entry {
+  return entry('mcode.owner-input.placed', { inputEntryId, model: [{ role: 'user', content: text, timestamp: 5 }] }, seq, ordinal);
+}
+
+/** A dedicated system-reminder entry (converts to a tail record). */
+function reminder(text: string, seq: number, ordinal: number): Entry {
+  return entry('mcode.system-reminder', { text }, seq, ordinal);
+}
+
+/** The assembled payload bytes of the reference manifest path, record for record. */
+function referenceBody(entries: readonly Entry[], manifest: ReturnType<ContextWirePipeline['manifest']>): Buffer {
+  return Buffer.concat(
+    assembleManifestPayload(entries, manifest).records.map((record) =>
+      Buffer.from(`${serializeCompiledEntry(record)}\n`, 'utf8'),
+    ),
+  );
 }
 
 describe('ContextWirePipeline (runtime composition of the Ф2 context path)', () => {
@@ -146,5 +179,112 @@ describe('ContextWirePipeline (runtime composition of the Ф2 context path)', ()
     expect(second.segments.every((stat) => stat.cacheHit)).toBe(true);
     // Cache hits carry no sha256 — the hot path pays no per-segment hashing.
     expect(second.segments.every((stat) => stat.sha256 === undefined)).toBe(true);
+  });
+});
+
+describe('ContextWirePipeline steering D+C seam (model-visible control kinds)', () => {
+  it('admits the placed entry exactly once — a recovery-artifact duplicate is dropped', () => {
+    // A crash between the admission commit and the delivery-index update can
+    // replay the placement: two durable placed entries share one
+    // inputEntryId. The payload must carry the input EXACTLY once (first log
+    // occurrence wins), and the seam must agree with convert-to-llm.
+    const pipeline = new ContextWirePipeline();
+    const log: Entry[] = [
+      ...turn(1, 'question'),
+      placed('steer text', 'in_1', 2, 0),
+      // Recovery artifact: same inputEntryId, fresh entry id, corrupt copy.
+      placed('corrupt copy', 'in_1', 3, 0),
+      ...turn(4, 'after steer'),
+    ];
+    for (let seq = 1; seq <= 4; seq += 1) {
+      const batch = log.filter((candidate) => candidate.seq === seq);
+      if (batch.length > 0) pipeline.applyCommit(commitOfEntries(seq, batch));
+    }
+
+    const prepared = pipeline.prepare();
+    const lines = prepared.body.toString('utf8').trimEnd().split('\n');
+    const steerLines = lines.filter((line) => line.includes('steer text'));
+    expect(steerLines).toHaveLength(1);
+    expect(prepared.body.toString('utf8')).not.toContain('corrupt copy');
+    // The audit receipt never reaches the payload even if it logs.
+    expect(prepared.body.toString('utf8')).not.toContain('mcode.owner-input.received');
+
+    // Incremental ≡ one-shot ≡ the reference manifest path, byte for byte.
+    expect(prepared.body.equals(prepareContextWire(log).body)).toBe(true);
+    expect(prepared.body.equals(referenceBody(log, prepared.manifest))).toBe(true);
+  });
+
+  it('positions reminder records strictly after the stable cache prefix', () => {
+    const pipeline = new ContextWirePipeline();
+    const log: Entry[] = [
+      ...turn(1, 'before'),
+      // A reminder logged BETWEEN turns still becomes a tail record.
+      reminder('context usage is high', 2, 0),
+      // An embedded block inside user text splits: residual prefix + tail.
+      entry('pi.user', { model: [{ role: 'user', content: 'real ask <system-reminder>embedded note</system-reminder>' }] }, 3, 0),
+      ...turn(4, 'after'),
+    ];
+    for (let seq = 1; seq <= 4; seq += 1) {
+      pipeline.applyCommit(commitOfEntries(seq, log.filter((candidate) => candidate.seq === seq)));
+    }
+
+    const prepared = pipeline.prepare();
+    const text = prepared.body.toString('utf8');
+    const lines = text.trimEnd().split('\n');
+    // The reference path owns the ordering contract: every tail record sits
+    // after every prefix record. Recompute the split from the reference.
+    const reference = assembleManifestPayload(log, prepared.manifest);
+    expect(reference.tails.length).toBeGreaterThanOrEqual(2);
+    const tailLines = reference.tails.map((record) => `${serializeCompiledEntry(record)}\n`);
+    // The body ends with exactly the tail section, in reference order.
+    expect(text.endsWith(tailLines.join(''))).toBe(true);
+    // No reminder bytes leak into the prefix section.
+    const prefixText = lines.slice(0, lines.length - reference.tails.length).join('\n');
+    expect(prefixText).not.toContain('context usage is high');
+    expect(prefixText).not.toContain('embedded note');
+    expect(prefixText).toContain('real ask');
+    // Both manifests agree byte for byte.
+    expect(prepared.body.equals(referenceBody(log, prepared.manifest))).toBe(true);
+    expect(prepared.body.equals(prepareContextWire(log).body)).toBe(true);
+  });
+
+  it('cuts control pages at a compaction exactly like the retained slice does', () => {
+    const pipeline = new ContextWirePipeline();
+    const firstTurn = turn(1, 'old question');
+    const preSteer = placed('old steer', 'in_old', 1, 2); // before the future cut
+    pipeline.applyCommit(commitOfEntries(1, [...firstTurn, preSteer]));
+    const keptTurn = turn(2, 'kept question');
+    pipeline.applyCommit(commitOfEntries(2, keptTurn));
+    const keptId = keptTurn[0]!.id;
+    const checkpoint = entry(
+      'mcode.compaction',
+      { summary: 'summary of turn 1', firstKeptEntryId: keptId, systemMessage: null, isSplitTurn: false, tokensBefore: 100, estimatedTokensAfter: 20, createdAtMs: 1 },
+      3,
+      0,
+    );
+    pipeline.applyCommit(commitOfEntries(3, [checkpoint]));
+    const postSteer = placed('new steer', 'in_new', 4, 0);
+    const postReminder = reminder('fresh reminder', 4, 1);
+    const controlBatch = [postSteer, postReminder];
+    pipeline.applyCommit(commitOfEntries(4, controlBatch));
+
+    const log: Entry[] = [...firstTurn, preSteer, ...keptTurn, checkpoint, ...controlBatch];
+    const prepared = pipeline.prepare();
+    const text = prepared.body.toString('utf8');
+    // The cut prefix's steering went with it; the window's own control stayed.
+    expect(text).toContain('new steer');
+    expect(text).toContain('fresh reminder');
+    expect(text).not.toContain('old steer');
+    expect(prepared.manifest.compaction).toEqual({ summary: 'summary of turn 1', firstKeptEntryId: keptId });
+
+    // Byte equality holds on the retained slice the capsule serves (from
+    // firstKeptEntryId to head — the resumed pipeline's exact input).
+    const sliceStart = log.findIndex((candidate) => candidate.id === keptId);
+    const slice = log.slice(sliceStart);
+    expect(prepared.body.equals(referenceBody(slice, prepared.manifest))).toBe(true);
+
+    // A pipeline resumed from the capsule compiles the same body.
+    const resumed = ContextWirePipeline.fromCapsule(pipeline.capsule(), slice);
+    expect(resumed.prepare().body.equals(prepared.body)).toBe(true);
   });
 });
