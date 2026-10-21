@@ -1,0 +1,24 @@
+{
+  "name": "@mavis/durable-seam",
+  "version": "0.1.0",
+  "description": "Mandatory steering seam over the wave-1 durable storage contract: atomic T_accept (submission + owner-input receipt + delivery index in one commit), CAS-guarded T_release with replayable prepared outcomes, and exactly-once T_complete tool finalization.",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
+  "private": true,
+  "license": "MIT"
+}
