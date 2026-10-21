@@ -35,14 +35,20 @@ describe('spawnDelegation (T_spawn)', () => {
     expect(result.childSubmissionId).toBe(`childsub-${result.delegationId.slice('del-'.length)}`);
 
     const entries = supervisorEntries(backend);
+    // The supervisor transition batch is unchanged (four records); the wait
+    // anchor of the wait-outcome authority (the durable seam) follows in its
+    // own committed batch of the same serialized spawn operation.
     expect(entries.map((entry) => entry.kind)).toEqual([
       KIND_SUPERVISOR_TASK,
       KIND_CHILD_CONVERSATION,
       KIND_SPAWNED,
       DELEGATION_DOCUMENT_KIND,
+      'mcode.delegation.wait-opened',
     ]);
-    // Atomicity: every record of the transition carries the same sequence.
-    const sequences = new Set(entries.map((entry) => entry.seq));
+    // Atomicity: every record of the transition carries the same sequence;
+    // the wait anchor commits separately (healed idempotently on replay).
+    const transitionEntries = entries.slice(0, 4);
+    const sequences = new Set(transitionEntries.map((entry) => entry.seq));
     expect(sequences.size).toBe(1);
 
     const childConversation = payloadsOfKind(backend, KIND_CHILD_CONVERSATION)[0]!;
@@ -112,8 +118,10 @@ describe('spawnDelegation (T_spawn)', () => {
 
     const ids = new Set(results.map((result) => result.delegationId));
     expect(ids.size).toBe(1);
-    // Exactly one spawn batch was committed (4 entries → head 1).
-    expect(backend.head).toBe(1);
+    // Exactly one spawn transition batch plus one wait-anchor batch of the
+    // wait-outcome authority (4 supervisor entries → head 1, anchor → head 2).
+    expect(backend.head).toBe(2);
+    expect(payloadsOfKind(backend, KIND_SPAWNED)).toHaveLength(1);
   });
 
   it('replays are durable: after reopening, the same key rejoins and the wait is re-materialized', async () => {

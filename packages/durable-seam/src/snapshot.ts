@@ -81,9 +81,15 @@ export function parseBackgroundOutcome(value: unknown, context: string): Backgro
 	const reason = value['reason'];
 	const initiator = value['initiator'];
 	if (typeof reason !== 'string' || typeof initiator !== 'string') throw malformed(context);
+	const waitId = asString(value['waitId'], context);
+	const operationId = value['operationId'];
 	return {
 		kind: 'background',
-		waitId: asString(value['waitId'], context),
+		// Entries written before the operation id existed replay under the
+		// deterministic default; new entries always carry it.
+		operationId:
+			typeof operationId === 'string' && operationId.length > 0 ? operationId : `release:${waitId}`,
+		waitId,
 		toolCallId: asString(value['toolCallId'], context),
 		conversationId: asString(value['conversationId'], context),
 		delegationId: asStringOrNull(value['delegationId'], context),

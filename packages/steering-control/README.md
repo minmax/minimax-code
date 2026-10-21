@@ -63,8 +63,19 @@ durable writer (§3, "обязательный seam Ф1"):
 fence (§4): after a release the controller engages it; while engaged the
 gateway must refuse new conflicting parent effects immediately with the
 `DELEGATION_EFFECT_BLOCKED` tool-error (plus task IDs and a way forward),
-never by parking the effect until the child finishes. Disengagement after
-proven child completion / safe stop is the supervisor's concern.
+never by parking the effect until the child finishes. Disengagement is owned
+by the delegation supervisor and happens on PROVEN child terminal facts via
+the optional `disengage` hook below — never on a stop signal.
+
+**Adapter over the wave-3 seam.** `createDurableSeamControlSeam(durableSeam)`
+implements the whole `DelegationControlSeam` contract on top of
+`@mavis/durable-seam` — the wait-outcome authority that writes the ONE
+`mcode.delegation.backgrounded` entry and the ONE tool-result per waitId.
+The adapter applies the FIXED stale-refusal mapping rule (see the
+`DelegationControlSeam` contract): seam `VERSION_CONFLICT` / `OWNER_LOST` /
+`GENERATION_SEALED` surface as `StaleStateVersionError` (`stale-version`:
+visible blocker, refresh-and-retry); everything else passes through — a CAS
+conflict never degrades into a generic `failed`.
 
 ## Guarantees covered by the suite
 
@@ -87,6 +98,14 @@ proven child completion / safe stop is the supervisor's concern.
   (`replayed` on redelivery), never restarts the child, re-engages the fence.
 - **Priorities P0–P4**: queued cancel/permission preempts queued lower lanes;
   a running atomic job is never interrupted.
+- **Real-clock, real-storage gates** live outside this suite:
+  `scripts/bench/bench-steering.mjs` measures Enter → durable saved-ack and
+  saved-ack → committed release on the sqlite-zstd backend (§6.1/§6.2,
+  thresholds in `scripts/bench/thresholds.json`), and the in-process e2e
+  (`packages/local-runtime-v2/test/integration/steering-delegation.e2e.test.ts`)
+  measures Enter → start of the next parent provider request through the
+  turn-system composition, plus the kill -9 steering crash matrix and the
+  10 000-schedule race gate in this package's `test/`.
 
 ## Package wiring (integrator)
 

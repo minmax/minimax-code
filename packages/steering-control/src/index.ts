@@ -19,6 +19,11 @@ export {
 } from './errors.js';
 export { createReactiveControl } from './reactive-control.js';
 export {
+	createDurableSeamControlSeam,
+	mapDurableSeamError,
+	type DurableSeamAdapterOptions,
+} from './durable-seam-adapter.js';
+export {
 	DELEGATION_EFFECT_BLOCKED,
 	type ActiveBlocker,
 	type BackgroundHandle,
@@ -27,6 +32,9 @@ export {
 	type DelegationControlSeam,
 	type DelegationFenceRef,
 	type EffectFence,
+	type FenceDisengageRef,
+	type FenceDisengageRequest,
+	type FenceDisengagement,
 	type FenceEngageRequest,
 	type FenceEngagement,
 	type PreparedRelease,

@@ -383,6 +383,12 @@ export type CompletionResult = {
   readonly stateVersion: number;
   /** True when the completion was already committed (idempotent replay). */
   readonly replayed: boolean;
+  /**
+   * Effect-fence disengagement attempted after the proven terminal fact
+   * (§4); `undefined` when no fence is wired or the parent conversation is
+   * unknown (fork branches).
+   */
+  readonly fence?: FenceDisengagement;
 };
 
 /** One node of a stop cascade. */
@@ -437,10 +443,57 @@ export type ChildTerminalResult = {
   readonly stateVersion: number;
   /** True when the same terminal was already committed (replay). */
   readonly replayed: boolean;
+  /**
+   * Effect-fence disengagement attempted after the proven terminal fact
+   * (§4); `undefined` when no fence is wired or the parent conversation is
+   * unknown (fork branches).
+   */
+  readonly fence?: FenceDisengagement;
 };
 
 /** Read-only view of a delegation record (projection or durable replay). */
 export type DelegationView = DelegationRecord;
+
+// ---------------------------------------------------------------------------
+// Effect fence disengagement (steering-design-sol.md §4/§5)
+// ---------------------------------------------------------------------------
+
+/**
+ * One delegation whose fence entry may be lifted: the child reached a PROVEN
+ * terminal fact (never a mere stop signal — §5 "fence снимается после
+ * доказанного завершения, не после отправки сигнала").
+ */
+export type FenceDisengageRef = {
+  readonly delegationId: string;
+  readonly waitId: string;
+  readonly toolCallId: string | null;
+};
+
+/**
+ * Request the supervisor issues on a terminal transition so the integrator's
+ * permission gateway can lift the parent's effect-fence entries.
+ */
+export type FenceDisengageRequest = {
+  readonly parentConversationId: string;
+  readonly reason: 'child_completed' | 'child_stopped' | 'child_failed';
+  readonly refs: readonly FenceDisengageRef[];
+};
+
+/** Advisory result of a disengage call (never rolls back the terminal). */
+export type FenceDisengagement = {
+  readonly status: 'disengaged' | 'failed';
+  readonly error?: string;
+};
+
+/**
+ * Structural surface the supervisor calls after committing a child terminal
+ * fact. Implemented by the integrator's permission gateway (the engage side
+ * lives in `@mavis/steering-control`'s `EffectFence.disengage`); failures are
+ * reported, never thrown into the terminal transition.
+ */
+export interface EffectFenceDisengage {
+  disengage(request: FenceDisengageRequest): Promise<FenceDisengagement>;
+}
 
 // ---------------------------------------------------------------------------
 // Recovery (§3 "recovery до следующего parent generation")

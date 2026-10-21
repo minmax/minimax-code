@@ -40,6 +40,13 @@ const BENCHES = [
   // prep.payloadBytes is the PROVIDER PAYLOAD byte truth (dialect-normalized
   // wire segments), gated at <= 32 MB (messages) / <= 12 MB (images).
   { id: 'prep', script: 'bench-prep.mjs' },
+  // Ф3 steering hot path (steering-design-sol.md §6.1/§6.2) on REAL clocks
+  // and the REAL sqlite-zstd backend: Enter → durable saved-ack
+  // (steering.enterSavedAckP95Ms <= 100, P99 <= 250) and saved-ack →
+  // committed release (steering.releaseP99Ms <= 250). Synthetic-admission
+  // corpus, no fixture dependency; the composed in-process §6.2 span
+  // (enter → release → finalized tool) is reported for contrast.
+  { id: 'steering', script: 'bench-steering.mjs' },
 ];
 
 const checkIndex = process.argv.indexOf('--check');

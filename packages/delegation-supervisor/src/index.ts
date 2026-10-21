@@ -63,7 +63,15 @@ export type {
   StoredSupervisorEntry,
   SupervisorEntryDraft,
 } from './log.js';
-export { DelegationsIndex, isSupervisorKind, cloneWorking, snapshotRecord } from './document.js';
+export type {
+  ForegroundWaitSeam,
+  ForegroundWaitSeamDraft,
+  ForegroundWaitSeamPrepared,
+  ForegroundWaitSeamReleaseInput,
+  ForegroundWaitSeamState,
+  ForegroundWaitSeamView,
+} from './wait-seam.js';
+export { DelegationsIndex, entriesRelatingTo, isSeamShapedBackgroundedPayload, isSupervisorKind, cloneWorking, snapshotRecord } from './document.js';
 export {
   DELEGATION_DOCUMENT_KIND,
   DELEGATION_ENTRY_KIND_PREFIX,
@@ -111,6 +119,12 @@ export {
   DelegationSupervisorError,
   SupervisorClosedError,
 } from './errors.js';
+export type {
+  EffectFenceDisengage,
+  FenceDisengageRef,
+  FenceDisengageRequest,
+  FenceDisengagement,
+} from './types.js';
 export type {
   BackgroundHandle,
   ChildConversationPayload,

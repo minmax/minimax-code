@@ -21,5 +21,8 @@
     "vitest": "^2"
   },
   "private": true,
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@mavis/durable-seam": "workspace:^"
+  }
 }

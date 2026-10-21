@@ -157,6 +157,8 @@ type PreparedPayload = {
 	waitId: string;
 	toolCallId: string;
 	stateVersion: number;
+	/** Identity of the release decision (deterministic default per waitId). */
+	operationId: string;
 	outcome: BackgroundOutcome;
 	outcomeHash: string;
 };
@@ -533,6 +535,7 @@ export class DurableSeam {
 			}
 			const outcome: BackgroundOutcome = {
 				kind: 'background',
+				operationId: input.operationId ?? `release:${wait.waitId}`,
 				waitId: wait.waitId,
 				toolCallId: wait.toolCallId,
 				conversationId: wait.conversationId,
@@ -550,6 +553,7 @@ export class DurableSeam {
 				waitId: wait.waitId,
 				toolCallId: wait.toolCallId,
 				stateVersion: wait.stateVersion + 1,
+				operationId: outcome.operationId,
 				outcome,
 				outcomeHash,
 			};
@@ -881,7 +885,22 @@ function applyReplayEntry(
 			return;
 		}
 		case SEAM_ENTRY_KINDS.backgrounded: {
-			const payload = parsePreparedPayload(entry.payload, entry.id);
+			// `mcode.delegation.backgrounded` is THE canonical T_release record
+			// kind, but this seam is not the only historical writer of the kind
+			// string: pre-unification supervisor projections carried a flat
+			// `{delegationId, ...}` payload. Those are not seam decisions —
+			// skip them instead of failing recovery on a foreign shape. A
+			// seam decision always carries `waitId` + `outcome` + `outcomeHash`.
+			const candidate = entry.payload;
+			if (
+				!isObject(candidate) ||
+				typeof candidate['waitId'] !== 'string' ||
+				!isObject(candidate['outcome']) ||
+				typeof candidate['outcomeHash'] !== 'string'
+			) {
+				return;
+			}
+			const payload = parsePreparedPayload(candidate, entry.id);
 			const wait = waits.get(payload.waitId);
 			if (wait !== undefined && payload.stateVersion > wait.stateVersion) {
 				wait.state = 'backgrounded';
@@ -969,10 +988,14 @@ function parseWaitOpenedPayload(value: unknown, entryId: string): WaitOpenedPayl
 
 function parsePreparedPayload(value: unknown, entryId: string): PreparedPayload {
 	if (!isObject(value)) throw malformedPayload(entryId);
+	const waitId = requireString(value['waitId'], entryId);
 	return {
-		waitId: requireString(value['waitId'], entryId),
+		waitId,
 		toolCallId: requireString(value['toolCallId'], entryId),
 		stateVersion: requireSafeInteger(value['stateVersion'], entryId),
+		// Entries written before the operation id existed replay under the
+		// deterministic default; new entries always carry it.
+		operationId: optionalString(value['operationId']) ?? `release:${waitId}`,
 		outcome: parseBackgroundOutcome(value['outcome'], entryId),
 		outcomeHash: requireString(value['outcomeHash'], entryId),
 	};

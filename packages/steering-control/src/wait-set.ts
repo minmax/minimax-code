@@ -91,13 +91,14 @@ class WaitHandleImpl implements InternalWaitHandle {
 
 	constructor(
 		key: WaitKey,
+		waitId: string,
 		stateVersion: number,
 		delegationId: string | undefined,
 		registeredAtMs: number,
 		private readonly onSettled: (handle: WaitHandleImpl) => void,
 	) {
 		this.key = key;
-		this.waitId = deriveWaitId(key);
+		this.waitId = waitId;
 		this.stateVersionValue = stateVersion;
 		this.delegationId = delegationId;
 		this.registeredAtMs = registeredAtMs;
@@ -221,7 +222,13 @@ export function createForegroundWaitSetRegistry(
 				parentRunId: registration.parentRunId,
 				toolCallId: registration.toolCallId,
 			};
-			const waitId = deriveWaitId(key);
+			// The durable wait identity: the integrator's (spawn-fixed) when
+			// provided, the derived default otherwise — the release decision is
+			// keyed by whatever the wait was anchored under.
+			const waitId =
+				registration.waitId !== undefined && registration.waitId.length > 0
+					? registration.waitId
+					: deriveWaitId(key);
 
 			let runs = rounds.get(key.parentConversationId);
 			const existing = runs?.get(key.parentRunId)?.get(waitId);
@@ -246,6 +253,7 @@ export function createForegroundWaitSetRegistry(
 			}
 			const handle = new WaitHandleImpl(
 				key,
+				waitId,
 				registration.stateVersion,
 				registration.delegationId,
 				nowMs,

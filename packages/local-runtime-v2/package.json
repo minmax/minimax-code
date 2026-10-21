@@ -111,7 +111,11 @@
     "proper-lockfile": "^4",
     "typebox": "1.1.38",
     "smol-toml": "1.7.1",
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "@mavis/steering-control": "workspace:^",
+    "@mavis/durable-seam": "workspace:^",
+    "@mavis/delegation-supervisor": "workspace:^",
+    "@mavis/input-delivery": "workspace:^"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

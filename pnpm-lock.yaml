@@ -857,6 +857,18 @@ importers:
         specifier: ^2.9.0
         version: 2.9.0
     devDependencies:
+      '@mavis/delegation-supervisor':
+        specifier: workspace:^
+        version: link:../delegation-supervisor
+      '@mavis/durable-seam':
+        specifier: workspace:^
+        version: link:../durable-seam
+      '@mavis/input-delivery':
+        specifier: workspace:^
+        version: link:../input-delivery
+      '@mavis/steering-control':
+        specifier: workspace:^
+        version: link:../steering-control
       '@modelcontextprotocol/sdk':
         specifier: ^1.30.0
         version: 1.30.0(zod@4.6.5)
@@ -921,6 +933,10 @@ importers:
         version: 2.1.9(@types/node@20.19.43)
 
   packages/steering-control:
+    dependencies:
+      '@mavis/durable-seam':
+        specifier: workspace:^
+        version: link:../durable-seam
     devDependencies:
       '@types/node':
         specifier: ^20

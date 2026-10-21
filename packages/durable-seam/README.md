@@ -88,7 +88,7 @@ All app records are plain entries of the storage contract:
 | `mcode.owner-input.submission` | native input submission record (dedup anchor) |
 | `mcode.owner-input.received` | immutable receipt: ids, route, `whenBusy`, `contentHash`, content. No `model`, no `head`, no `edits` — it never shifts the model boundary |
 | `mcode.delegation.wait-opened` | foreground wait anchor |
-| `mcode.delegation.backgrounded` | T_release decision: control entry + prepared background outcome |
+| `mcode.delegation.backgrounded` | T_release decision: control entry + prepared background outcome. THE canonical record of the wait outcome — this seam is its single writer; the delegation supervisor projects it (its index document is a different kind) and its reducer joins these entries by waitId. The prepared outcome carries the release `operationId` (§3: "один переход с одним operationId/CAS"), deterministic `release:<waitId>` when the caller omits one. Legacy pre-unification flat `{delegationId, …}` entries of the same kind are skipped on replay (not seam decisions) |
 | `mcode.delegation.tool-result` | T_complete: the one tool result of a `toolCallId` |
 | `mcode.input-delivery.settled` | terminal removal from the bounded active delivery index |
 | `mcode.seam.snapshot` | bounded active-state snapshot shipped inside every seam commit |

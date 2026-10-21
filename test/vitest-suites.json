@@ -294,7 +294,13 @@
       "packages/steering-control/test/finalize-failure.test.ts",
       "packages/steering-control/test/release-latency.test.ts",
       "packages/steering-control/test/single-outcome.test.ts",
-      "packages/steering-control/test/wait-set.test.ts"
+      "packages/steering-control/test/wait-set.test.ts",
+      "packages/local-runtime-v2/test/integration/steering-delegation.e2e.test.ts",
+      "packages/steering-control/test/durable-seam-adapter.test.ts",
+      "packages/steering-control/test/composed-single-outcome.test.ts",
+      "packages/delegation-supervisor/test/unit/fence-disengage.test.ts",
+      "packages/steering-control/test/kill-9-steering-crash.test.ts",
+      "packages/steering-control/test/races-10k.test.ts"
     ],
     "status-contract": [
       "packages/tui/test/unit/tui-build-mode-contract.test.ts"

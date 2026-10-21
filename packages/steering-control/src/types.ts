@@ -49,6 +49,14 @@ export interface WaitRegistration {
 	readonly stateVersion: number;
 	/** Delegation identity, when the caller already has one. */
 	readonly delegationId?: string;
+	/**
+	 * The durable wait identity, when the spawn path already fixed one
+	 * (the delegation supervisor derives `wait-<digest>` at T_spawn and
+	 * anchors the SAME id with the durable seam). Defaults to
+	 * {@link deriveWaitId}`(key)`; whatever is chosen here MUST be the id the
+	 * wait was anchored under — the release decision is keyed by it.
+	 */
+	readonly waitId?: string;
 }
 
 /** The single outcome of a wait — chosen exactly once per waitId (§3). */
@@ -197,6 +205,24 @@ export interface PreparedReleaseQuery {
  * 5. `flushUrgent`, when implemented, forces the short control-plane flush
  *    bypassing the ≤200 ms batching window; the controller calls it when a
  *    committed steer wakes the release path.
+ *
+ * **Stale-refusal code (fixed mapping rule).** This package classifies a
+ * refused release through `isStaleStateVersionError` — the `code
+ * 'STALE_STATE_VERSION'` — and ONLY that shape routes into the
+ * `stale-version` branch (visible blocker, refresh-and-retry). An
+ * implementation that wraps the wave-3 `@mavis/durable-seam` must therefore
+ * map, before surfacing an error to this contract:
+ *
+ * - durable-seam `VERSION_CONFLICT` (the `stateVersion` CAS did not hold,
+ *   `durable-seam/src/errors.ts` `VersionConflictError`) →
+ *   `StaleStateVersionError`;
+ * - durable-seam `OWNER_LOST` / `GENERATION_SEALED` (this writer lost the
+ *   single-writer epoch / generation) → `StaleStateVersionError`;
+ * - everything else surfaces unchanged (generic `failed`).
+ *
+ * `createDurableSeamControlSeam` (this package) implements exactly this
+ * rule over `DurableSeam`; a hand-rolled integrator seam must reproduce it
+ * (single-outcome.test.ts pins the visible semantics of the stale branch).
  */
 export interface DelegationControlSeam {
 	prepareRelease(request: ReleaseRequest): Promise<PreparedRelease>;
@@ -310,11 +336,49 @@ export interface FenceEngagement {
  * while engaged, new conflicting parent effects must be refused immediately
  * (never parked until the child finishes) with a standard tool-error carrying
  * {@link DELEGATION_EFFECT_BLOCKED}, the task IDs and a way forward.
- * Disengagement happens after proven child completion or confirmed safe stop
- * and is the supervisor's concern — not this package's.
+ *
+ * **Disengagement owner.** The fence is lifted after a PROVEN child
+ * terminal fact — never after a stop signal (§5: "fence снимается после
+ * доказанного завершения, не после отправки сигнала"). The owner of that
+ * proof is the delegation supervisor: its terminal transitions
+ * (`complete` / `recordChildTerminal`) call {@link EffectFence.disengage}
+ * after the terminal commit. This package never disengages on its own: a
+ * released wait keeps its fence until the supervised child reaches a
+ * terminal fact, so parent effects stay serialized for exactly as long as
+ * the child can still produce conflicting effects.
  */
 export interface EffectFence {
 	engage(request: FenceEngageRequest): Promise<FenceEngagement>;
+	/**
+	 * Lift the fence entries of delegations that reached a PROVEN terminal
+	 * fact. Called by the delegation supervisor after the terminal commit;
+	 * advisory semantics like {@link engage}: a failure is reported by the
+	 * caller and never rolls back the committed terminal transition.
+	 * Implementations decide per conversation when the LAST ref of a
+	 * conversation lifts that conversation's fence.
+	 */
+	disengage?(request: FenceDisengageRequest): Promise<FenceDisengagement>;
+}
+
+/** One released delegation whose fence entry may be lifted (terminal child). */
+export interface FenceDisengageRef {
+	readonly waitId: string;
+	readonly toolCallId: string | null;
+	readonly delegationId: string;
+}
+
+/** Disengagement request issued after a proven child terminal fact. */
+export interface FenceDisengageRequest {
+	readonly parentConversationId: string;
+	/** Why the fence lifts (`child_completed` / `child_stopped` / `child_failed`). */
+	readonly reason: 'child_completed' | 'child_stopped' | 'child_failed';
+	readonly refs: readonly FenceDisengageRef[];
+}
+
+export interface FenceDisengagement {
+	readonly status: 'disengaged' | 'failed';
+	/** Set for `failed`. */
+	readonly error?: string;
 }
 
 // ---------------------------------------------------------------------------

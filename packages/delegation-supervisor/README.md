@@ -17,8 +17,13 @@ child: running --> stopping --> terminal
 
 ```ts
 import { DelegationSupervisor, sqliteZstdDelegationLog } from '@mavis/delegation-supervisor';
+import { DurableSeam, sqliteZstdDurableLogPort } from '@mavis/durable-seam';
 
-const supervisor = await DelegationSupervisor.open({ log: sqliteZstdDelegationLog(backend) });
+// The wait-outcome authority (steering-design-sol.md §3): the durable seam
+// owns T_release / T_complete records; the supervisor routes through it and
+// only PROJECTS the committed decisions.
+const waitSeam = await DurableSeam.open(sqliteZstdDurableLogPort(backend));
+const supervisor = await DelegationSupervisor.open({ log: sqliteZstdDelegationLog(backend), waitSeam });
 
 // T_spawn — atomic: supervisor task + child conversation + delegation record
 // + foreground wait, one durable batch.
@@ -32,6 +37,10 @@ spawn.wait.promise.then((result) => {
 });
 
 // T_release — the one irreversible wait transition (auto-detach / manual).
+// ROUTED: the durable decision is the seam's single
+// `mcode.delegation.backgrounded` entry per waitId (one operationId/CAS);
+// the supervisor commits only its own index-document projection of it —
+// exactly one backgrounded record and one tool-result exist per waitId.
 await supervisor.detachToBackground({ delegationId, reason: 'owner-input' });
 
 // T_complete — exactly one delivery: the foreground consumer, or the
@@ -132,6 +141,19 @@ recovery uses, so live and recovered state cannot diverge.
 - This package is the supervision anchor, not the tool executor: the native
   tool finalizer turns the delivered outcome/background handle into the one
   tool result; the reactive release control drives `detachToBackground`.
+- **Wait outcomes have one writer.** The durable seam
+  (`@mavis/durable-seam`) is the wait-outcome authority (§3: "один переход с
+  одним operationId/CAS"); `detachToBackground` routes through it, recovery
+  (`recover`) and `syncWaitDecision` project decisions committed outside
+  this process (e.g. by the reactive control), and the supervisor's reducer
+  joins seam-shaped backgrounded entries by waitId. The supervisor never
+  writes a second copy of a wait outcome.
+- **Fence disengagement is owned here (§4/§5).** With `effectFence` wired,
+  the supervisor calls `disengage` after PROVEN child terminal facts
+  (`complete`, `recordChildTerminal`) and reports the advisory result on
+  `CompletionResult.fence` / `ChildTerminalResult.fence`. A stop signal
+  (`stop`, `parentAborted`) never disengages: "fence снимается после
+  доказанного завершения, не после отправки сигнала".
 - Payloads must stay JSON-serializable and small enough for the backend's
   256 KiB batch cap; large child payloads belong in CAS with references.
 - Fork branches are independent supervision roots: stopping a delegation does

@@ -96,6 +96,23 @@ export function snapshotRecord(record: WorkingRecord): DelegationRecord {
 }
 
 /**
+ * Whether a `mcode.delegation.backgrounded` payload is the SEAM-SHAPED
+ * prepared-outcome record (written by `@mavis/durable-seam`, the wait-outcome
+ * authority: `{waitId, toolCallId, stateVersion, operationId, outcome,
+ * outcomeHash}` — the §3 canonical content lives inside `outcome`) as opposed
+ * to the supervisor's legacy shape (`{delegationId, ...}`, written before the
+ * seam became the single writer). Exactly one writer commits this entry kind
+ * per waitId — the seam — so the supervisor only PROJECTS it.
+ */
+export function isSeamShapedBackgroundedPayload(payload: Record<string, unknown>): boolean {
+	return (
+		typeof payload['outcome'] === 'object' &&
+		payload['outcome'] !== null &&
+		typeof payload['waitId'] === 'string'
+	);
+}
+
+/**
  * Incremental index over supervisor entries. Feed it stored entries in commit
  * order — everything else (raw non-supervisor entries) is ignored, so callers
  * may hand over whole log windows.
@@ -103,6 +120,8 @@ export function snapshotRecord(record: WorkingRecord): DelegationRecord {
 export class DelegationsIndex {
   private working = new Map<string, WorkingRecord>();
   private keyIndex = new Map<string, string>();
+  /** waitId → delegationId, so seam-shaped transitions join the right record. */
+  private waitIndex = new Map<string, string>();
   private revisionValue = 0;
   private appliedEntryCount = 0;
 
@@ -129,6 +148,37 @@ export class DelegationsIndex {
           break;
         }
         case KIND_BACKGROUNDED: {
+          const payloadRecord = payload as unknown as Record<string, unknown>;
+          if (isSeamShapedBackgroundedPayload(payloadRecord)) {
+            // The seam's committed T_release decision: the supervisor
+            // PROJECTS it (one entry per waitId, written by the wait-outcome
+            // authority). Waits without a supervised delegation here (the
+            // seam also serves direct control waits) are ignored.
+            const typed = payloadRecord as unknown as {
+              waitId: string;
+              outcome: {
+                operationId?: string;
+                reason?: string;
+              };
+            };
+            const delegationId = this.waitIndex.get(typed.waitId);
+            if (delegationId === undefined) break;
+            this.patch(entry.id, delegationId, (record) => {
+              record.waitState = 'backgrounded';
+              record.backgroundHandle = {
+                kind: 'task-background',
+                supervisorTaskId: record.supervisorTaskId,
+                childConversationId: record.childConversationId,
+                childSubmissionId: record.childSubmissionId,
+              };
+              record.detach = {
+                operationId: typed.outcome.operationId ?? `release:${typed.waitId}`,
+                reason: typed.outcome.reason ?? 'owner_input',
+              };
+              record.stateVersion = record.stateVersion + 1;
+            });
+            break;
+          }
           const typed = payload as unknown as {
             delegationId: string;
             operationId: string;
@@ -253,6 +303,7 @@ export class DelegationsIndex {
     if (this.working.has(record.delegationId)) return;
     this.working.set(record.delegationId, record);
     if (record.key !== null) this.keyIndex.set(spawnKeyString(record.key), record.delegationId);
+    this.waitIndex.set(record.waitId, record.delegationId);
   }
 
   /** RequestIds of committed reporter deliveries whose report entry is missing. */
@@ -280,10 +331,12 @@ export class DelegationsIndex {
     }
     this.working = new Map();
     this.keyIndex = new Map();
+    this.waitIndex = new Map();
     for (const record of payload.delegations) {
       const mutable = workingFromCommitted(record);
       this.working.set(record.delegationId, mutable);
       if (record.key !== null) this.keyIndex.set(spawnKeyString(record.key), record.delegationId);
+      this.waitIndex.set(record.waitId, record.delegationId);
     }
     this.revisionValue = payload.revision;
   }
@@ -328,6 +381,7 @@ export class DelegationsIndex {
     };
     this.working.set(payload.delegationId, record);
     this.keyIndex.set(spawnKeyString(payload.key), payload.delegationId);
+    this.waitIndex.set(payload.waitId, payload.delegationId);
     // Link the parent in the supervision tree (the committed document carries
     // the same link; this keeps non-document logs consistent too).
     if (payload.parentDelegationId !== null) {
@@ -369,6 +423,7 @@ export class DelegationsIndex {
       stateVersion: payload.stateVersion,
     };
     this.working.set(payload.forkDelegationId, record);
+    this.waitIndex.set(payload.waitId, payload.forkDelegationId);
     const source = this.working.get(payload.fromDelegationId);
     if (source !== undefined && !source.forkDelegationIds.includes(payload.forkDelegationId)) {
       source.forkDelegationIds.push(payload.forkDelegationId);
@@ -398,11 +453,14 @@ export function isSupervisorKind(kind: string): boolean {
  * The transition entries that RELATE to one delegation, excluding document
  * checkpoints. This is the replay feed for a delegation that aged out of the
  * document tail: its record is rebuilt purely from its own transitions, which
- * is always possible because every transition payload names its delegation.
+ * is always possible because every transition payload names its delegation —
+ * directly, or (seam-shaped T_release entries) through `waitIds`, the wait
+ * identities the caller already knows belong to this delegation.
  */
 export function entriesRelatingTo(
   entries: readonly (StoredSupervisorEntry | SupervisorEntryDraft)[],
   delegationId: string,
+  waitIds?: ReadonlySet<string>,
 ): Array<StoredSupervisorEntry | SupervisorEntryDraft> {
   return entries.filter((entry) => {
     if (entry.kind === DELEGATION_DOCUMENT_KIND) return false;
@@ -410,11 +468,19 @@ export function entriesRelatingTo(
       return (entry.payload as Record<string, unknown>)['delegationId'] === delegationId;
     }
     const payload = entry.payload as Record<string, unknown>;
-    return (
+    if (
       payload['delegationId'] === delegationId ||
       payload['forkDelegationId'] === delegationId ||
       payload['fromDelegationId'] === delegationId
-    );
+    ) {
+      return true;
+    }
+    // The seam's backgrounded entry carries no delegationId — join by waitId.
+    if (entry.kind === KIND_BACKGROUNDED && waitIds !== undefined && isSeamShapedBackgroundedPayload(payload)) {
+      const waitId = payload['waitId'];
+      return typeof waitId === 'string' && waitIds.has(waitId);
+    }
+    return false;
   });
 }
 

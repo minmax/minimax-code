@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { afterEach } from 'vitest';
 
 import { SqliteZstdBackend } from '../../durable-backend-sqlite-zstd/src/index.js';
+import { DurableSeam, sqliteZstdDurableLogPort } from '../../durable-seam/src/index.js';
 import { sqliteZstdDelegationLog } from '../src/log.js';
 import type { StoredSupervisorEntry } from '../src/log.js';
 import { DelegationSupervisor } from '../src/supervisor.js';
@@ -25,12 +26,24 @@ export function makeBackend(): SqliteZstdBackend {
   return SqliteZstdBackend.open(directory);
 }
 
-/** A supervisor over the given backend (convention: one per test). */
+/**
+ * A supervisor over the given backend (convention: one per test). The
+ * wait-outcome authority is a REAL `DurableSeam` over the same backend — the
+ * supervisor routes every release through it and projects the committed
+ * decision (steering-design-sol.md §3: one backgrounded entry per waitId).
+ */
 export async function makeSupervisor(
   backend: SqliteZstdBackend,
   options: { recoveryScanBytes?: number; anchorReadBytes?: number; maxTerminalRecords?: number } = {},
+  effectFence?: { disengage(request: unknown): Promise<unknown> },
 ): Promise<DelegationSupervisor> {
-  return DelegationSupervisor.open({ log: sqliteZstdDelegationLog(backend), ...options });
+  const seam = await DurableSeam.open(sqliteZstdDurableLogPort(backend));
+  return DelegationSupervisor.open({
+    log: sqliteZstdDelegationLog(backend),
+    waitSeam: seam,
+    effectFence: effectFence as never,
+    ...options,
+  });
 }
 
 afterEach(() => {

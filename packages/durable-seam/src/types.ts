@@ -172,6 +172,13 @@ export type PrepareReleaseInput = {
 	 * prepared only when it still matches the durable version.
 	 */
 	readonly expectedVersion: number;
+	/**
+	 * Identity of this release decision (§3: "один переход с одним
+	 * operationId/CAS"). Defaults to the deterministic `release:<waitId>` —
+	 * at most one release transition exists per waitId, so the derived id
+	 * replays stably. Stored on the `mcode.delegation.backgrounded` entry.
+	 */
+	readonly operationId?: string;
 	/** Why the wait moved to background (default `owner_input`). */
 	readonly reason?: string;
 	/** Who decided (default `owner-input`). */
@@ -190,6 +197,8 @@ export type PrepareReleaseInput = {
  */
 export type BackgroundOutcome = {
 	readonly kind: 'background';
+	/** Identity of the release decision (see {@link PrepareReleaseInput}). */
+	readonly operationId: string;
 	readonly waitId: string;
 	readonly toolCallId: string;
 	readonly conversationId: string;

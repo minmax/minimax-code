@@ -1,7 +1,7 @@
 /**
  * The delegation supervisor: durable ownership of delegated children
- * (steering-design-sol.md §3 — T_spawn, T_release, T_complete, stop cascade,
- * cancelOnParentAbort supervision, R3 fork compatibility).
+ * (steering-design-sol.md §3 — T_spawn, T_release routing, T_complete, stop
+ * cascade, cancelOnParentAbort supervision, R3 fork compatibility).
  *
  * Ownership model. A `task` tool call does not own the child it starts: the
  * child conversation belongs to a stable supervisor task placed at the native
@@ -14,25 +14,39 @@
  * child: running --> stopping --> terminal
  * ```
  *
- * Atomicity. Every transition commits as ONE atomic batch on the delta log
- * (transition entries + the updated index document). Entry ids and operation
- * ids are deterministic (see `ids.ts`), so a replayed operation recomputes the
- * ids it already committed and rejoins the recorded outcome instead of
- * creating a second executor / second completion / second stop request. The
- * document-update closures of every transition MUST mirror the entry appliers
- * of `document.ts` — the committed document checkpoint resets the projection,
- * so a closure that under-reports would erase the transition on apply.
+ * Wait-outcome authority (§3: "один переход с одним operationId/CAS"). The
+ * supervisor does NOT commit its own durable copy of a wait outcome: the
+ * release decision is THE `@mavis/durable-seam` transition routed through
+ * {@link DelegationSupervisorOptions.waitSeam} — one
+ * `mcode.delegation.backgrounded` entry per waitId, one CAS — and the
+ * supervisor projects the committed decision into its index document (a
+ * different entry kind). Exactly one backgrounded record and one tool-result
+ * exist per waitId across the whole log.
+ *
+ * Atomicity. Every supervisor-owned transition commits as ONE atomic batch on
+ * the delta log (transition entries + the updated index document). Entry ids
+ * and operation ids are deterministic (see `ids.ts`), so a replayed operation
+ * recomputes the ids it already committed and rejoins the recorded outcome
+ * instead of creating a second executor / second completion / second stop
+ * request. The document-update closures of every transition MUST mirror the
+ * entry appliers of `document.ts` — the committed document checkpoint resets
+ * the projection, so a closure that under-reports would erase the transition
+ * on apply.
  *
  * Delivery. `complete` chooses exactly one consumer: the foreground waiter
  * (the tool result) OR the deduplicated background reporter whose requestId is
- * `delegation:<id>:completion:<childRunId>`. The reporter's submission id is
- * derived from that requestId, so a crash + repeat returns the SAME submission
- * (§3 T_complete: the repeat of the native submit returns the same submission).
+ * `delegation:<id>:completion:<childRunId>`. The wait decision is confirmed
+ * against the authority before choosing, so a release committed through the
+ * reactive control can never produce a second foreground delivery. The
+ * reporter's submission id is derived from that requestId, so a crash +
+ * repeat returns the SAME submission (§3 T_complete).
  *
  * Supervision. `cancelOnParentAbort` is stored ON the delegation, so it keeps
  * acting after an automatic detach: while the wait is foreground any parent
  * abort stops the child; after the wait is backgrounded only an EXPLICIT
- * parent Stop does (§3 "Владение", §5 "Abort после принятия ввода").
+ * parent Stop does (§3 "Владение", §5 "Abort после принятия ввода"). The
+ * effect fence of §4 lifts on PROVEN terminal facts (`complete` /
+ * `recordChildTerminal`), never on a stop signal.
  *
  * All mutating operations are serialized through one in-process queue (the
  * single durable-writer discipline); every committed entry applies through the
@@ -42,7 +56,6 @@
  */
 
 import {
-  backgroundedEntryId,
   childConversationEntryId,
   childSpecDigest,
   childTerminalEntryId,
@@ -89,9 +102,19 @@ import {
   DelegationVersionConflictError,
   SupervisorClosedError,
 } from './errors.js';
+import type {
+  EffectFenceDisengage,
+  FenceDisengageRef,
+  FenceDisengageRequest,
+  FenceDisengagement,
+} from './types.js';
+import type {
+  ForegroundWaitSeam,
+  ForegroundWaitSeamPrepared,
+  ForegroundWaitSeamView,
+} from './wait-seam.js';
 import {
   DELEGATION_DOCUMENT_KIND,
-  KIND_BACKGROUNDED,
   KIND_CHILD_CONVERSATION,
   KIND_CHILD_TERMINAL,
   KIND_COMPLETED,
@@ -133,6 +156,24 @@ import {
 export interface DelegationSupervisorOptions {
   /** The persistence port (see `log.ts`). */
   readonly log: DelegationLog;
+  /**
+   * The wait-outcome authority (`@mavis/durable-seam`'s `DurableSeam`).
+   * REQUIRED: the supervisor does not represent wait outcomes durably on its
+   * own — `detachToBackground` routes the T_release decision through this
+   * seam (one `mcode.delegation.backgrounded` entry per waitId, one CAS) and
+   * only projects the committed decision into its index document. Wiring a
+   * different implementation would recreate the dual-representation defect
+   * the steering contract (§3) forbids.
+   */
+  readonly waitSeam: ForegroundWaitSeam;
+  /**
+   * Effect-fence disengagement (§4): after a PROVEN child terminal fact
+   * (`complete` / `recordChildTerminal`) the supervisor asks the gateway to
+   * lift the parent's fence entries. Advisory — failures are reported on the
+   * result, never rolled back. Note the deliberate asymmetry: `stop` does
+   * NOT disengage (a stop signal is not a proven terminal).
+   */
+  readonly effectFence?: EffectFenceDisengage;
   /** Recovery full-scan budget, uncompressed bytes. Default 64 MiB. */
   readonly recoveryScanBytes?: number;
   /** Bounded anchor-read budget of the `getDelegation` fallback. Default 4 MiB. */
@@ -227,6 +268,9 @@ interface Waiter {
  */
 export class DelegationSupervisor {
   private readonly log: DelegationLog;
+  /** The wait-outcome authority — T_release/T_complete decisions live HERE. */
+  private readonly waitSeam: ForegroundWaitSeam;
+  private readonly effectFence: EffectFenceDisengage | null;
   private readonly recoveryScanBytes: number;
   private readonly anchorReadBytes: number;
   private readonly maxTerminalRecords: number;
@@ -248,6 +292,19 @@ export class DelegationSupervisor {
 
   private constructor(log: DelegationLog, options: DelegationSupervisorOptions) {
     this.log = log;
+    if (options.waitSeam === undefined || options.waitSeam === null) {
+      throw new TypeError(
+        'DelegationSupervisor.open: options.waitSeam is required — the durable seam is the single ' +
+          'wait-outcome authority (steering-design-sol.md §3); the supervisor only projects its decisions',
+      );
+    }
+    for (const method of ['openForegroundWait', 'getWait', 'prepareRelease'] as const) {
+      if (typeof (options.waitSeam as unknown as Record<string, unknown>)[method] !== 'function') {
+        throw new TypeError(`DelegationSupervisor.open: options.waitSeam.${method} must be a function`);
+      }
+    }
+    this.waitSeam = options.waitSeam;
+    this.effectFence = options.effectFence ?? null;
     this.recoveryScanBytes = options.recoveryScanBytes ?? DEFAULT_RECOVERY_SCAN_BYTES;
     this.anchorReadBytes = options.anchorReadBytes ?? DEFAULT_ANCHOR_READ_BYTES;
     this.maxTerminalRecords = options.maxTerminalRecords ?? 64;
@@ -310,6 +367,35 @@ export class DelegationSupervisor {
     return waiter === undefined ? undefined : { id: waiter.waitId, promise: waiter.promise };
   }
 
+  /**
+   * Project a wait decision the authority already committed (typically a
+   * release performed by the reactive control outside this supervisor's
+   * queue) into the index document, and settle the foreground waiter with
+   * the recorded outcome. Serialized with every other transition; a no-op
+   * when the wait is not supervised here or is still undecided. Returns the
+   * refreshed view, or `undefined` when the waitId belongs to no delegation.
+   */
+  async syncWaitDecision(waitId: string): Promise<DelegationView | undefined> {
+    return this.enqueue(async () => {
+      this.assertOpen();
+      const record = [...this.index.records().values()].find((candidate) => candidate.waitId === waitId);
+      if (record === undefined) return undefined;
+      if (record.waitState !== 'foreground') return snapshotRecord(record);
+      const view = this.waitSeam.getWait(waitId);
+      if (view === undefined || view.state === 'foreground') return snapshotRecord(record);
+      const updated = await this.projectSeamDecision(record, view);
+      if (updated.waitState === 'backgrounded' && updated.backgroundHandle !== null) {
+        this.waiters.get(updated.waitId)?.resolve({
+          kind: 'backgrounded',
+          delegationId: updated.delegationId,
+          reason: updated.detach?.reason ?? 'owner_input',
+          backgroundHandle: updated.backgroundHandle,
+        });
+      }
+      return snapshotRecord(updated);
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // T_spawn
   // ---------------------------------------------------------------------------
@@ -346,6 +432,11 @@ export class DelegationSupervisor {
       if (existing !== undefined) {
         if (existing.childSpecDigest !== digest) {
           throw new DelegationKeyConflictError(spawnKeyString(key));
+        }
+        // Crash between the supervisor commit and the wait anchor: the replay
+        // re-anchors the foreground wait with the authority (idempotent).
+        if (existing.waitState === 'foreground') {
+          await this.ensureWaitSeamOpen(existing);
         }
         return {
           delegationId: existing.delegationId,
@@ -423,6 +514,12 @@ export class DelegationSupervisor {
 
       await this.commitTransition(drafts);
       const record = this.requireRecord(identity.delegationId, 'spawn');
+      // Anchor the foreground wait with the authority in the SAME serialized
+      // operation (T_spawn, §3: delegation record + foreground wait). A crash
+      // right here is healed by the spawn replay path above.
+      if (record.waitState === 'foreground') {
+        await this.ensureWaitSeamOpen(record);
+      }
       return {
         delegationId: record.delegationId,
         supervisorTaskId: record.supervisorTaskId,
@@ -442,17 +539,24 @@ export class DelegationSupervisor {
 
   /**
    * Release the foreground wait: one irreversible transition per waitId, one
-   * committed background outcome (§3 T_release). The waiter resolves with the
-   * background handle AFTER the commit; the native tool-finalizer turns it
-   * into the standard background tool result. A replay of the same operation
-   * returns the recorded outcome; a completion that already won the race is
-   * reported as `released: false` ("already-completed") — a release can never
-   * overwrite a chosen outcome.
+   * committed background outcome (§3 T_release). The supervisor does NOT
+   * commit its own copy of the decision: the durable release is THE seam
+   * transition routed through {@link DelegationSupervisorOptions.waitSeam} —
+   * the single `mcode.delegation.backgrounded` entry with a single CAS — and
+   * the supervisor then projects the committed decision into its index
+   * document. The waiter resolves with the background handle AFTER both
+   * commits; the native tool-finalizer (the seam's `finalizeTool`) turns the
+   * prepared outcome into the standard background tool result.
+   *
+   * A replay of the same operation returns the recorded outcome; a completion
+   * that already won the race (here or in the authority) is reported as
+   * `released: false` ("already-completed") — a release can never overwrite a
+   * chosen outcome.
    */
   async detachToBackground(request: DetachRequest): Promise<DetachResult> {
     return this.enqueue(async () => {
       this.assertOpen();
-      const record = this.requireRecord(request.delegationId, 'detach');
+      let record = this.requireRecord(request.delegationId, 'detach');
       this.assertVersion(record, request.expectedStateVersion);
       const operationId = request.operationId ?? detachOperationId(request.delegationId);
 
@@ -484,52 +588,128 @@ export class DelegationSupervisor {
         throw new DelegationNotForegroundError(record.delegationId, record.waitState, operationId);
       }
 
+      // Foreground per the projection — but the AUTHORITY decides: a release
+      // committed through another path (the reactive control's adapter) may
+      // already have chosen the outcome. Reconcile before deciding.
+      await this.ensureWaitSeamOpen(record);
+      record = this.requireRecord(request.delegationId, 'detach');
+      if (record.waitState !== 'foreground') {
+        if (record.waitState === 'completed') {
+          return {
+            released: false,
+            delegationId: record.delegationId,
+            reason: 'already-completed' as const,
+            operationId,
+            backgroundHandle: null,
+            stateVersion: record.stateVersion,
+            replayed: false,
+          } satisfies DetachResult;
+        }
+        // Backgrounded by the authority: report the recorded outcome.
+        if (record.detach?.operationId === operationId || record.backgroundHandle !== null) {
+          return {
+            released: true,
+            delegationId: record.delegationId,
+            operationId: record.detach?.operationId ?? operationId,
+            backgroundHandle: record.backgroundHandle,
+            stateVersion: record.stateVersion,
+            replayed: true,
+          } satisfies DetachResult;
+        }
+        throw new DelegationNotForegroundError(record.delegationId, record.waitState, operationId);
+      }
+
+      const view = this.waitSeam.getWait(record.waitId);
+      if (view !== undefined && view.state === 'backgrounded') {
+        // The authority committed the release; this projection was behind.
+        record = await this.projectSeamDecision(record, view);
+        return {
+          released: true,
+          delegationId: record.delegationId,
+          operationId: record.detach?.operationId ?? operationId,
+          backgroundHandle: record.backgroundHandle,
+          stateVersion: record.stateVersion,
+          replayed: true,
+        } satisfies DetachResult;
+      }
+      if (view !== undefined && view.state === 'completed') {
+        record = await this.projectSeamDecision(record, view);
+        return {
+          released: false,
+          delegationId: record.delegationId,
+          reason: 'already-completed' as const,
+          operationId,
+          backgroundHandle: null,
+          stateVersion: record.stateVersion,
+          replayed: false,
+        } satisfies DetachResult;
+      }
+
       const backgroundHandle: BackgroundHandle = {
         kind: 'task-background',
         supervisorTaskId: record.supervisorTaskId,
         childConversationId: record.childConversationId,
         childSubmissionId: record.childSubmissionId,
       };
-      const stateVersion = record.stateVersion + 1;
-      const drafts = this.withDocumentUpdate(
-        [
-          {
-            id: backgroundedEntryId(record.delegationId),
-            kind: KIND_BACKGROUNDED,
-            payload: {
-              delegationId: record.delegationId,
-              waitId: record.waitId,
-              operationId,
-              reason: request.reason,
-              backgroundHandle,
-              stateVersion,
-            },
-          },
-        ],
-        (records) => {
-          const next = cloneWorking(records.get(record.delegationId)!);
-          next.waitState = 'backgrounded';
-          next.backgroundHandle = backgroundHandle;
-          next.detach = { operationId, reason: request.reason };
-          next.stateVersion = stateVersion;
-          records.set(next.delegationId, next);
+      const seamExpected = view?.stateVersion ?? 1;
+      let prepared: ForegroundWaitSeamPrepared;
+      try {
+        // THE single durable T_release (§3): one entry, one operationId, one
+        // CAS — committed by the authority, not duplicated here.
+        prepared = await this.waitSeam.prepareRelease({
+          waitId: record.waitId,
+          expectedVersion: seamExpected,
+          operationId,
+          reason: request.reason,
+          initiator: 'supervisor',
+          backgroundHandle,
+        });
+      } catch (error) {
+        // Stale tokens map onto the supervisor's own conflict hierarchy: the
+        // caller re-reads the record and retries with fresh versions (§4).
+        const code = (error as { code?: unknown } | null)?.code;
+        if (code === 'VERSION_CONFLICT' || code === 'OWNER_LOST' || code === 'GENERATION_SEALED') {
+          const current = (error as { currentVersion?: unknown }).currentVersion;
+          throw new DelegationVersionConflictError(
+            record.delegationId,
+            seamExpected,
+            typeof current === 'number' ? current : record.stateVersion,
+          );
+        }
+        throw error;
+      }
+
+      // Project the committed decision (document checkpoint only — the
+      // backgrounded ENTRY belongs to the seam; replay joins it by waitId).
+      const backgroundHandleFromOutcome = isBackgroundHandleLike(prepared.outcome.backgroundHandle)
+        ? prepared.outcome.backgroundHandle
+        : backgroundHandle;
+      record = await this.projectSeamDecision(record, {
+        state: 'backgrounded',
+        stateVersion: prepared.stateVersion,
+        preparedOutcome: {
+          operationId: prepared.outcome.operationId,
+          waitId: prepared.outcome.waitId,
+          toolCallId: prepared.outcome.toolCallId,
+          reason: prepared.outcome.reason,
+          initiator: prepared.outcome.initiator,
+          backgroundHandle: backgroundHandleFromOutcome,
         },
-      );
-      await this.commitTransition(drafts);
+      });
 
       this.waiters.get(record.waitId)?.resolve({
         kind: 'backgrounded',
         delegationId: record.delegationId,
         reason: request.reason,
-        backgroundHandle,
+        backgroundHandle: record.backgroundHandle ?? backgroundHandle,
       });
 
       return {
         released: true,
         delegationId: record.delegationId,
-        operationId,
-        backgroundHandle,
-        stateVersion,
+        operationId: record.detach?.operationId ?? operationId,
+        backgroundHandle: record.backgroundHandle ?? backgroundHandle,
+        stateVersion: record.stateVersion,
         replayed: false,
       } satisfies DetachResult;
     });
@@ -543,7 +723,10 @@ export class DelegationSupervisor {
    * Commit the child outcome and the delivery decision (§3 T_complete): the
    * foreground consumer when the wait is still foreground, otherwise the
    * deduplicated reporter with the stable requestId
-   * `delegation:<id>:completion:<childRunId>`. Repeating the same completion
+   * `delegation:<id>:completion:<childRunId>`. The wait state is confirmed
+   * against the wait authority before choosing, so a release committed
+   * through the reactive control (outside this supervisor's queue) can never
+   * produce a second foreground delivery. Repeating the same completion
    * (also after a crash + recovery) returns the SAME delivery and submission;
    * a completion under a different childRunId is refused — it is new work
    * (task_append), not a duplicate of the first completion.
@@ -551,7 +734,7 @@ export class DelegationSupervisor {
   async complete(request: CompleteRequest): Promise<CompletionResult> {
     return this.enqueue(async () => {
       this.assertOpen();
-      const record = this.requireRecord(request.delegationId, 'complete');
+      let record = this.requireRecord(request.delegationId, 'complete');
       this.assertVersion(record, request.expectedStateVersion);
 
       if (record.completion !== null) {
@@ -568,6 +751,16 @@ export class DelegationSupervisor {
           } satisfies CompletionResult;
         }
         throw new DelegationAlreadyCompletedError(record.delegationId, record.completion.childRunId, request.childRunId);
+      }
+
+      // Confirm the wait decision with the authority (§4 Гонки: the
+      // commit-order writer wins; the projection may lag a concurrent
+      // reactive release). This also commits the lagging projection.
+      if (record.waitState === 'foreground') {
+        const view = this.waitSeam.getWait(record.waitId);
+        if (view !== undefined && view.state !== 'foreground') {
+          record = await this.projectSeamDecision(record, view);
+        }
       }
 
       const delivery = record.waitState === 'foreground' ? ('foreground' as const) : ('reporter' as const);
@@ -624,6 +817,10 @@ export class DelegationSupervisor {
       });
       await this.commitTransition(allDrafts);
 
+      // The completion is a proven child terminal fact (§4): lift the fence
+      // entries of this delegation. Advisory — never rolls back the commit.
+      const fence = await this.disengageFence(record, request.outcome.status === 'completed' ? 'child_completed' : 'child_failed');
+
       if (delivery === 'foreground') {
         this.waiters.get(record.waitId)?.resolve({
           kind: 'completed',
@@ -631,6 +828,17 @@ export class DelegationSupervisor {
           delivery: 'foreground',
           childRunId: request.childRunId,
           outcome: request.outcome,
+        });
+      } else if (record.waitState === 'backgrounded' && record.backgroundHandle !== null) {
+        // The wait was backgrounded by the authority outside this queue (the
+        // reactive control's release) and this completion arrived late: the
+        // foreground waiter still deserves its single backgrounded outcome
+        // (settle-once; a detach that already resolved it is a no-op).
+        this.waiters.get(record.waitId)?.resolve({
+          kind: 'backgrounded',
+          delegationId: record.delegationId,
+          reason: record.detach?.reason ?? 'owner_input',
+          backgroundHandle: record.backgroundHandle,
         });
       }
 
@@ -642,6 +850,7 @@ export class DelegationSupervisor {
         submissionId,
         stateVersion,
         replayed: false,
+        fence,
       } satisfies CompletionResult;
     });
   }
@@ -831,6 +1040,11 @@ export class DelegationSupervisor {
       );
       await this.commitTransition(drafts);
 
+      // A proven terminal fact (confirmed stop / observed terminal): lift the
+      // parent's fence entries (§4). A mere stop REQUEST never disengages —
+      // only this acknowledged terminal does (§5).
+      const fence = await this.disengageFence(record, request.terminal === 'completed' ? 'child_completed' : request.terminal === 'stopped' ? 'child_stopped' : 'child_failed');
+
       this.waiters.get(record.waitId)?.resolve({
         kind: 'completed',
         delegationId: record.delegationId,
@@ -847,6 +1061,7 @@ export class DelegationSupervisor {
         terminal: request.terminal,
         stateVersion,
         replayed: false,
+        fence,
       } satisfies ChildTerminalResult;
     });
   }
@@ -1052,12 +1267,26 @@ export class DelegationSupervisor {
     // pending waiters; decided states (backgrounded/completed/none) are not
     // pre-materialized — a late handle request materializes them on demand
     // with the recorded outcome, so no never-resolving waiters accumulate.
+    // Before that, reconcile against the wait authority: a release/finalize
+    // committed through the seam without the supervisor's projection commit
+    // (crash window between the two writers) is projected here, so recovery
+    // never resurrects a decided wait as foreground (§3 recovery checklist).
     const reMaterialized: string[] = [];
     const stopping: string[] = [];
+    const sorted = [...this.index.records().values()].sort((left, right) =>
+      compareStrings(left.delegationId, right.delegationId),
+    );
+    for (const record of sorted) {
+      if (record.childState === 'stopping') stopping.push(record.delegationId);
+      if (record.waitState !== 'foreground') continue;
+      const view = this.waitSeam.getWait(record.waitId);
+      if (view !== undefined && view.state !== 'foreground') {
+        await this.projectSeamDecision(record, view);
+      }
+    }
     for (const record of [...this.index.records().values()].sort((left, right) =>
       compareStrings(left.delegationId, right.delegationId),
     )) {
-      if (record.childState === 'stopping') stopping.push(record.delegationId);
       if (record.waitState === 'foreground') {
         this.materializeWait(record);
         reMaterialized.push(record.waitId);
@@ -1274,15 +1503,21 @@ export class DelegationSupervisor {
    * would look childless and stop cascades would silently skip the subtree.
    */
   private replaySingle(delegationId: string): WorkingRecord | undefined {
-    const anchorId = this.log.getEntry(spawnedEntryId(delegationId))
-      ? spawnedEntryId(delegationId)
-      : this.log.getEntry(forkedEntryId(delegationId))
-        ? forkedEntryId(delegationId)
-        : null;
-    if (anchorId === null) return undefined;
+    const anchorEntry =
+      this.log.getEntry(spawnedEntryId(delegationId)) ??
+      this.log.getEntry(forkedEntryId(delegationId));
+    if (anchorEntry === undefined) return undefined;
+    const anchorId =
+      anchorEntry.kind === KIND_SPAWNED
+        ? spawnedEntryId(delegationId)
+        : forkedEntryId(delegationId);
+    // The anchor names the waitId, so the seam's backgrounded entry (which
+    // carries no delegationId) can join the replay by wait identity.
+    const anchorWaitId = (anchorEntry.payload as { waitId?: unknown }).waitId;
+    const waitIds = typeof anchorWaitId === 'string' ? new Set([anchorWaitId]) : undefined;
     const window = this.log.readFrom(anchorId, this.anchorReadBytes, { inclusive: true });
     const scratch = new DelegationsIndex();
-    scratch.apply(entriesRelatingTo(window, delegationId));
+    scratch.apply(entriesRelatingTo(window, delegationId, waitIds));
     const record = scratch.records().get(delegationId);
     if (record === undefined) return undefined;
     this.index.adopt(record);
@@ -1307,6 +1542,91 @@ export class DelegationSupervisor {
   private assertVersion(record: WorkingRecord, expected: number | undefined): void {
     if (expected !== undefined && expected !== record.stateVersion) {
       throw new DelegationVersionConflictError(record.delegationId, expected, record.stateVersion);
+    }
+  }
+
+  /**
+   * Anchor a foreground wait with the authority (idempotent). Called at
+   * spawn, at spawn-replay, and right before a release decision, so a crash
+   * between the supervisor commit and the anchor cannot leave the wait
+   * un-releasable.
+   */
+  private async ensureWaitSeamOpen(record: WorkingRecord): Promise<void> {
+    if (record.waitState !== 'foreground') return;
+    if (this.waitSeam.getWait(record.waitId) !== undefined) return;
+    await this.waitSeam.openForegroundWait({
+      waitId: record.waitId,
+      toolCallId: record.key?.toolCallId ?? record.waitId,
+      conversationId: record.key?.parentConversationId ?? record.childConversationId,
+      delegationId: record.delegationId,
+      childConversationId: record.childConversationId,
+      cancelOnParentAbort: record.supervision.cancelOnParentAbort,
+    });
+  }
+
+  /**
+   * Project an already-committed authority decision (the seam's
+   * `backgrounded` / finalized `completed` wait state) into the supervisor's
+   * index document. This writes ONLY the supervisor's own document
+   * checkpoint — the decision ENTRY itself stays owned by the seam, so one
+   * release still produces exactly one backgrounded record per waitId.
+   * Returns the refreshed record.
+   */
+  private async projectSeamDecision(record: WorkingRecord, view: ForegroundWaitSeamView): Promise<WorkingRecord> {
+    const current = this.requireRecord(record.delegationId, 'seam-decision-projection');
+    if (current.waitState === 'backgrounded' || current.waitState === 'completed') return current;
+    const prepared = view.preparedOutcome;
+    const backgroundHandle =
+      view.state === 'backgrounded' && isBackgroundHandleLike(prepared?.backgroundHandle)
+        ? prepared.backgroundHandle
+        : {
+            kind: 'task-background' as const,
+            supervisorTaskId: current.supervisorTaskId,
+            childConversationId: current.childConversationId,
+            childSubmissionId: current.childSubmissionId,
+          };
+    const detachOperation = prepared?.operationId ?? detachOperationId(current.delegationId);
+    const reason = prepared?.reason ?? 'owner_input';
+    const stateVersion = current.stateVersion + 1;
+    const waitState: WorkingRecord['waitState'] = view.state === 'completed' ? 'completed' : 'backgrounded';
+    const drafts = this.withDocumentUpdate([], (records) => {
+      const next = cloneWorking(records.get(current.delegationId)!);
+      next.waitState = waitState;
+      next.backgroundHandle = waitState === 'backgrounded' ? backgroundHandle : next.backgroundHandle;
+      next.detach = waitState === 'backgrounded' ? { operationId: detachOperation, reason } : next.detach;
+      next.stateVersion = stateVersion;
+      records.set(next.delegationId, next);
+    });
+    await this.commitTransition(drafts);
+    return this.requireRecord(current.delegationId, 'seam-decision-projection');
+  }
+
+  /**
+   * Lift this delegation's effect-fence entries after a proven terminal fact
+   * (§4). Advisory: a failing or absent gateway is reported, never thrown
+   * into the terminal transition, and a fork branch without a parent
+   * conversation has nothing to disengage.
+   */
+  private async disengageFence(
+    record: WorkingRecord,
+    reason: FenceDisengageRequest['reason'],
+  ): Promise<FenceDisengagement | undefined> {
+    const fence = this.effectFence;
+    if (fence === null || typeof fence.disengage !== 'function') return undefined;
+    const parentConversationId = record.key?.parentConversationId;
+    if (parentConversationId === undefined || parentConversationId === null) return undefined;
+    const refs: FenceDisengageRef[] = [
+      {
+        delegationId: record.delegationId,
+        waitId: record.waitId,
+        toolCallId: record.key?.toolCallId ?? null,
+      },
+    ];
+    const request: FenceDisengageRequest = { parentConversationId, reason, refs };
+    try {
+      return await fence.disengage(request);
+    } catch (error) {
+      return { status: 'failed', error: error instanceof Error ? error.message : String(error) };
     }
   }
 
@@ -1442,6 +1762,18 @@ function workingFromSpawned(payload: SpawnedPayload): WorkingRecord {
 
 function completionStatusOf(outcome: DelegationOutcome): 'stopped' | 'failed' | 'completed' {
   return outcome.status === 'completed' ? 'completed' : 'failed';
+}
+
+/** Structural guard: does the authority's recorded handle look like ours? */
+function isBackgroundHandleLike(value: unknown): value is BackgroundHandle {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value as { kind?: unknown }).kind === 'task-background' &&
+    typeof (value as { supervisorTaskId?: unknown }).supervisorTaskId === 'string' &&
+    typeof (value as { childConversationId?: unknown }).childConversationId === 'string' &&
+    typeof (value as { childSubmissionId?: unknown }).childSubmissionId === 'string'
+  );
 }
 
 function compareStrings(left: string, right: string): number {
