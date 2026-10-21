@@ -793,9 +793,18 @@ importers:
       '@mavis/conversation-contract':
         specifier: workspace:*
         version: link:../agent-modules/conversation-contract
+      '@mavis/delegation-supervisor':
+        specifier: workspace:^
+        version: link:../delegation-supervisor
+      '@mavis/durable-seam':
+        specifier: workspace:^
+        version: link:../durable-seam
       '@mavis/goal':
         specifier: workspace:^
         version: link:../agent-modules/goal
+      '@mavis/input-delivery':
+        specifier: workspace:^
+        version: link:../input-delivery
       '@mavis/local-runtime':
         specifier: workspace:*
         version: link:../local-runtime
@@ -817,6 +826,12 @@ importers:
       '@mavis/shared':
         specifier: workspace:^
         version: link:../shared
+      '@mavis/steering-control':
+        specifier: workspace:^
+        version: link:../steering-control
+      '@mavis/storage-worker':
+        specifier: workspace:*
+        version: link:../storage-worker
       '@mavis/system-reminder':
         specifier: workspace:^
         version: link:../agent-modules/system-reminder
@@ -857,18 +872,6 @@ importers:
         specifier: ^2.9.0
         version: 2.9.0
     devDependencies:
-      '@mavis/delegation-supervisor':
-        specifier: workspace:^
-        version: link:../delegation-supervisor
-      '@mavis/durable-seam':
-        specifier: workspace:^
-        version: link:../durable-seam
-      '@mavis/input-delivery':
-        specifier: workspace:^
-        version: link:../input-delivery
-      '@mavis/steering-control':
-        specifier: workspace:^
-        version: link:../steering-control
       '@modelcontextprotocol/sdk':
         specifier: ^1.30.0
         version: 1.30.0(zod@4.6.5)
@@ -900,6 +903,22 @@ importers:
         specifier: workspace:*
         version: link:../oauth-lease-protocol
 
+  packages/mcoded:
+    dependencies:
+      '@mavis/config':
+        specifier: workspace:^
+        version: link:../config
+    devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.43
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.43)
+
   packages/oauth-core:
     dependencies:
       proper-lockfile:
@@ -925,6 +944,18 @@ importers:
       '@vitest/coverage-v8':
         specifier: ^2
         version: 2.1.9(vitest@2.1.9(@types/node@20.19.43))
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.43)
+
+  packages/speculation:
+    devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.43
       typescript:
         specifier: ^5
         version: 5.9.3

@@ -124,6 +124,7 @@
       "packages/tui/test/unit/runtime-error-presentation-rejection.test.ts",
       "packages/local-runtime-v2/src/service/turn-system/agent-host/assembly/local-turn-payload-transform.test.ts",
       "packages/local-runtime-v2/src/service/turn-system/agent-host/execution/executor.test.ts",
+      "packages/local-runtime-v2/src/service/turn-system/agent-host/execution/turn-checkpoint-policy.test.ts",
       "packages/local-runtime-v2/src/service/turn-system/execution/reminder/session-identity-reminder.test.ts",
       "packages/local-runtime-v2/src/services.test.ts",
       "packages/local-runtime-v2/src/application/session/session-title-policy.test.ts",
@@ -242,6 +243,7 @@
       "packages/durable-backend-sqlite-zstd/test/unit/backend.test.ts",
       "packages/storage-worker/test/integration/off-thread.e2e.test.ts",
       "packages/storage-worker/test/integration/checkpoint-barrier.e2e.test.ts",
+      "packages/storage-worker/test/integration/checkpoint-barrier.runtime.test.ts",
       "packages/durable-backend-sqlite-zstd/test/integration/kill-9-crash.test.ts",
       "packages/storage-worker/test/integration/sqlite-zstd.e2e.test.ts",
       "packages/storage-worker/test/unit/adapter-replay.test.ts",
@@ -260,6 +262,7 @@
       "packages/context-compaction/test/unit/split-turn.test.ts",
       "packages/context-compaction/test/unit/trigger.test.ts",
       "packages/context-compaction/test/unit/usage-tracker.test.ts",
+      "packages/context-compaction/test/unit/checkpoint-cross-package.test.ts",
       "packages/context-mmu/test/unit/coherence.test.ts",
       "packages/context-mmu/test/unit/fault-and-digest.test.ts",
       "packages/context-mmu/test/unit/lru-eviction.test.ts",
@@ -300,7 +303,14 @@
       "packages/steering-control/test/composed-single-outcome.test.ts",
       "packages/delegation-supervisor/test/unit/fence-disengage.test.ts",
       "packages/steering-control/test/kill-9-steering-crash.test.ts",
-      "packages/steering-control/test/races-10k.test.ts"
+      "packages/steering-control/test/races-10k.test.ts",
+      "packages/mcoded/test/clients-cursor-replay.test.ts",
+      "packages/mcoded/test/daemon-lifecycle.test.ts",
+      "packages/mcoded/test/replay-ring.test.ts",
+      "packages/mcoded/test/wire-in-memory.test.ts",
+      "packages/speculation/test/budget.test.ts",
+      "packages/speculation/test/classifier.test.ts",
+      "packages/speculation/test/pre-decision.test.ts"
     ],
     "status-contract": [
       "packages/tui/test/unit/tui-build-mode-contract.test.ts"

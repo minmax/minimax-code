@@ -44,6 +44,8 @@ packages:
   - packages/durable-seam
   - packages/input-delivery
   - packages/steering-control
+  - packages/mcoded
+  - packages/speculation
   - third_party/pi-durable
   - third_party/chord
 overrides:

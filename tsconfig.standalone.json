@@ -220,6 +220,9 @@
       "@mavis/mcode-tools-host": [
         "./packages/mcode-tools-host/src/index.ts"
       ],
+      "@mavis/mcoded": [
+        "./packages/mcoded/src/index.ts"
+      ],
       "@mavis/mcp": [
         "./packages/agent-modules/mcp/src/index.ts"
       ],
@@ -408,6 +411,9 @@
       ],
       "@mavis/skills": [
         "./packages/agent-modules/skills/src/index.ts"
+      ],
+      "@mavis/speculation": [
+        "./packages/speculation/src/index.ts"
       ],
       "@mavis/steering-control": [
         "./packages/steering-control/src/index.ts"

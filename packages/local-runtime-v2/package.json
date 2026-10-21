@@ -115,7 +115,8 @@
     "@mavis/steering-control": "workspace:^",
     "@mavis/durable-seam": "workspace:^",
     "@mavis/delegation-supervisor": "workspace:^",
-    "@mavis/input-delivery": "workspace:^"
+    "@mavis/input-delivery": "workspace:^",
+    "@mavis/storage-worker": "workspace:*"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
