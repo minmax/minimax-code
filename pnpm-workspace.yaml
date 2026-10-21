@@ -34,6 +34,11 @@ packages:
   - packages/durable-backend-sqlite-zstd
   - packages/storage-worker
   - packages/v2-adapter
+  - packages/context-compaction
+  - packages/context-mmu
+  - packages/context-projection
+  - packages/convert-to-llm
+  - packages/wire-compiler
   - third_party/pi-durable
   - third_party/chord
 overrides:

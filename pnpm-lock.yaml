@@ -528,6 +528,60 @@ importers:
         specifier: ^5
         version: 5.9.3
 
+  packages/context-compaction:
+    devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.43
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.43)
+
+  packages/context-mmu:
+    devDependencies:
+      '@mavis/cas':
+        specifier: workspace:*
+        version: link:../cas
+      '@types/node':
+        specifier: ^20
+        version: 20.19.43
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.43)
+
+  packages/context-projection:
+    devDependencies:
+      '@mavis/durable-backend-sqlite-zstd':
+        specifier: workspace:*
+        version: link:../durable-backend-sqlite-zstd
+      '@types/node':
+        specifier: ^20
+        version: 20.19.43
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.43)
+
+  packages/convert-to-llm:
+    devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.43
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.43)
+
   packages/durable-backend-sqlite-zstd:
     dependencies:
       better-sqlite3:
@@ -955,6 +1009,18 @@ importers:
       '@mavis/storage-worker':
         specifier: workspace:*
         version: link:../storage-worker
+      '@types/node':
+        specifier: ^20
+        version: 20.19.43
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.43)
+
+  packages/wire-compiler:
+    devDependencies:
       '@types/node':
         specifier: ^20
         version: 20.19.43

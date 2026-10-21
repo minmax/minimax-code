@@ -148,11 +148,23 @@
       "@mavis/config/sandbox-settings": [
         "./packages/config/src/sandbox-settings.ts"
       ],
+      "@mavis/context-compaction": [
+        "./packages/context-compaction/src/index.ts"
+      ],
       "@mavis/context-manager": [
         "./packages/agent-modules/context-manager/src/index.ts"
       ],
+      "@mavis/context-mmu": [
+        "./packages/context-mmu/src/index.ts"
+      ],
+      "@mavis/context-projection": [
+        "./packages/context-projection/src/index.ts"
+      ],
       "@mavis/conversation-contract": [
         "./packages/agent-modules/conversation-contract/src/index.ts"
+      ],
+      "@mavis/convert-to-llm": [
+        "./packages/convert-to-llm/src/index.ts"
       ],
       "@mavis/cron": [
         "./packages/agent-modules/cron/src/index.ts"
@@ -393,6 +405,9 @@
       ],
       "@mavis/v2-adapter": [
         "./packages/v2-adapter/src/index.ts"
+      ],
+      "@mavis/wire-compiler": [
+        "./packages/wire-compiler/src/index.ts"
       ],
       "@minimax/code/package.json": [
         "./packages/tui/package.json"
