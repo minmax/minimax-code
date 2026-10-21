@@ -59,7 +59,10 @@ function storageTarget(worker: ReturnType<typeof createStorageWorker>): V2Import
     async putEntry(envelope: V2Envelope) {
       seq += 1;
       const entryId = `imported-${seq}`;
-      const payload = JSON.parse(JSON.stringify(envelope)) as Record<string, unknown>;
+      // One stringify serves both the payload clone and the declared size —
+      // no parse+stringify+stringify round trip (OPT-L8).
+      const serialized = JSON.stringify(envelope);
+      const payload = JSON.parse(serialized) as Record<string, unknown>;
       await worker.enqueue({
         entryId,
         parentId: previousId,
@@ -68,7 +71,7 @@ function storageTarget(worker: ReturnType<typeof createStorageWorker>): V2Import
         // Declared size = the post-externalization envelope, the unit the
         // worker's budgets count in. A large entry would be admitted only
         // within the batch cap — externalization is what keeps it small.
-        bytes: Buffer.byteLength(JSON.stringify(payload), 'utf8'),
+        bytes: Buffer.byteLength(serialized, 'utf8'),
       });
       previousId = entryId;
       entries.push(envelope);
@@ -145,7 +148,10 @@ describe('default image CAS lands in the durable root, never the legacy tree', (
       expect(block.type).toBe('image_ref');
       const digest = /cas:\/\/sha256\/([0-9a-f]{64})#/.exec(block.blob)?.[1];
       expect(digest).toBeDefined();
-      const cas = await openCas(durableCas);
+      // IC-F1-001: openCas takes the PARENT durable root — blobs live in
+      // `<root>/cas/<aa>/<62hex>` (the `resolveCasDirPath` layout), never in
+      // a `<root>/cas/cas` double nesting.
+      const cas = await openCas(join(fakeHome, '.mcode-durable'));
       expect(cas.has(digest!)).toBe(true);
 
       // The guard itself agrees: the legacy path is refused, the durable one passes.

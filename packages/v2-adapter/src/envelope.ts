@@ -55,7 +55,15 @@ export interface V2Envelope {
   readonly history_artifact?: V2HistoryArtifact;
 }
 
-/** One line of the v2 history file violated the canonical envelope format. */
+/**
+ * One line of the v2 history file violated the canonical envelope format.
+ *
+ * `lineNo` is the 1-based PHYSICAL line number in the file: the reader drops
+ * blank lines before it ever parses a record, so the number reported here
+ * still counts them — opening the file in an editor or `sed -n '<lineNo>p'`
+ * lands exactly on the offending line. The diagnostic message never embeds
+ * the line payload (lines can hold megabytes of base64).
+ */
 export class V2SessionFormatError extends Error {
   readonly filePath: string;
   readonly lineNo: number;
@@ -139,13 +147,11 @@ function decodeMessage(value: unknown, at: LineLocation): V2Message {
       }
     }
   }
-  // Pass-through: keep every unknown message key, but hand the caller a
-  // normalized view where role/content are known to hold the checked values.
-  return {
-    ...message,
-    role,
-    ...(contentValue !== undefined ? { content: contentValue as readonly V2ContentBlock[] } : {}),
-  };
+  // The decoded object is fresh from JSON.parse and exclusively owned by this
+  // line's visitor: role and content hold exactly the values checked above,
+  // so it is handed on as-is — no per-record surface copy (OPT-L7), and the
+  // source key order survives the round trip instead of being reordered.
+  return message as unknown as V2Message;
 }
 
 /** Narrows a content block to an inline base64 image block. */

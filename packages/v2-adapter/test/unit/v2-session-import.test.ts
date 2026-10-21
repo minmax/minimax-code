@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import {
   openV2Session,
   V2_MESSAGES_FILE,
+  type CasImportIssue,
   type V2Envelope,
   type V2ImportTarget,
 } from '../../src/index.js';
@@ -44,23 +45,30 @@ describe('importTo', () => {
     });
 
     const expected = await stat(join(fixtureDir, V2_MESSAGES_FILE));
+    // The stats invariant (IC-F2-012): every image block is either migrated
+    // or kept inline — with `cas: null` the single image block counts as
+    // inline. `lastLine` is the resume cursor (VA-02).
     expect(stats).toEqual({
       bytes: expected.size,
       lines: 4,
       envelopes: 4,
       imageBlocks: 1,
       imagesMigrated: 0,
-      imagesInline: 0,
+      imagesInline: 1,
+      lastLine: 4,
     });
   });
 
   it('replaces image blocks with image_ref descriptors when the hook returns one', async () => {
     const target = collectingTarget();
     const seen: string[] = [];
+    // Only a canonical `cas://` descriptor is substituted (IC-F2-011); the
+    // hook, not the import, owns the descriptor format.
+    const canonicalRef = `cas://sha256/${'9f2c1f6b'.repeat(8)}#70`;
     const stats = await openV2Session(fixtureDir).importTo(target, {
       onImage: async (base64) => {
         seen.push(base64);
-        return 'sha256:9f2c1f6b';
+        return canonicalRef;
       },
     });
 
@@ -69,13 +77,29 @@ describe('importTo', () => {
     ]);
     const content = target.entries[2]?.message.content;
     expect(content?.[0]).toEqual({ type: 'text', text: 'ok' });
-    expect(content?.[1]).toEqual({ type: 'image_ref', blob: 'sha256:9f2c1f6b' });
+    expect(content?.[1]).toEqual({ type: 'image_ref', blob: canonicalRef });
     // Everything but the replaced block stays byte-identical.
     expect(target.entries[2]?.message).toMatchObject({ toolCallId: 'call-1', toolName: 'read' });
     expect(stats.imagesMigrated).toBe(1);
     expect(stats.imagesInline).toBe(0);
     expect(stats.imageBlocks).toBe(1);
     expect(stats.envelopes).toBe(4);
+  });
+
+  it('keeps the block inline when the hook returns a non-canonical descriptor', async () => {
+    const target = collectingTarget();
+    const issues: CasImportIssue[] = [];
+    const inlineData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    // A foreign descriptor would be unparsable downstream, so it is treated
+    // exactly like a decline: the block stays inline and is counted (IC-F2-011).
+    const stats = await openV2Session(fixtureDir).importTo(target, {
+      onImage: async () => 'sha256:9f2c1f6b',
+      onIssue: (issue) => issues.push(issue),
+    });
+
+    expect(target.entries[2]?.message.content?.[1]).toEqual({ type: 'image', data: inlineData });
+    expect(stats).toMatchObject({ imageBlocks: 1, imagesMigrated: 0, imagesInline: 1 });
+    expect(issues.map((issue) => issue.kind)).toEqual(['invalid-blob-ref']);
   });
 
   it('keeps image blocks inline when the hook declines', async () => {
@@ -157,10 +181,13 @@ describe('importTo', () => {
     try {
       const target = collectingTarget();
       let hookedBase64: string | undefined;
+      // The hook must return a canonical `cas://` descriptor for the block to
+      // be replaced (IC-F2-011).
+      const canonicalRef = `cas://sha256/${'bb'.repeat(32)}#${payload.length}`;
       const stats = await openV2Session(session.dir).importTo(target, {
         onImage: async (data) => {
           hookedBase64 = data;
-          return 'sha256:big';
+          return canonicalRef;
         },
       });
 
@@ -170,7 +197,7 @@ describe('importTo', () => {
       expect(Buffer.from(hookedBase64 ?? '', 'base64').equals(payload)).toBe(true);
       expect(target.entries[0]?.message.content?.[1]).toEqual({
         type: 'image_ref',
-        blob: 'sha256:big',
+        blob: canonicalRef,
       });
       expect(stats).toMatchObject({ lines: 1, envelopes: 1, imagesMigrated: 1 });
     } finally {
