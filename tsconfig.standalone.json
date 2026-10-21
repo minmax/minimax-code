@@ -175,6 +175,9 @@
       "@mavis/durable-backend-sqlite-zstd/codec": [
         "./packages/durable-backend-sqlite-zstd/src/codec.ts"
       ],
+      "@mavis/durable-core": [
+        "./packages/durable-core/src/index.ts"
+      ],
       "@mavis/goal": [
         "./packages/agent-modules/goal/src/index.ts"
       ],
@@ -514,6 +517,11 @@
   },
   "include": [
     "packages/tui/src/index.ts",
+    "packages/durable-core/src/index.ts",
+    "packages/durable-backend-sqlite-zstd/src/index.ts",
+    "packages/storage-worker/src/index.ts",
+    "packages/cas/src/index.ts",
+    "packages/v2-adapter/src/index.ts",
     "packages/local-runtime/src/types/*.d.ts",
     "third_party/pi-mono/packages/coding-agent/src/utils/*.d.ts"
   ]

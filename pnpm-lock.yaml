@@ -598,6 +598,8 @@ importers:
         specifier: ^2
         version: 2.1.9(@types/node@20.19.43)
 
+  packages/durable-core: {}
+
   packages/local-runtime:
     dependencies:
       '@earendil-works/pi-agent-core':
@@ -615,6 +617,9 @@ importers:
       '@mavis/agent-tools':
         specifier: workspace:^
         version: link:../agent-tools
+      '@mavis/cas':
+        specifier: workspace:*
+        version: link:../cas
       '@mavis/config':
         specifier: workspace:^
         version: link:../config
