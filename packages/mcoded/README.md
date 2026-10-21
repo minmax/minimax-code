@@ -76,10 +76,11 @@ post-restart replay (the ring is in-memory by design here; reconnects across a
 restart answer `replay_gap`), the thin client bundle, byte-bounded write
 queues with explicit backpressure, and the Windows named-pipe listener.
 
-One platform caveat, pinned by tests: fd adoption uses Node's documented
-`listen({ fd })`, which re-calls `listen()` on the inherited socket. On Linux
-(systemd) that succeeds, so adoption works there; on darwin, `listen()` on an
-already-listening socket fails with `EEXIST` and Node destroys the handle, so
-the daemon surfaces a typed `not-started` refusal that says exactly this. The
-Ф4 runtime resolves it with a supervisor-side shim (hand over the path, not
-the fd) or a Linux deployment.
+Socket activation never re-listens an already-listening fd (Node answers a
+second `listen({ fd })` with `EEXIST` — older Linux kernels were the outlier
+that allowed it, darwin and current ubuntu kernels refuse). Two adoption
+shapes, both pinned by tests: when a server of the same process already holds
+the fd, the daemon adopts that server as-is and serves through it; a
+cross-process supervisor fd is adopted without a re-listen (`EEXIST` reads as
+"already listening"). Anything else (EBADF, EINVAL, …) surfaces as a typed
+`not-started` refusal.

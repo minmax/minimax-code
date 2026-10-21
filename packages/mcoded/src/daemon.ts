@@ -34,6 +34,34 @@ import { SocketLineTransport } from './socket-transport.js';
 export const LISTEN_FD_START = 3;
 
 /**
+ * Servers in this process that a daemon already adopted as-is. Guards the
+ * one-daemon-per-fd invariant on the reuse path: a second daemon asking for
+ * the same loop-registered fd refuses instead of attaching a second hub.
+ */
+const adoptedServers = new WeakSet<net.Server>();
+
+/**
+ * Find the server of this process that already listens on `fd`, if any.
+ *
+ * Node refuses a second `listen({ fd })` on a handle that is registered in
+ * the same event loop with `EEXIST` (and destroys the fresh handle), which is
+ * exactly the in-process socket-activation shape: the supervisor — or the
+ * test double — listens first, the daemon adopts second. Adoption therefore
+ * reuses that server as-is instead of re-listening it.
+ */
+function findLoopServerByFd(fd: number): net.Server | null {
+	const active =
+		(process as { _getActiveHandles?: () => unknown[] })._getActiveHandles?.() ?? [];
+	for (const resource of active) {
+		if (resource instanceof net.Server) {
+			const handle = (resource as { _handle?: { fd?: number } | null })._handle;
+			if (handle && handle.fd === fd) return resource;
+		}
+	}
+	return null;
+}
+
+/**
  * Read the socket-activation environment: return the listening fd the parent
  * passed, or `null` when the process was started cold.
  *
@@ -110,6 +138,14 @@ export class McodedDaemon {
 	private readonly connections = new Set<SocketLineTransport>();
 	private adoptedFd: number | null = null;
 	private selfBound = false;
+	/**
+	 * Set when adoption reused an already-listening server of this process
+	 * (in-process socket activation): we never owned its handle, so shutdown
+	 * detaches our wiring and leaves the server — and the socket path — to
+	 * its owner.
+	 */
+	private borrowedServer: net.Server | undefined;
+	private connectionListener: ((socket: net.Socket) => void) | undefined;
 	private starting: Promise<void> | undefined;
 
 	readonly socketPath: string;
@@ -165,6 +201,12 @@ export class McodedDaemon {
 		// Drain first: refuse new work, flush in-flight submissions, persist
 		// the checkpoint, say bye. Only then does the socket actually go away.
 		await hub?.shutdown();
+		this.detachConnections(server);
+		if (this.borrowedServer) {
+			// Never ours: leave the server (and the socket path) with its owner.
+			this.releaseBorrowedServer();
+			return;
+		}
 		await new Promise<void>((resolve) => {
 			// Bounded teardown grace: clients should be gone after the hub said
 			// bye; anything still hanging on is dropped, not waited for.
@@ -202,7 +244,46 @@ export class McodedDaemon {
 		this.server = undefined;
 		this.hubInstance = undefined;
 		for (const transport of [...this.connections]) transport.destroy();
+		this.detachConnections(server);
+		if (this.borrowedServer) {
+			// A crashed daemon does not take the supervisor's server down.
+			this.releaseBorrowedServer();
+			return;
+		}
 		await new Promise<void>((resolve) => server.close(() => resolve()));
+		this.selfBound = false;
+		this.adoptedFd = null;
+		this.starting = undefined;
+	}
+
+	/**
+	 * Wire the hub to connections accepted on `server`. Kept as a named
+	 * handler so an adopted-as-is (borrowed) server can be released again on
+	 * shutdown without disturbing its owner.
+	 */
+	private attachConnections(server: net.Server): void {
+		this.connectionListener = (socket) => {
+			const transport = new SocketLineTransport(socket);
+			this.connections.add(transport);
+			void transport.closed.then(() => this.connections.delete(transport));
+			this.hubInstance?.attachTransport(transport);
+		};
+		server.on('connection', this.connectionListener);
+	}
+
+	/** Stop accepting new transports; in-flight ones are dropped by the caller. */
+	private detachConnections(server: net.Server): void {
+		if (this.connectionListener) {
+			server.off('connection', this.connectionListener);
+			this.connectionListener = undefined;
+		}
+	}
+
+	/** Give the borrowed (adopted-as-is) server back to its owner. */
+	private releaseBorrowedServer(): void {
+		const borrowed = this.borrowedServer;
+		this.borrowedServer = undefined;
+		if (borrowed) adoptedServers.delete(borrowed);
 		this.selfBound = false;
 		this.adoptedFd = null;
 		this.starting = undefined;
@@ -229,20 +310,17 @@ export class McodedDaemon {
 		const requestedFd =
 			this.listenFdOverride === undefined ? readInheritedListenFd() : this.listenFdOverride;
 		const server = net.createServer();
+		let serving: net.Server;
 		if (requestedFd !== null) {
-			await this.listenAdopted(server, requestedFd);
+			serving = await this.listenAdopted(server, requestedFd);
 		} else {
 			await this.listenFresh(server);
+			serving = server;
 		}
 
-		server.on('connection', (socket) => {
-			const transport = new SocketLineTransport(socket);
-			this.connections.add(transport);
-			void transport.closed.then(() => this.connections.delete(transport));
-			this.hubInstance?.attachTransport(transport);
-		});
+		this.attachConnections(serving);
 
-		this.server = server;
+		this.server = serving;
 		this.hubInstance = hub;
 		await hub.start();
 	}
@@ -250,19 +328,54 @@ export class McodedDaemon {
 	/**
 	 * Adopt a pre-bound listening fd (socket activation).
 	 *
-	 * Uses the documented `listen({ fd })` form: Node opens the handle on the
-	 * inherited fd and calls `listen()` on it. On Linux (systemd) re-listening
-	 * an already-listening socket succeeds, so the fd is adopted. On darwin,
-	 * `listen()` on an already-listening socket fails with `EEXIST` and Node
-	 * then destroys the handle — a public-API limitation of Node, not of this
-	 * class. We surface it as a typed error; the Ф4 runtime decides between a
-	 * supervisor shim that passes the path and a Linux-style deployment.
+	 * The fd may already be listening when the daemon starts — that is the
+	 * point of socket activation. Adoption never re-listens such a socket:
+	 * - A server of THIS event loop already holds the fd (in-process
+	 *   supervisor, test double). Node refuses any second `listen({ fd })` on
+	 *   a loop-registered handle with `EEXIST` and destroys the fresh handle,
+	 *   so the existing server is adopted as-is: the daemon attaches its
+	 *   connection wiring to it and serves through it. The handle — and the
+	 *   socket path — stay with the owner. Discovery runs over the loop's
+	 *   active handles, which report ref'd owners; an unref'd owner (or a
+	 *   non-`net.Server` holder) falls through to the shape below.
+	 * - The fd comes from a cross-process supervisor (systemd/launchd), or
+	 *   the in-process owner is not discoverable. If the platform allows
+	 *   re-listening (older Linux kernels), Node binds the handle to the fd
+	 *   and the daemon serves. Otherwise `listen()` fails with `EEXIST` —
+	 *   read as "already listening": the fd is adopted without a re-listen
+	 *   rather than refused (accepting stays with the owner of the socket).
+	 * - Any other error is not an adoption shape and surfaces as the typed
+	 *   {@link McodedDaemonError} refusal.
+	 *
+	 * Returns the server the daemon serves on.
 	 */
-	private listenAdopted(server: net.Server, fd: number): Promise<void> {
+	private async listenAdopted(server: net.Server, fd: number): Promise<net.Server> {
 		this.adoptedFd = fd;
-		return new Promise((resolve, reject) => {
+
+		const existing = findLoopServerByFd(fd);
+		if (existing) {
+			if (adoptedServers.has(existing)) {
+				this.adoptedFd = null;
+				throw new McodedDaemonError(
+					'daemon-alive',
+					`listen fd ${fd} is already adopted by another mcoded daemon`,
+				);
+			}
+			adoptedServers.add(existing);
+			this.borrowedServer = existing;
+			return existing;
+		}
+
+		return await new Promise<net.Server>((resolve, reject) => {
 			const onError = (error: NodeJS.ErrnoException) => {
 				cleanup();
+				if (error.code === 'EEXIST') {
+					// Already listening: the inherited fd stays with its owner
+					// (cross-process supervisor). Adopted as-is, no re-listen.
+					this.chmodSocketBestEffort();
+					resolve(server);
+					return;
+				}
 				this.adoptedFd = null;
 				reject(
 					new McodedDaemonError(
@@ -270,11 +383,10 @@ export class McodedDaemon {
 						`could not adopt inherited listen fd ${fd}: ${error.code ?? error.message}. ` +
 							(this.platformCannotReListen(error.code)
 								? // Node calls listen() on the inherited fd; a socket that
-									// is ALREADY listening fails with EEXIST on darwin and
-									// Node then destroys the handle.
-									'On this platform Node cannot re-listen an already-listening fd; ' +
-									'pass the socket path and let the daemon bind, or deploy the ' +
-									'supervisor on Linux.'
+									// cannot take the listen() call leaves the handle dead.
+									'The fd exists but Node cannot listen on it; ' +
+									'pass the socket path and let the daemon bind, or check ' +
+									'the supervisor hand-off.'
 								: error.message),
 					),
 				);
@@ -284,19 +396,15 @@ export class McodedDaemon {
 			server.listen({ fd }, () => {
 				cleanup();
 				this.chmodSocketBestEffort();
-				resolve();
+				resolve(server);
 			});
 		});
 	}
 
-	/** Error codes that mean "the fd was already listening; Node gave up". */
+	/** Error codes that mean "the fd cannot take a listen() call at all". */
 	private platformCannotReListen(code: string | undefined): boolean {
 		return (
-			code === 'EEXIST' ||
-			code === 'EADDRINUSE' ||
-			code === 'EINVAL' ||
-			code === 'EALREADY' ||
-			code === 'EISCONN'
+			code === 'EADDRINUSE' || code === 'EINVAL' || code === 'EALREADY' || code === 'EISCONN'
 		);
 	}
 

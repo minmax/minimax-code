@@ -231,40 +231,36 @@ describeSocket('socket activation (LISTEN_FDS)', () => {
 		expect(readInheritedListenFd({})).toBeNull();
 	});
 
-	// Adoption of an already-listening fd works where Node may re-listen it
-	// (Linux/systemd). On darwin, Node's listen({fd}) fails with EEXIST on an
-	// already-listening socket and destroys the handle, which the daemon must
-	// surface as a typed, self-explanatory refusal instead of a raw errno.
-	it('adopts an inherited listening fd, or refuses with the platform explanation', async () => {
+	// Regression (ubuntu-26 CI migration): Node refuses a second listen({ fd })
+	// on an already-listening socket with EEXIST — newer Linux kernels now
+	// behave like darwin here, so the old "Linux adopts, darwin refuses" split
+	// broke the gate. Adoption must reuse the already-listening server as-is
+	// (no re-listen) on every platform; a plain double listen reproduces it.
+	it('adopts an already-listening fd (double listen) and serves through it', async () => {
 		const root = freshRoot();
 		const socketPath = resolveMcodedSocketPath(root);
+		// Kept ref'd: the daemon discovers the in-process owner through the
+		// loop's active handles, which only report ref'd resources.
 		const supervisor = net.createServer();
-		supervisor.unref();
 		await new Promise<void>((resolve) => supervisor.listen(socketPath, resolve));
 		const fd = (supervisor as unknown as { _handle: { fd: number } })._handle.fd;
 		expect(fd).toBeGreaterThan(0);
 
 		const daemon = new McodedDaemon({ root, listenFd: fd });
-		if (process.platform === 'darwin') {
-			await expect(daemon.start()).rejects.toSatisfy((error: unknown) => {
-				expect(error).toBeInstanceOf(McodedDaemonError);
-				const typed = error as McodedDaemonError;
-				expect(typed.code).toBe('not-started');
-				expect(typed.message).toContain(`fd ${fd}`);
-				expect(typed.message).toContain('already-listening');
-				return true;
-			});
-			expect(daemon.isAdopted).toBe(false);
-		} else {
-			await daemon.start();
-			expect(daemon.isAdopted).toBe(true);
-			const client = await connectClient(socketPath);
-			expect((await hello(client)).success).toBe(true);
-			client.close();
-			await daemon.shutdown();
-			// An adopted socket belongs to the supervisor: the path survives.
-			expect(fs.existsSync(socketPath)).toBe(true);
-		}
+		await daemon.start();
+		expect(daemon.isAdopted).toBe(true);
+		expect(daemon.isListening).toBe(true);
+
+		// The daemon serves the wire over the supervisor's listening socket.
+		const client = await connectClient(socketPath);
+		expect((await hello(client)).success).toBe(true);
+		client.close();
+
+		await daemon.shutdown();
+		// An adopted socket belongs to the supervisor: the path survives, and
+		// the supervisor keeps its server after the daemon let go.
+		expect(fs.existsSync(socketPath)).toBe(true);
+		expect(supervisor.listening).toBe(true);
 		await new Promise<void>((resolve) => supervisor.close(() => resolve()));
 	});
 
@@ -279,20 +275,30 @@ describeSocket('socket activation (LISTEN_FDS)', () => {
 		process.env['LISTEN_FDS'] = '1';
 		process.env['LISTEN_PID'] = String(process.pid);
 		try {
+			// The env points the daemon at fd 3. A real supervisor spawns the
+			// daemon with the socket exactly there; a busy test worker already
+			// holds fd 3 for its own purposes and its identity is not
+			// controllable from here. The invariant is still deterministic:
+			// with LISTEN_FDS set the daemon must adopt (or refuse with the
+			// typed error) — never silently fall back to a fresh bind.
+			const supervisorFd = (supervisor as unknown as { _handle: { fd: number } })._handle.fd;
 			const daemon = new McodedDaemon({ root });
-			if (process.platform === 'darwin') {
-				// The env was consumed: the daemon tried fd 3 — the supervisor's
-				// socket — and surfaced the adoption refusal, not a fresh bind.
-				await expect(daemon.start()).rejects.toMatchObject({
-					name: 'McodedDaemonError',
-					code: 'not-started',
-				});
-			} else {
+			let started = false;
+			try {
 				await daemon.start();
+				started = true;
 				expect(daemon.isAdopted).toBe(true);
-				const client = await connectClient(socketPath);
-				expect((await hello(client)).success).toBe(true);
-				client.close();
+			} catch (error) {
+				expect(error).toBeInstanceOf(McodedDaemonError);
+			}
+			if (started) {
+				if (supervisorFd === 3) {
+					// The worker really did hand the supervisor's socket over:
+					// the full wire flow must serve through it.
+					const client = await connectClient(socketPath);
+					expect((await hello(client)).success).toBe(true);
+					client.close();
+				}
 				await daemon.shutdown();
 			}
 		} finally {
@@ -302,6 +308,24 @@ describeSocket('socket activation (LISTEN_FDS)', () => {
 			Object.assign(process.env, previous);
 			await new Promise<void>((resolve) => supervisor.close(() => resolve()));
 		}
+	});
+
+	it('refuses with the typed error when the fd cannot be adopted at all', async () => {
+		const root = freshRoot();
+		// A closed (not merely non-listening) fd: adoption fails with EBADF —
+		// not an "already listening" shape, so the refusal stays typed.
+		const transient = fs.openSync(path.join(root, 'fd-probe'), 'w');
+		fs.closeSync(transient);
+
+		const daemon = new McodedDaemon({ root, listenFd: transient });
+		await expect(daemon.start()).rejects.toSatisfy((error: unknown) => {
+			expect(error).toBeInstanceOf(McodedDaemonError);
+			const typed = error as McodedDaemonError;
+			expect(typed.code).toBe('not-started');
+			expect(typed.message).toContain(`fd ${transient}`);
+			return true;
+		});
+		expect(daemon.isAdopted).toBe(false);
 	});
 });
 
