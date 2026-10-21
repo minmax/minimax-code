@@ -1,5 +1,5 @@
 {
-  "comment": "Thresholds for the ~100 MB images corpus. Same acceptance budgets as thresholds.json, except `open.rssDeltaMb`: bench-open MATERIALIZES the whole 100 MB corpus (the legacy path), which inherently holds several hundred MB of heap — the Ф1 'RSS <= 500 MB' budget belongs to the lazy open (resume capsule) path and is enforced there, not on the legacy materialization. As in thresholds.json, the Ф1 'append <= 1 ms p99 (enqueue frozen entry)' budget is gated on `offthread.enqueueP99Ms` (bench-worker-commit.mjs); bench-append.mjs is the legacy simulation and its write/total/degradation metrics are unthresholded. The Ф2 rows mirror thresholds.json on this corpus, with the picture-specific payload gate: `resume.totalMs`/`resume.rssDeltaMb` gate the lazy open (≤1 с, RSS ≤ 500 МБ — enforced HERE because this bench's legacy materialization is exempt), `prep.p95Ms`/`prep.warmP95Ms` gate prep, and `prep.payloadBytes` gates 'на картинковой fixture ≤12 МБ' over the provider payload bytes (the dialect reduces inline base64 to cas:// placeholders, so the compiled body — not the raw file size — is what is gated).",
+  "comment": "Thresholds for the ~100 MB images corpus. Same acceptance budgets as thresholds.json, except `open.rssDeltaMb`: bench-open MATERIALIZES the whole 100 MB corpus (the legacy path), which inherently holds several hundred MB of heap — the Ф1 'RSS <= 500 MB' budget belongs to the lazy open (resume capsule) path and is enforced there, not on the legacy materialization. As in thresholds.json, the Ф1 'append <= 1 ms p99 (enqueue frozen entry)' budget is gated on `offthread.enqueueP99Ms` (bench-worker-commit.mjs); bench-append.mjs is the legacy simulation and its write/total/degradation metrics are unthresholded. The Ф2 rows mirror thresholds.json on this corpus, with the picture-specific payload gate: `resume.totalMs`/`resume.rssDeltaMb` gate the lazy open (≤1 с, RSS ≤ 500 МБ — enforced HERE because this bench's legacy materialization is exempt), `prep.p95Ms`/`prep.warmP95Ms` gate prep, and `prep.payloadBytes` gates 'на картинковой fixture ≤12 МБ' over the provider payload bytes (the dialect reduces inline base64 to cas:// placeholders, so the compiled body — not the raw file size — is what is gated). `resume-backend.totalMs` gates the lazy open on the REAL indexed backend path (bench-open-backend.mjs).",
   "open.totalMs": 1000,
   "append.stallP99Ms": 5,
   "offthread.enqueueP99Ms": 1,
@@ -10,5 +10,7 @@
   "resume.rssDeltaMb": 500,
   "prep.p95Ms": 50,
   "prep.warmP95Ms": 5,
-  "prep.payloadBytes": 12582912
+  "prep.payloadBytes": 12582912,
+  "resume-backend.totalMs": 1000,
+  "resume-backend.rssDeltaMb": 500
 }

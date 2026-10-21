@@ -15,6 +15,11 @@ on:
         default: full
         type: choice
         options: [full, basic]
+      giant:
+        description: Also gate the 10 GB lazy open on the real backend path
+        required: false
+        default: false
+        type: boolean
 permissions:
   contents: read
 jobs:
@@ -107,6 +112,11 @@ jobs:
     name: bench thresholds
     runs-on: macos-15
     timeout-minutes: 30
+    env:
+      # The benches load the packages' TypeScript sources (dist/ is not built
+      # here); without the `development` condition `exports` resolve `import`
+      # → dist and every bench dies with ERR_MODULE_NOT_FOUND.
+      NODE_OPTIONS: --conditions=development
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -137,6 +147,22 @@ jobs:
         run: |
           FIXTURE="$(ls "$RUNNER_TEMP"/bench-fixtures/messages-*.jsonl)" \
             node scripts/bench/equivalence-corpus.mjs
+      - name: Corpus equivalence gate (Ф2 full-shape — context_edit, split-turn, interrupted tools)
+        run: |
+          node scripts/bench/build-fixtures.mjs hybrid --out "$RUNNER_TEMP/bench-fixtures"
+          FIXTURE="$(ls "$RUNNER_TEMP"/bench-fixtures/hybrid-*.jsonl)" \
+            node scripts/bench/equivalence-corpus.mjs
+      # Opt-in giant gate (review round 2: the ≤1 с open budget must hold at
+      # 10 GB on the MEASURED path). Label a PR `perf:giant` (or dispatch with
+      # giant: true) to build the ~10 GB synthetic durable store and gate the
+      # indexed lazy open: capsule meta row + range read, ≤1 s / RSS ≤500 МБ.
+      # The build takes several minutes — never on by default.
+      - name: Gate the 10 GB lazy open on the real backend path (opt-in)
+        if: ${{ contains(github.event.pull_request.labels.*.name, 'perf:giant') || (github.event_name == 'workflow_dispatch' && inputs.giant == true) }}
+        timeout-minutes: 45
+        run: |
+          GATE_TOTAL_MS=1000 GATE_RSS_MB=500 TARGET_GB=10 KEEP=1 \
+            node --expose-gc scripts/bench/bench-open-backend.mjs
       - name: Upload bench gate evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

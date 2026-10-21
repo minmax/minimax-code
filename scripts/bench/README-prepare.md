@@ -65,17 +65,23 @@ any llm-mock verification error, and the MMU resident budget being exceeded.
 Requires `--experimental-transform-types`: the `context-mmu` sources use
 TypeScript parameter properties, which strip-only mode rejects.
 
+Requires `--conditions=development` on a clean checkout: the packages'
+`exports` map the `import` condition to built `dist/` files (gitignored, not
+built by `scripts/build.mjs`), while the `development` condition resolves the
+TypeScript sources. Without it the run dies with `ERR_MODULE_NOT_FOUND`
+(`.../wire-compiler/node_modules/@mavis/cas/dist/cas-ref.js`).
+
 ```sh
 cd src
 
 # text corpus, 2061 entries (default profile)
-node --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
+node --conditions=development --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
 
 # images corpus: 62 images × ~1.5 MiB base64 imitation through CAS + MMU
-HEAVY_IMAGES=1 node --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
+HEAVY_IMAGES=1 node --conditions=development --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
 
 # 10× size: 20610 entries — history-length independence of prep/payload
-N_ENTRIES=20610 node --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
+N_ENTRIES=20610 node --conditions=development --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
 ```
 
 All three profiles must print `gate=PASS` and exit 0.

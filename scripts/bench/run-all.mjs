@@ -40,6 +40,15 @@ const BENCHES = [
   // prep.payloadBytes is the PROVIDER PAYLOAD byte truth (dialect-normalized
   // wire segments), gated at <= 32 MB (messages) / <= 12 MB (images).
   { id: 'prep', script: 'bench-prep.mjs' },
+  // Ф2 context path: the LAZY open through the REAL sqlite-zstd backend —
+  // capsule meta row (readResume) + batch-granular range read
+  // (readDeltaFrom) + ProjectionService.fromCapsule. O(window) reads over an
+  // indexed store: this is the gate bench for "открытие/resume ≤1 с" at any
+  // size; bench-open-resume.mjs above streams the whole JSONL fixture (the
+  // O(size) contrast the review measured at 6.5 s on 12.9 GB) and
+  // bench-open-backend.mjs also self-gates the opt-in 10 GB corpus
+  // (performance.yml, label `perf:giant`).
+  { id: 'resume-backend', script: 'bench-open-backend.mjs' },
   // Ф3 steering hot path (steering-design-sol.md §6.1/§6.2) on REAL clocks
   // and the REAL sqlite-zstd backend: Enter → durable saved-ack
   // (steering.enterSavedAckP95Ms <= 100, P99 <= 250) and saved-ack →
@@ -69,7 +78,11 @@ const runs = [];
 for (const { id, script } of BENCHES) {
   const scriptPath = fileURLToPath(new URL(`./${script}`, import.meta.url));
   const started = performance.now();
-  const child = spawnSync(process.execPath, ['--expose-gc', scriptPath], {
+  // --conditions=development: the children load the packages' TypeScript
+  // sources (dist/ is gitignored and unbuilt on a clean checkout); without
+  // the condition `exports` resolve `import` → dist and the run dies with
+  // ERR_MODULE_NOT_FOUND (@mavis/cas/dist/cas-ref.js via the prep bench).
+  const child = spawnSync(process.execPath, ['--conditions=development', '--expose-gc', scriptPath], {
     env: process.env,
     encoding: 'utf8',
     maxBuffer: 64 * MIB,
@@ -83,7 +96,7 @@ for (const { id, script } of BENCHES) {
   }
   // Collect "metric=value" lines (keys are prefixed with the benchmark id).
   const metrics = {};
-  for (const match of (child.stdout ?? '').matchAll(/^([a-zA-Z][a-zA-Z0-9_.]*)=([^=\s].*)$/gm)) {
+  for (const match of (child.stdout ?? '').matchAll(/^([a-zA-Z][a-zA-Z0-9_.-]*)=([^=\s].*)$/gm)) {
     metrics[match[1]] = match[2];
   }
   if (Object.keys(metrics).length === 0) {
@@ -146,6 +159,7 @@ lines.push(
     ['replay.p95Ms', pick('replay', 'p95Ms')],
     ['resume.totalMs', pick('resume', 'totalMs')],
     ['resume.rssDeltaMb', pick('resume', 'rssDeltaMb')],
+    ['resume-backend.totalMs', pick('resume-backend', 'totalMs')],
     ['prep.p95Ms', pick('prep', 'p95Ms')],
     ['prep.warmP95Ms', pick('prep', 'warmP95Ms')],
     ['prep.payloadBytes', pick('prep', 'payloadBytes')],

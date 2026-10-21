@@ -41,13 +41,19 @@
 // Requires --experimental-transform-types: the context-mmu sources use
 // TypeScript parameter properties, which strip-only mode rejects.
 //
+// Requires --conditions=development on a clean checkout: the packages'
+// `exports` map the `import` condition to built `dist/` (gitignored, not
+// built by scripts/build.mjs); `development` resolves the TypeScript
+// sources. Without it the run dies with ERR_MODULE_NOT_FOUND
+// (@mavis/cas/dist/cas-ref.js via wire-compiler/src/dialect.ts).
+//
 // Usage:
-//   node --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
+//   node --conditions=development --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
 //
 // Profiles (each must print gate=PASS and exit 0):
-//   text   — node --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
-//   images — HEAVY_IMAGES=1 node --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
-//   10x    — N_ENTRIES=20610 node --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
+//   text   — node --conditions=development --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
+//   images — HEAVY_IMAGES=1 node --conditions=development --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
+//   10x    — N_ENTRIES=20610 node --conditions=development --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
 import { registerHooks } from 'node:module';
 import { createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
