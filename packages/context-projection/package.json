@@ -1,0 +1,25 @@
+{
+  "name": "@mavis/context-projection",
+  "version": "0.1.0",
+  "description": "Derived context view over the durable delta log: manifest fold, incremental ProjectionService with head-keyed cache, resume capsule, and a Context MMU residency hook.",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "devDependencies": {
+    "@mavis/durable-backend-sqlite-zstd": "workspace:*",
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
+  "private": true,
+  "license": "MIT"
+}
