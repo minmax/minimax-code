@@ -107,11 +107,14 @@ conflict never degrades into a generic `failed`.
   turn-system composition, plus the kill -9 steering crash matrix and the
   10 000-schedule race gate in this package's `test/`.
 
-## Package wiring (integrator)
+## Package wiring
 
-The package is not yet registered in the repository plumbing; the integrator
-owns: `pnpm-workspace.yaml`, `packageRoots` in `release/extraction.json`,
-`pnpm gen:tsconfig` (export paths), `test/vitest-suites.json` and
-`node scripts/source-inventory.mjs --write`. Local iteration:
+The package is registered in the repository plumbing: `pnpm-workspace.yaml`,
+`packageRoots` in `release/extraction.json`, the `tsconfig.standalone.json`
+`paths` entry (`@mavis/steering-control`) and all ten Vitest files in
+`test/vitest-suites.json`. The seam IMPLEMENTATIONS (the transaction-scoped
+native-writer bridge beyond `createDurableSeamControlSeam`, the permission
+gateway behind `EffectFence`, the supervisor's `disengage` calls) stay with
+the integrating packages. Local iteration:
 `pnpm --filter @mavis/steering-control test` or
-`../../node_modules/.bin/vitest run --config vitest.config.ts`.
+`./node_modules/.bin/vitest run --config vitest.config.ts`.
