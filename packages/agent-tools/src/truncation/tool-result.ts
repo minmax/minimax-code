@@ -1,4 +1,4 @@
-import type { ToolResult } from '@mavis/agent-core/tools';
+import type { ToolResult, ToolResultContent } from '@mavis/agent-core/tools';
 
 import {
   applyDesktopTextLimit,
@@ -6,6 +6,7 @@ import {
   type DesktopOutputContinuationHint,
 } from '../desktop/output-limit.js';
 import type { ToolOutputSpill } from './spill.js';
+import { base64SpillFromHook } from './cas-spill.js';
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead, truncateTail } from './truncate.js';
 
 export interface ToolResultTruncationOptions {
@@ -38,76 +39,122 @@ export interface ToolResultTruncationOptions {
  *   `desktop_output_continuation` details).
  * - The full output is delegated to the optional `spill` hook; without the
  *   hook the result is truncated without a full-output reference.
- * - Results carrying non-text blocks (images, video, documents) are returned
- *   untouched: their spill path is owned by the CAS integrator at a later
- *   step.
+ *
+ * Non-text blocks (SE-F1-003, implemented): a result carrying non-text blocks
+ * no longer bypasses the seam. Inline base64 `image` blocks are externalized
+ * into the spill sink — the store dedups by the sha256 of the decoded bytes,
+ * so the same image is never stored twice — and replaced with the canonical
+ * `[image: cas://sha256/<digest>#<size>]` text placeholder, the same
+ * reference shape and placeholder convention the v2 importer and the wire
+ * compiler publish. Blocks that cannot be externalized (no hook, hook
+ * without a base64-native put, hook failure, or video/documents, which have
+ * no inline-base64 contract here) stay untouched, and the text part is
+ * truncated exactly like a text-only result.
  */
 export async function truncateToolResultText(
   result: ToolResult,
   options: ToolResultTruncationOptions = {},
 ): Promise<ToolResult> {
-  if (result.content.some((block) => block.type !== 'text')) return result;
-
   const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
   const headShare = normalizeHeadShare(options.headShare);
 
+  // Cheap byte gate first: it decides the common short-output case. The line
+  // count below is still a single allocation-free pass, and it is needed in
+  // every non-returning path (the notice reports it), so no second gate can
+  // skip it.
   const originalBytes = byteLength(result.text);
   const originalLines = countLines(result.text);
-  if (originalLines <= maxLines && originalBytes <= maxBytes) return result;
+  const textOverflows = originalLines > maxLines || originalBytes > maxBytes;
+  const hasNonText = result.content.some((block) => block.type !== 'text');
+  if (!textOverflows && !hasNonText) return result;
 
-  // Spill first: the notice must know whether a full-output reference exists
-  // so the model always keeps a way back to the complete payload.
-  const spillReference = await spillFullOutput(options.spill, result.text);
-  const notice = buildTruncationNotice({ originalLines, originalBytes, spillReference });
+  let output: ToolResult;
+  if (!textOverflows) {
+    // The text fits; only the non-text path below applies.
+    output = result;
+  } else {
+    // Spill first: the notice must know whether a full-output reference exists
+    // so the model always keeps a way back to the complete payload.
+    const spillReference = await spillFullOutput(options.spill, result.text);
+    const notice = buildTruncationNotice({ originalLines, originalBytes, spillReference });
 
-  // Reserve room for the notice so body + notice never exceed maxBytes. The
-  // extra byte covers the '\n' join between the head and tail parts.
-  const separatorBytes = byteLength('\n\n') * 2 + byteLength('\n');
-  const bodyBudget = Math.max(0, maxBytes - byteLength(notice) - separatorBytes);
-  const headBudget = Math.max(1, Math.floor(bodyBudget * headShare));
-  const tailBudget = Math.max(1, bodyBudget - Math.floor(bodyBudget * headShare));
+    // Reserve room for the notice so body + notice never exceed maxBytes. The
+    // extra byte covers the '\n' join between the head and tail parts.
+    const separatorBytes = byteLength('\n\n') * 2 + byteLength('\n');
+    const bodyBudget = Math.max(0, maxBytes - byteLength(notice) - separatorBytes);
+    const headBudget = Math.max(1, Math.floor(bodyBudget * headShare));
+    const tailBudget = Math.max(1, bodyBudget - Math.floor(bodyBudget * headShare));
 
-  const { headSource, tailSource } = partitionForHeadTail(result.text);
-  // The line budget is split across the halves so the total kept lines never
-  // exceeds maxLines even when the byte limits do not bind.
-  const headLines = Math.ceil(maxLines / 2);
-  const tailLines = Math.floor(maxLines / 2);
-  const head = truncateHead(headSource, { maxLines: headLines, maxBytes: headBudget });
-  const tail = truncateTail(tailSource, { maxLines: tailLines, maxBytes: tailBudget });
+    const { headSource, tailSource } = partitionForHeadTail(result.text);
+    // The line budget is split across the halves so the total kept lines never
+    // exceeds maxLines even when the byte limits do not bind.
+    const headLines = Math.ceil(maxLines / 2);
+    const tailLines = Math.floor(maxLines / 2);
+    const head = truncateHead(headSource, { maxLines: headLines, maxBytes: headBudget });
+    const tail = truncateTail(tailSource, { maxLines: tailLines, maxBytes: tailBudget });
 
-  // Desktop head_tail_lines convention: the notice sits between the retained
-  // head and tail so both ends stay adjacent to their continuation context.
-  const pieces = [head.content, notice, tail.content].filter((piece) => piece.length > 0);
-  let text = pieces.join('\n\n');
-  // A notice can overflow the budget on its own (for example a long spill
-  // reference at a small maxBytes); clamp like the desktop limiters do.
-  if (byteLength(text) > maxBytes) {
-    text = fitUtf8Prefix(text, maxBytes);
+    // Desktop head_tail_lines convention: the notice sits between the retained
+    // head and tail so both ends stay adjacent to their continuation context.
+    const pieces = [head.content, notice, tail.content].filter((piece) => piece.length > 0);
+    let text = pieces.join('\n\n');
+    // A notice can overflow the budget on its own (for example a long spill
+    // reference at a small maxBytes); clamp like the desktop limiters do.
+    if (byteLength(text) > maxBytes) {
+      text = fitUtf8Prefix(text, maxBytes);
+    }
+
+    const limited = withDesktopOutputContinuation(
+      {
+        text,
+        returnedBodyLines: head.outputLines + tail.outputLines,
+        truncation: {
+          truncated: true,
+          has_more: true,
+          strategy: 'head_tail_lines',
+          original_bytes: originalBytes,
+          returned_bytes: byteLength(text),
+          max_bytes: maxBytes,
+        },
+      },
+      { continuation_hint: options.continuation ?? createGenericContinuationHint(spillReference) },
+    );
+
+    const applied = applyDesktopTextLimit(result, limited);
+    output =
+      spillReference === undefined
+        ? applied
+        : { ...applied, details: { ...(applied.details ?? {}), spill_reference: spillReference } };
   }
 
-  const limited = withDesktopOutputContinuation(
-    {
-      text,
-      returnedBodyLines: head.outputLines + tail.outputLines,
-      truncation: {
-        truncated: true,
-        has_more: true,
-        strategy: 'head_tail_lines',
-        original_bytes: originalBytes,
-        returned_bytes: byteLength(text),
-        max_bytes: maxBytes,
-      },
-    },
-    { continuation_hint: options.continuation ?? createGenericContinuationHint(spillReference) },
-  );
+  return hasNonText ? externalizeInlineImages(output, options.spill) : output;
+}
 
-  const applied = applyDesktopTextLimit(result, limited);
-  if (!spillReference) return applied;
-  return {
-    ...applied,
-    details: { ...(applied.details ?? {}), spill_reference: spillReference },
-  };
+/**
+ * Replace inline base64 image blocks with `[image: cas://…]` text placeholders
+ * backed by the spill sink. Best-effort per block: a hook without a
+ * base64-native put, or a failing store, keeps that block inline. Video and
+ * document blocks have no inline-base64 contract here and always stay.
+ */
+async function externalizeInlineImages(
+  result: ToolResult,
+  spill: ToolOutputSpill | undefined,
+): Promise<ToolResult> {
+  if (!spill) return result;
+  const spillBase64 = base64SpillFromHook(spill);
+  if (!spillBase64) return result;
+  let externalized = false;
+  const content = await Promise.all(
+    result.content.map(async (block): Promise<ToolResultContent> => {
+      if (block.type !== 'image' || block.data.length === 0) return block;
+      const reference = await spillBase64(block.data);
+      if (reference === undefined) return block;
+      externalized = true;
+      return { type: 'text', text: `[image: ${reference}]` };
+    }),
+  );
+  if (!externalized) return result;
+  return { ...result, content };
 }
 
 /** Build the default continuation hint for a truncated result. */
@@ -126,15 +173,32 @@ export function createGenericContinuationHint(
 /**
  * Split the payload into non-overlapping head and tail sources at the middle
  * line so head and tail truncation can never duplicate or overwrite content.
+ *
+ * The halves are plain string slices around the offset of the middle line:
+ * no `split('\n')` of the whole payload and no join of the halves. The only
+ * adjustment is dropping one trailing '\n' from each slice, which keeps them
+ * byte-identical to the line-array join this used to perform.
  */
 function partitionForHeadTail(content: string): { headSource: string; tailSource: string } {
-  const lines = content.split('\n');
-  if (content.endsWith('\n')) lines.pop();
-  const middle = Math.floor(lines.length / 2);
+  const middle = Math.floor(countLines(content) / 2);
+  if (middle === 0) {
+    return { headSource: '', tailSource: withoutTrailingNewline(content) };
+  }
+  // Walk to the start of line `middle`: every '\n' terminates one line.
+  let lineBreaks = 0;
+  let offset = 0;
+  while (lineBreaks < middle && offset < content.length) {
+    if (content.charCodeAt(offset) === 10) lineBreaks += 1;
+    offset += 1;
+  }
   return {
-    headSource: lines.slice(0, middle).join('\n'),
-    tailSource: lines.slice(middle).join('\n'),
+    headSource: withoutTrailingNewline(content.slice(0, offset)),
+    tailSource: withoutTrailingNewline(content.slice(offset)),
   };
+}
+
+function withoutTrailingNewline(text: string): string {
+  return text.endsWith('\n') ? text.slice(0, -1) : text;
 }
 
 function buildTruncationNotice(context: {
@@ -172,11 +236,17 @@ function normalizeHeadShare(headShare: number | undefined): number {
   return Math.min(1, Math.max(0, headShare));
 }
 
+/**
+ * Line count with pi semantics: a trailing '\n' does not start a new line.
+ * Single allocation-free pass — no split of the whole payload into an array.
+ */
 function countLines(content: string): number {
   if (content.length === 0) return 0;
-  const lines = content.split('\n');
-  if (content.endsWith('\n')) lines.pop();
-  return lines.length;
+  let lines = 1;
+  for (let index = 0; index < content.length; index += 1) {
+    if (content.charCodeAt(index) === 10) lines += 1;
+  }
+  return content.endsWith('\n') ? lines - 1 : lines;
 }
 
 function byteLength(text: string): number {

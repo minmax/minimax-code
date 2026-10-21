@@ -43,13 +43,78 @@ describe('truncateToolResultText', () => {
     expect(truncated).toBe(result);
   });
 
-  it('returns results carrying non-text blocks untouched (images stay out of scope)', async () => {
-    const image = { type: 'image' as const, data: 'base64', mimeType: 'image/png' };
+  it('truncates a mixed-block result even without a spill hook (image stays inline)', async () => {
+    const image = { type: 'image' as const, data: 'aGVsbG8=', mimeType: 'image/png' };
     const text = longText(5000);
     const result = textResult(text, [{ type: 'text', text }, image]);
     const truncated = await truncateToolResultText(result);
-    expect(truncated).toBe(result);
+
+    expect(Buffer.byteLength(truncated.text, 'utf8')).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+    expect(truncated.text).toContain('[output truncated:');
     expect(truncated.content[1]).toBe(image);
+  });
+
+  it('externalizes inline images through the spill sink while truncating the text (SE-F1-003)', async () => {
+    const spilled: string[] = [];
+    const spill: ToolOutputSpill & { spillBase64(base64: string): Promise<string | undefined> } = {
+      spill: async () => undefined,
+      spillBase64: async (base64) => {
+        spilled.push(base64);
+        return `cas://sha256/${'a'.repeat(64)}#${Buffer.from(base64, 'base64').byteLength}`;
+      },
+    };
+    const image = { type: 'image' as const, data: 'aGVsbG8=', mimeType: 'image/png' };
+    const text = longText(5000);
+    const truncated = await truncateToolResultText(textResult(text, [{ type: 'text', text }, image]), {
+      spill,
+    });
+
+    expect(spilled).toEqual(['aGVsbG8=']);
+    expect(truncated.content[1]).toEqual({
+      type: 'text',
+      text: `[image: cas://sha256/${'a'.repeat(64)}#5]`,
+    });
+    expect(Buffer.byteLength(truncated.text, 'utf8')).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+    expect(truncated.text).toContain('[output truncated:');
+  });
+
+  it('keeps blocks inline when the hook lacks a base64 put or the store fails', async () => {
+    const image = { type: 'image' as const, data: 'aGVsbG8=', mimeType: 'image/png' };
+    const text = longText(5000);
+    const mixed = (): ToolResult => textResult(text, [{ type: 'text', text }, image]);
+
+    // Plain ToolOutputSpill without spillBase64 → image stays inline.
+    const plain = await truncateToolResultText(mixed(), {
+      spill: { spill: async () => 'cas://sha256/full-output' },
+    });
+    expect(plain.content[1]).toBe(image);
+    expect(plain.text).toContain('[output truncated:');
+
+    // Base64-capable hook whose store fails → degrade to inline.
+    const failing = await truncateToolResultText(mixed(), {
+      spill: { spill: async () => undefined, spillBase64: async () => undefined },
+    });
+    expect(failing.content[1]).toBe(image);
+  });
+
+  it('leaves video blocks untouched while externalizing sibling images', async () => {
+    const image = { type: 'image' as const, data: 'aGVsbG8=', mimeType: 'image/png' };
+    const video = { type: 'video' as const, data: 'dmlk', mimeType: 'video/mp4' };
+    const result = textResult('tiny', [{ type: 'text', text: 'tiny' }, video, image]);
+    const truncated = await truncateToolResultText(result, {
+      spill: {
+        spill: async () => undefined,
+        spillBase64: async () => `cas://sha256/${'b'.repeat(64)}#3`,
+      },
+    });
+
+    expect(truncated).not.toBe(result);
+    expect(truncated.content[1]).toBe(video);
+    expect(truncated.content[2]).toEqual({
+      type: 'text',
+      text: `[image: cas://sha256/${'b'.repeat(64)}#3]`,
+    });
+    expect(truncated.text).toBe('tiny');
   });
 
   it('truncates oversized text head+tail under the pi defaults', async () => {
@@ -98,6 +163,35 @@ describe('truncateToolResultText', () => {
     expect(truncated.text).toContain('line-0\n');
     expect(truncated.text).toContain('line-3000');
     expect(truncated.text).not.toContain('line-1500\n');
+  });
+
+  it('partitions a payload with a trailing newline into the same head and tail lines', async () => {
+    // 7 lines (trailing newline included): the middle line lands in neither
+    // half, and the retained text is byte-identical to the line-array split.
+    const original = `${Array.from({ length: 7 }, (_, index) => `line-${index}`).join('\n')}\n`;
+    const truncated = await truncateToolResultText(textResult(original), {
+      maxLines: 4,
+      maxBytes: DEFAULT_MAX_BYTES,
+    });
+    expect(truncated.text).toBe(
+      'line-0\nline-1\n\n' +
+        `[output truncated: head+tail shown; original_lines=7; ` +
+        `original_bytes=${Buffer.byteLength(original, 'utf8')}. Rerun with narrower ` +
+        'arguments if the omitted remainder is needed.]\n\n' +
+        'line-5\nline-6',
+    );
+  });
+
+  it('truncates a single oversized line without replacement characters', async () => {
+    // One 150KB line: the byte limit binds, the partition degenerates to a
+    // whole-payload tail, and the cut must stay on UTF-8 boundaries.
+    const original = `${'ж'.repeat(30000)}${'x'.repeat(30000)}${'ж'.repeat(30000)}`;
+    const truncated = await truncateToolResultText(textResult(original));
+
+    expect(Buffer.byteLength(truncated.text, 'utf8')).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+    expect(truncated.text).not.toContain('\uFFFD');
+    expect(truncated.text.endsWith('ж'.repeat(16))).toBe(true);
+    expect(truncated.text).toContain('[output truncated:');
   });
 
   it('delegates the full payload to the spill hook and surfaces the reference', async () => {

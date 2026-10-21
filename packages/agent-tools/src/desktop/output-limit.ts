@@ -71,14 +71,34 @@ export function limitDesktopPrefixLines(
     options.maxBytes,
   );
   let returnedBodyLines = 0;
+  // Incremental accounting: the body byte total grows by the line plus one
+  // '\n' separator, so each candidate's size is known without re-joining the
+  // retained prefix (the naive slice+join per iteration is quadratic). The
+  // final body is joined once, after the loop, for the winning count only.
+  const retained: string[] = [];
+  let bodyBytes = 0;
+  let bestNotice: string | undefined;
   for (let count = 1; count <= inputLines.length; count += 1) {
-    const body = inputLines.slice(0, count).join('\n');
-    const retainedLines = inputLines.slice(0, count);
-    const notice = options.notice({ originalBytes, returnedBodyLines: count, retainedLines });
-    const candidate = joinBodyAndNotice(body, notice);
-    if (byteLength(candidate) > options.maxBytes) break;
-    bestText = candidate;
+    const line = inputLines[count - 1] ?? '';
+    bodyBytes += byteLength(line) + (count > 1 ? 1 : 0);
+    // The notice consumes the array synchronously and must not retain it: it
+    // keeps growing as the retained prefix extends.
+    retained.push(line);
+    const notice = options.notice({
+      originalBytes,
+      returnedBodyLines: count,
+      retainedLines: retained,
+    });
+    // Mirrors joinBodyAndNotice: the '\n\n' separator applies only when both
+    // parts are non-empty (a single '' first line yields an empty body).
+    const bodyEmpty = count === 1 && line === '';
+    const separatorBytes = bodyEmpty || notice === '' ? 0 : 2;
+    if (bodyBytes + separatorBytes + byteLength(notice) > options.maxBytes) break;
+    bestNotice = notice;
     returnedBodyLines = count;
+  }
+  if (bestNotice !== undefined) {
+    bestText = joinBodyAndNotice(retained.slice(0, returnedBodyLines).join('\n'), bestNotice);
   }
 
   return buildLimitedResult(
@@ -241,11 +261,15 @@ function takeWholeLinesFromStart(
   lines: readonly string[],
   maxBytes: number,
 ): { text: string; count: number } {
+  // Incremental byte accounting mirrors the joined candidate's length:
+  // every accepted line after the first costs its bytes plus one '\n'.
   const kept: string[] = [];
+  let keptBytes = 0;
   for (const line of lines) {
-    const candidate = [...kept, line].join('\n');
-    if (byteLength(candidate) > maxBytes) break;
+    const lineBytes = byteLength(line) + (kept.length > 0 ? 1 : 0);
+    if (keptBytes + lineBytes > maxBytes) break;
     kept.push(line);
+    keptBytes += lineBytes;
   }
   return { text: kept.join('\n'), count: kept.length };
 }
@@ -254,14 +278,20 @@ function takeWholeLinesFromEnd(
   lines: readonly string[],
   maxBytes: number,
 ): { text: string; count: number } {
-  const kept: string[] = [];
+  // Mirrored accounting: the last accepted line costs its bytes alone, every
+  // earlier one adds a '\n'. Collected in reverse, flipped once at the end so
+  // there is no per-line unshift copy.
+  const collected: string[] = [];
+  let keptBytes = 0;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const line = lines[index] ?? '';
-    const candidate = [line, ...kept].join('\n');
-    if (byteLength(candidate) > maxBytes) break;
-    kept.unshift(line);
+    const lineBytes = byteLength(line) + (collected.length > 0 ? 1 : 0);
+    if (keptBytes + lineBytes > maxBytes) break;
+    collected.push(line);
+    keptBytes += lineBytes;
   }
-  return { text: kept.join('\n'), count: kept.length };
+  collected.reverse();
+  return { text: collected.join('\n'), count: collected.length };
 }
 
 function joinBodyAndNotice(body: string, notice: string): string {
@@ -271,17 +301,32 @@ function joinBodyAndNotice(body: string, notice: string): string {
 }
 
 function fitUtf8Prefix(text: string, maxBytes: number): string {
-  const buffer = Buffer.from(text, 'utf8');
-  if (buffer.length <= maxBytes) return text;
-  let end = Math.max(0, maxBytes);
+  // Byte-length first: no copy is made just to discover the text already fits.
+  if (byteLength(text) <= maxBytes) return text;
+  // The text overflows. Every UTF-16 code unit encodes to at least one UTF-8
+  // byte, so the first `maxBytes` code units always carry at least `maxBytes`
+  // bytes: buffering that bounded slice never copies the whole (potentially
+  // single-line) payload. A surrogate pair split at the slice edge decodes to
+  // U+FFFD at or after the cut, and the boundary walk below lands on the same
+  // offset as it would with the full buffer.
+  const bounded = text.length <= maxBytes ? text : text.slice(0, maxBytes);
+  const buffer = Buffer.from(bounded, 'utf8');
+  let end = Math.min(Math.max(0, maxBytes), buffer.length);
   while (end > 0 && isUtf8Continuation(buffer[end])) end -= 1;
   return buffer.subarray(0, end).toString('utf8');
 }
 
 function fitUtf8Suffix(text: string, maxBytes: number): string {
-  const buffer = Buffer.from(text, 'utf8');
-  if (buffer.length <= maxBytes) return text;
-  let start = Math.max(0, buffer.length - maxBytes);
+  // Byte-length first: no copy is made just to discover the text already fits.
+  if (byteLength(text) <= maxBytes) return text;
+  // The text overflows. The bounded slice keeps one leading code unit of
+  // context so a surrogate pair straddling the cut stays intact: its bytes
+  // are then encoded identically to the full buffer, the last `maxBytes`
+  // bytes of both buffers coincide, and the boundary walk below lands on the
+  // same offset it would with the whole (potentially single-line) payload.
+  const bounded = text.length <= maxBytes + 1 ? text : text.slice(-(maxBytes + 1));
+  const buffer = Buffer.from(bounded, 'utf8');
+  let start = Math.max(0, buffer.length - Math.max(0, maxBytes));
   while (start < buffer.length && isUtf8Continuation(buffer[start])) start += 1;
   return buffer.subarray(start).toString('utf8');
 }

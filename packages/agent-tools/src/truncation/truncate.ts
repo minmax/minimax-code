@@ -243,15 +243,23 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 /**
  * Truncate a string to fit within a byte limit (from the end).
  * Handles multi-byte UTF-8 characters correctly.
+ *
+ * The suffix cut buffers only a bounded one-unit-of-context slice of the
+ * string, never the whole (potentially single-line, tens-of-megabytes)
+ * payload: with the context unit a surrogate pair straddling the cut stays
+ * intact, so the bounded buffer's tail is byte-identical to the full one and
+ * the boundary walk produces exactly the same output.
  */
 function truncateStringToBytesFromEnd(str: string, maxBytes: number): string {
-  const buf = Buffer.from(str, 'utf8');
-  if (buf.length <= maxBytes) {
+  if (byteLength(str) <= maxBytes) {
     return str;
   }
 
+  const bounded = str.length <= maxBytes + 1 ? str : str.slice(-(maxBytes + 1));
+  const buf = Buffer.from(bounded, 'utf8');
+
   // Start from the end, skip maxBytes back.
-  let start = buf.length - maxBytes;
+  let start = Math.max(0, buf.length - Math.max(0, maxBytes));
 
   // Find a valid UTF-8 boundary (start of a character).
   while (start < buf.length && isUtf8Continuation(buf[start])) {
@@ -305,7 +313,14 @@ export function truncateMiddle(content: string, maxBytes: number): MiddleTruncat
   while (tailStart < buf.length && !isBoundary(tailStart)) tailStart += 1;
   const head = buf.subarray(0, headEnd).toString('utf8');
   const tail = buf.subarray(tailStart).toString('utf8');
-  const removedChars = Array.from(buf.subarray(headEnd, tailStart).toString('utf8')).length;
+  // The buffer was encoded from a JS string, so the removed range is
+  // well-formed UTF-8: every code point starts with exactly one lead byte.
+  // Counting lead bytes avoids materializing the whole removed middle as a
+  // string and a code-point array just to take its length.
+  let removedChars = 0;
+  for (let index = headEnd; index < tailStart; index += 1) {
+    if (!isUtf8Continuation(buf[index] as number)) removedChars += 1;
+  }
   return {
     content: `${head}…${removedChars} chars truncated…${tail}`,
     truncated: true,

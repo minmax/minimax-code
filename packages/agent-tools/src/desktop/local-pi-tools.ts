@@ -85,6 +85,7 @@ import {
   withDesktopOutputContinuation,
 } from './output-limit.js';
 import type { ToolOutputSpill } from '../truncation/spill.js';
+import { fileSpillFromHook } from '../truncation/cas-spill.js';
 
 export function getLocalBashEnvironment(): {
   readonly platform: NodeJS.Platform;
@@ -632,6 +633,11 @@ export class LocalBashTool implements ToolImpl<
    * when the output was actually truncated — at the pi preview cap or the
    * desktop cap — so untruncated output is never persisted twice. Best-effort:
    * any failure keeps the persisted file as the full-output reference.
+   *
+   * A hook with a file-native `spillFile` (the CAS spill, via the store's
+   * `putFile`) ingests the already-persisted file directly, so the full
+   * payload is never read back into memory; plain string hooks keep the
+   * readFile fallback.
    */
   private async spillFullOutput(
     result: ToolResult,
@@ -648,6 +654,8 @@ export class LocalBashTool implements ToolImpl<
       return undefined;
     }
     try {
+      const spillFile = fileSpillFromHook(this.toolOutputSpill);
+      if (spillFile) return await spillFile(fullOutputPath);
       const payload = await readFile(fullOutputPath, 'utf8');
       return await this.toolOutputSpill.spill(payload);
     } catch {

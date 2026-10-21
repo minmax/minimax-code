@@ -123,6 +123,17 @@ describe('truncateTail', () => {
     expect(Buffer.byteLength(result.content, 'utf8')).toBeLessThanOrEqual(20);
     expect(result.content.includes('ж')).toBe(true);
   });
+
+  it('keeps astral characters intact when the byte cut lands inside a surrogate pair', () => {
+    // 10 ASCII + 10 four-byte 𝕏: the 15-byte cut from the end lands mid-pair;
+    // the bounded-slice staging must reproduce the full-buffer boundary walk.
+    const content = `prefix\n${'a'.repeat(10)}${'𝕏'.repeat(10)}`;
+    const result = truncateTail(content, { maxBytes: 15 });
+    expect(result.lastLinePartial).toBe(true);
+    expect(result.content.endsWith('𝕏'.repeat(3))).toBe(true);
+    expect(Buffer.byteLength(result.content, 'utf8')).toBeLessThanOrEqual(15);
+    expect(result.content).not.toContain('\uFFFD');
+  });
 });
 
 describe('truncateLine', () => {
@@ -179,5 +190,27 @@ describe('truncateMiddle', () => {
     expect(result.content.endsWith('ж'.repeat(7))).toBe(true);
     expect(Buffer.from(result.content, 'utf8').length).toBeLessThanOrEqual(52);
     expect(result.content).not.toContain('\uFFFD');
+  });
+
+  it('counts removed characters exactly for a multi-byte middle', () => {
+    // 10 ASCII + 20 two-byte chars + 10 ASCII = 60 bytes; the cut leaves a
+    // 32-byte middle of exactly 16 characters.
+    const content = `${'a'.repeat(10)}${'б'.repeat(20)}${'a'.repeat(10)}`;
+    const result = truncateMiddle(content, 30);
+    expect(result.truncated).toBe(true);
+    expect(result.removedChars).toBe(16);
+    expect(result.content).toBe(
+      `${'a'.repeat(10)}${'б'.repeat(2)}…16 chars truncated…${'б'.repeat(2)}${'a'.repeat(10)}`,
+    );
+  });
+
+  it('counts astral characters once, like their surrogate-pair decoding', () => {
+    // 𝕏 (U+1D54F) is 4 UTF-8 bytes but one code point (a surrogate pair):
+    // the removed middle of 24 bytes must count as 6, not 12 or 24.
+    const content = `${'a'.repeat(8)}${'𝕏'.repeat(6)}${'b'.repeat(8)}`;
+    const result = truncateMiddle(content, 20);
+    expect(result.truncated).toBe(true);
+    expect(result.removedChars).toBe(6);
+    expect(result.content).toBe(`${'a'.repeat(8)}…6 chars truncated…${'b'.repeat(8)}`);
   });
 });

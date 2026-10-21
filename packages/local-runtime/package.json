@@ -15,6 +15,7 @@
     "@earendil-works/pi-coding-agent": "workspace:*",
     "@mavis/agent-core": "workspace:^",
     "@mavis/agent-tools": "workspace:^",
+    "@mavis/cas": "workspace:*",
     "@mavis/config": "workspace:^",
     "@mavis/conversation-contract": "workspace:^",
     "@mavis/context-manager": "workspace:^",

@@ -2,7 +2,9 @@ import type { PiEventWriter } from "@mavis/agent-core/pi-turn-runner";
 import type { RuntimeTool } from "@mavis/agent-core/tools";
 import {
   buildLocalToolRegistry,
+  createCasToolOutputSpill,
   LocalTodoWriteToolDef,
+  type CasToolOutputSpill,
   type LocalAskUserAdapter,
   type LocalBashAdapter,
   type LocalCodeReviewAdapter,
@@ -18,12 +20,15 @@ import {
   type LocalTaskControlAdapter,
   type LocalWebFetchAdapter,
   type LocalWebSearchAdapter,
+  type ToolOutputSpill,
   WebSearchToolDef,
 } from "@mavis/agent-tools/desktop";
 import { MatrixWebSearchToolDef } from "@mavis/agent-tools";
+import { openCas } from "@mavis/cas";
 import {
   getConfig,
   resolveAgentCapabilities,
+  resolveDurableRoot,
   type AgentBuiltinMcpToolId,
   type AgentBuiltinSkillId,
   type ResolvedAgentCapabilities,
@@ -61,6 +66,35 @@ export type {
   LocalTurnToolSources,
   LocalTurnToolSourcesInput,
 } from "./local-turn-tool-sources.types.js";
+
+/**
+ * CAS-backed full-output spill over the durable data root (SE-F1-007).
+ *
+ * The store is opened lazily on the first spill — building the per-Turn tool
+ * set must stay synchronous and must not touch the filesystem when no output
+ * is ever truncated — and memoized per `buildLocalNativeRuntimeTools` call so
+ * concurrent spills share one store handle. Every failure degrades to
+ * `undefined` (a truncated result without a full-output reference), matching
+ * the {@link ToolOutputSpill} contract. All three entry points are forwarded
+ * so the bash route can hand the persisted full-output file straight to the
+ * store's `putFile`, and the truncation seam can externalize inline base64
+ * images through the store's decoded-bytes `putBase64`, without extra
+ * in-memory copies.
+ */
+function durableCasToolOutputSpill(): CasToolOutputSpill {
+  let spillPromise: Promise<CasToolOutputSpill | undefined> | undefined;
+  const resolveSpill = (): Promise<CasToolOutputSpill | undefined> => {
+    spillPromise ??= openCas(resolveDurableRoot())
+      .then((store) => createCasToolOutputSpill(store))
+      .catch(() => undefined);
+    return spillPromise;
+  };
+  return {
+    spill: async (payload) => (await resolveSpill())?.spill(payload),
+    spillFile: async (sourcePath) => (await resolveSpill())?.spillFile(sourcePath),
+    spillBase64: async (base64) => (await resolveSpill())?.spillBase64(base64),
+  };
+}
 
 export function buildLocalNativeRuntimeTools(input: {
   dataDir?: string;
@@ -262,6 +296,10 @@ export function buildLocalNativeRuntimeTools(input: {
         routingContextGetter: input.routingContextGetter,
       }),
       codeReviewAdapter: input.codeReviewAdapter,
+      // Full-output spill for truncated tool results (SE-F1-007): the CAS
+      // store under the durable root (never the legacy `~/.minimax` family)
+      // backs the `cas://` references the bash tool and skill tool surface.
+      toolOutputSpill: durableCasToolOutputSpill(),
     }).values(),
   ];
   const modelVisibleNativeTools = input.mavisCronAdapter

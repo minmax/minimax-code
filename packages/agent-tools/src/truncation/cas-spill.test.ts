@@ -1,14 +1,24 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFile } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import type { ToolResult, ToolResultContent } from '@mavis/agent-core/tools';
 import { openCas } from '@mavis/cas';
 
-import { casSpillRef, createCasToolOutputSpill, parseCasSpillRef } from './cas-spill.js';
+import {
+  casSpillRef,
+  createCasToolOutputSpill,
+  fileSpillFromHook,
+  parseCasSpillRef,
+  STRING_SPILL_FILE_THRESHOLD_BYTES,
+} from './cas-spill.js';
 import { truncateToolResultText } from './tool-result.js';
+
+const writeFileAsync = promisify(writeFile);
 
 // The CAS-backed spill: full outputs of truncated tool results are stored in
 // the real content-addressed store, and the model keeps a resolvable
@@ -85,6 +95,114 @@ describe('CAS tool-output spill', () => {
       },
     });
     await expect(spill.spill('payload')).resolves.toBeUndefined();
+  });
+
+  it('prefers putBytes for small payloads and stages large ones through a chunked temp file', async () => {
+    const putBytesPayloads: Buffer[] = [];
+    const stagedFiles: Buffer[] = [];
+    let putBytesCalls = 0;
+    const spill = createCasToolOutputSpill({
+      putBytes: async (data) => {
+        putBytesCalls += 1;
+        putBytesPayloads.push(Buffer.from(data));
+        return { sha256: 'a'.repeat(64), size: data.length };
+      },
+      putFile: async (sourcePath) => {
+        const bytes = await readFile(sourcePath);
+        stagedFiles.push(bytes);
+        return { sha256: 'b'.repeat(64), size: bytes.length };
+      },
+    });
+
+    // Small payload: single encode into putBytes, no temp file.
+    const small = await spill.spill('tiny payload');
+    expect(small).toBe(`cas://sha256/${'a'.repeat(64)}#${Buffer.byteLength('tiny payload', 'utf8')}`);
+    expect(putBytesCalls).toBe(1);
+    expect(stagedFiles).toHaveLength(0);
+
+    // Payload at the threshold: staged chunk-wise through putFile, and the
+    // staged file holds exactly the UTF-8 payload bytes.
+    const large = 'ж'.repeat(STRING_SPILL_FILE_THRESHOLD_BYTES); // 2 bytes/char in UTF-8
+    const reference = await spill.spill(large);
+    expect(reference).toBe(`cas://sha256/${'b'.repeat(64)}#${Buffer.byteLength(large, 'utf8')}`);
+    expect(putBytesCalls).toBe(1);
+    expect(stagedFiles).toHaveLength(1);
+    expect(stagedFiles[0]?.toString('utf8')).toBe(large);
+  });
+
+  it('spills an on-disk file through the store-native putFile', async () => {
+    const root = freshDirectory();
+    const cas = await openCas(root);
+    const spill = createCasToolOutputSpill(cas);
+    const source = join(root, 'full-output.log');
+    const payload = 'line\n'.repeat(500);
+    await writeFileAsync(source, payload, 'utf8');
+
+    const reference = await spill.spillFile(source);
+    expect(reference).toBeDefined();
+    const parsed = parseCasSpillRef(reference!);
+    expect(parsed).not.toBeNull();
+    expect(cas.has(parsed!.sha256)).toBe(true);
+    expect((await cas.get(parsed!.sha256)).toString('utf8')).toBe(payload);
+    expect(parsed!.size).toBe(Buffer.byteLength(payload, 'utf8'));
+  });
+
+  it('spillFile degrades to undefined when the store has no file-native put', async () => {
+    const spill = createCasToolOutputSpill({
+      putBytes: async (data) => ({ sha256: 'c'.repeat(64), size: data.length }),
+    });
+    await expect(spill.spillFile('/tmp/any-path')).resolves.toBeUndefined();
+  });
+
+  it('exposes the file path only through fileSpillFromHook for CAS-backed hooks', async () => {
+    expect(fileSpillFromHook({ spill: async () => undefined })).toBeUndefined();
+    const cas = await openCas(freshDirectory());
+    expect(typeof fileSpillFromHook(createCasToolOutputSpill(cas))).toBe('function');
+  });
+
+  it('spillBase64 stores the decoded bytes with a digest over them', async () => {
+    const root = freshDirectory();
+    const cas = await openCas(root);
+    const spill = createCasToolOutputSpill(cas);
+
+    const reference = await spill.spillBase64('aGVsbG8='); // "hello"
+    expect(reference).toBeDefined();
+    const parsed = parseCasSpillRef(reference!);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.size).toBe(5);
+    expect((await cas.get(parsed!.sha256)).toString('utf8')).toBe('hello');
+  });
+
+  it('never stores the same image twice: identical base64 yields one blob', async () => {
+    const root = freshDirectory();
+    const cas = await openCas(root);
+    const spill = createCasToolOutputSpill(cas);
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
+
+    const first = await spill.spillBase64(png);
+    const second = await spill.spillBase64(png);
+    expect(first).toBe(second);
+
+    const parsed = parseCasSpillRef(first!);
+    expect(parsed).not.toBeNull();
+    // Both references resolve to the single deduplicated blob, byte-equal to
+    // the decoded image.
+    expect(await cas.hasAsync(parsed!.sha256)).toBe(true);
+    expect((await cas.get(parsed!.sha256)).equals(Buffer.from(png, 'base64'))).toBe(true);
+    expect(parsed!.size).toBe(Buffer.from(png, 'base64').byteLength);
+  });
+
+  it('spillBase64 falls back to putBytes when the store has no base64 put', async () => {
+    const decoded: Buffer[] = [];
+    const spill = createCasToolOutputSpill({
+      putBytes: async (data) => {
+        decoded.push(Buffer.from(data));
+        return { sha256: 'c'.repeat(64), size: data.length };
+      },
+    });
+    const reference = await spill.spillBase64('aGVsbG8=');
+    expect(reference).toBe(`cas://sha256/${'c'.repeat(64)}#5`);
+    expect(decoded.map((buffer) => buffer.toString('utf8'))).toEqual(['hello']);
   });
 
   it('parses only canonical references', () => {

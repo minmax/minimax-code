@@ -12,6 +12,10 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { openCas } from '@mavis/cas';
+
+import { createCasToolOutputSpill, parseCasSpillRef } from '../truncation/cas-spill.js';
+import type { ToolOutputSpill } from '../truncation/spill.js';
 import { LocalBashTool } from './local-pi-tools.js';
 import type { LocalRuntimeToolContext } from './types.js';
 
@@ -107,5 +111,39 @@ describe('LocalBashTool — full-output spill delegation', () => {
     expect(calls).toHaveLength(0);
     expect(result.text).toBe('short');
     expect(result.details?.spill_reference).toBeUndefined();
+  });
+
+  it('hands the persisted file to a CAS spill without reading it back into the hook', async () => {
+    const casRoot = await mkdtemp(join(tmpdir(), 'bash-spill-cas-'));
+    try {
+      const cas = await openCas(casRoot);
+      const casSpill = createCasToolOutputSpill(cas);
+      let stringSpillCalls = 0;
+      const hook: ToolOutputSpill & {
+        spillFile(path: string): Promise<string | undefined>;
+      } = {
+        spill: async (payload) => {
+          stringSpillCalls += 1;
+          return casSpill.spill(payload);
+        },
+        spillFile: (path) => casSpill.spillFile(path),
+      };
+      const tool = new LocalBashTool(workspace, undefined, { mode: 'off' }, undefined, undefined, hook);
+      const result = await tool.execute(SESSION_CTX, { command: largeOutputCommand() });
+
+      // The file-native path must win: the payload never travels through the
+      // string spill, so no second full copy of the output is materialized.
+      expect(stringSpillCalls).toBe(0);
+
+      const reference = result.details?.spill_reference as string;
+      const parsed = parseCasSpillRef(reference);
+      expect(parsed).not.toBeNull();
+      const fullPath = result.details?.fullOutputPath as string;
+      const fileBytes = await readFile(fullPath);
+      expect(parsed!.size).toBe(fileBytes.byteLength);
+      expect((await cas.get(parsed!.sha256)).equals(fileBytes)).toBe(true);
+    } finally {
+      await rm(casRoot, { recursive: true, force: true });
+    }
   });
 });
