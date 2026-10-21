@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { buf, makeMmu, refOf, shaOf, sleep, until } from './helpers.js';
+import type { PathWatcher } from '../../src/watch.js';
 
 const DEBOUNCE_MS = 20;
 
@@ -119,6 +120,47 @@ describe('watch coherence', () => {
       try {
         await unlink(file);
         await until(() => handle.stale, 'the page to be marked stale', 15_000);
+        expect(handle.replacedBy).toBeUndefined();
+      } finally {
+        stop();
+      }
+    } finally {
+      await rm(files, { recursive: true, force: true });
+      await dispose();
+    }
+  });
+
+  // fs.watch is best-effort: under load (FSEvents) or after an unlink the
+  // event stream can stay silent for longer than any reasonable deadline —
+  // this is exactly how the deletion test above once timed out at 15s. The
+  // stat-poll backstop must deliver coherence on its own, so this test
+  // mutes the event stream and drives the poll instead.
+  it('stales pages via the stat-poll backstop when the event stream stays silent', { timeout: 20_000 }, async () => {
+    const { mmu, dispose } = await makeMmu({
+      watchDebounceMs: DEBOUNCE_MS,
+      watchPollMs: 50,
+    });
+    const files = await makeFiles();
+    try {
+      const file = path.join(files, 'silent.png');
+      await writeFile(file, buf(48, 3));
+      const handle = await mmu.pageFile(file);
+
+      const stop = mmu.watch([file]);
+      try {
+        // Mute the fs.watch stream underneath: only the backstop remains.
+        const watcher = (mmu as unknown as { watcher?: PathWatcher }).watcher;
+        expect(watcher).toBeDefined();
+        const subscription = (
+          watcher as unknown as {
+            subscriptions: Map<string, { watcher: { close(): void } }>;
+          }
+        ).subscriptions.get(file);
+        expect(subscription).toBeDefined();
+        subscription!.watcher.close();
+
+        await unlink(file);
+        await until(() => handle.stale, 'the backstop to mark the page stale', 5_000);
         expect(handle.replacedBy).toBeUndefined();
       } finally {
         stop();

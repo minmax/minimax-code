@@ -109,6 +109,15 @@ export interface MmuOptions {
   batchEvictRatio?: number;
   /** Coalescing window for `fs.watch` event bursts, in ms. Default: 25. */
   watchDebounceMs?: number;
+  /**
+   * Stat-poll backstop interval for `watch` coherence, in ms. `fs.watch`
+   * delivery is best-effort (FSEvents latency under concurrent I/O, streams
+   * going silent after an unlink), so the poll stats each watched path and
+   * reports changes and disappearances the event stream missed — coherence
+   * stays eventually-correct without it. `0` disables the backstop.
+   * Default: 2000.
+   */
+  watchPollMs?: number;
 }
 
 /** The context MMU: paging facade over an injected CAS. */

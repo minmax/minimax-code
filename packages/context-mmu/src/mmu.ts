@@ -51,6 +51,9 @@ const DEFAULT_PIN_TURNS = 4;
 const DEFAULT_UNPIN_GRACE_TURNS = 1;
 const DEFAULT_BATCH_EVICT_RATIO = 0.75;
 const DEFAULT_WATCH_DEBOUNCE_MS = 25;
+// fs.watch delivery is best-effort (FSEvents latency under load, silent stop
+// after unlink); the poll backstop guarantees eventual staleness regardless.
+const DEFAULT_WATCH_POLL_MS = 2_000;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const DEFAULT_FILE_MIME = 'application/octet-stream';
 
@@ -127,6 +130,7 @@ class ContextMmuImpl implements ContextMmu {
   private readonly unpinGraceTurns: number;
   private readonly batchEvictRatio: number;
   private readonly watchDebounceMs: number;
+  private readonly watchPollMs: number;
 
   /** All live records keyed by handle id. */
   private readonly records = new Map<string, PageRecord>();
@@ -158,6 +162,7 @@ class ContextMmuImpl implements ContextMmu {
     this.unpinGraceTurns = Math.max(0, options.unpinGraceTurns ?? DEFAULT_UNPIN_GRACE_TURNS);
     this.batchEvictRatio = options.batchEvictRatio ?? DEFAULT_BATCH_EVICT_RATIO;
     this.watchDebounceMs = options.watchDebounceMs ?? DEFAULT_WATCH_DEBOUNCE_MS;
+    this.watchPollMs = options.watchPollMs ?? DEFAULT_WATCH_POLL_MS;
     this.pages = {
       read: (handle) => this.fault(handle),
       digest: (handle) => this.digest(handle),
@@ -395,6 +400,7 @@ class ContextMmuImpl implements ContextMmu {
     if (this.watcher === undefined) {
       this.watcher = new PathWatcher([], {
         debounceMs: this.watchDebounceMs,
+        pollMs: this.watchPollMs,
         onChange: (resolved) => this.handleChange(resolved),
       });
     }

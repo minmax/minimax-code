@@ -8,6 +8,14 @@
 // inode. Directories are watched non-recursively; every top-level change is
 // reported (the consumer simply ignores paths it has no bindings for).
 //
+// fs.watch is best-effort, though: FSEvents (darwin) can delay delivery by
+// tens of seconds under heavy concurrent I/O, some platforms stop emitting
+// entirely once the watched file is unlinked, and a directory that vanishes
+// and is recreated leaves the old watcher pointed at a dead inode. A stat
+// poll backstop (pollMs) therefore stats every subscribed path on a fixed
+// interval and reports mtime/size/inode changes — and disappearances — so
+// coherence is eventually correct even when the event stream stays silent.
+//
 // Subscriptions are reference-counted per resolved path: several `watch()`
 // calls may cover the same path, and the underlying `FSWatcher` is closed
 // only when the last disposer for that path detaches.
@@ -19,17 +27,37 @@ import path from 'node:path';
 export interface PathWatcherOptions {
   /** Coalescing window in ms; events within the window collapse into one callback. */
   debounceMs: number;
+  /**
+   * Stat-poll backstop interval in ms; `0` disables the backstop and trusts
+   * the fs.watch event stream alone. Default: 2000.
+   */
+  pollMs: number;
   /** Called with the resolved path of the changed file once the burst settles. */
   onChange(resolvedPath: string): void;
 }
 
+/** The stat fields the poll compares to detect a change or disappearance. */
+interface StatSnapshot {
+  ino: number;
+  mtimeMs: number;
+  size: number;
+}
+
 interface Subscription {
+  /** The resolved path this subscription covers (map key). */
+  target: string;
   /** Directory that `fs.watch` is attached to. */
   dir: string;
   /** Basename filter for file subscriptions; `undefined` watches a directory. */
   base: string | undefined;
   refs: number;
   watcher: FSWatcher;
+  /** Inode the current `fs.watch` is attached to (dirs: detects recreation). */
+  watchedIno: number;
+  /** Last stat seen by the poll; `undefined` after a seen disappearance. */
+  snapshot: StatSnapshot | undefined;
+  /** Backstop interval handle; absent when polling is disabled. */
+  pollTimer: NodeJS.Timeout | undefined;
 }
 
 export class PathWatcher {
@@ -74,6 +102,7 @@ export class PathWatcher {
         this.subscriptions.delete(target);
         subscription.watcher.close();
         this.cancelTimer(target);
+        this.cancelPoll(subscription);
       }
     }
   }
@@ -84,6 +113,7 @@ export class PathWatcher {
     for (const [target, subscription] of this.subscriptions) {
       subscription.watcher.close();
       this.cancelTimer(target);
+      this.cancelPoll(subscription);
     }
     this.subscriptions.clear();
   }
@@ -97,10 +127,14 @@ export class PathWatcher {
     const base = isDirectory ? undefined : path.basename(target);
 
     const subscription: Subscription = {
+      target,
       dir,
       base,
       refs: 1,
       watcher: undefined as unknown as FSWatcher,
+      watchedIno: stats.ino,
+      snapshot: snapshotOf(stats),
+      pollTimer: undefined,
     };
     const watcher = watch(dir, { persistent: false }, (_event, filename) => {
       if (this.disposed || this.subscriptions.get(target) !== subscription) {
@@ -120,7 +154,80 @@ export class PathWatcher {
     watcher.on('error', () => {});
     watcher.unref();
     subscription.watcher = watcher;
+    this.startPoll(target, subscription);
     return subscription;
+  }
+
+  /**
+   * The backstop: stats the subscribed path on a fixed interval and reports
+   * what the event stream may have missed — writes (mtime/size), a vanished
+   * file, and a directory deleted and recreated under a dead watcher.
+   */
+  private startPoll(target: string, subscription: Subscription): void {
+    if (this.options.pollMs <= 0) {
+      return;
+    }
+    const poll = setInterval(() => this.pollOnce(target, subscription), this.options.pollMs);
+    poll.unref();
+    subscription.pollTimer = poll;
+  }
+
+  private pollOnce(target: string, subscription: Subscription): void {
+    if (this.disposed || this.subscriptions.get(target) !== subscription) {
+      this.cancelPoll(subscription);
+      return;
+    }
+    let stats;
+    try {
+      stats = statSync(target);
+    } catch {
+      // Gone (or unreadable): report the disappearance exactly once — the
+      // snapshot stays undefined until the path exists again.
+      if (subscription.snapshot !== undefined) {
+        subscription.snapshot = undefined;
+        this.schedule(target);
+      }
+      return;
+    }
+    if (subscription.base === undefined && stats.ino !== subscription.watchedIno) {
+      // Directory deleted and recreated under a dead watcher: re-attach the
+      // event stream to the new inode, then report the recreation below.
+      subscription.watcher.close();
+      subscription.watcher = this.reattach(subscription);
+      subscription.watchedIno = stats.ino;
+    }
+    const next = snapshotOf(stats);
+    if (
+      subscription.snapshot === undefined ||
+      next.ino !== subscription.snapshot.ino ||
+      next.mtimeMs !== subscription.snapshot.mtimeMs ||
+      next.size !== subscription.snapshot.size
+    ) {
+      subscription.snapshot = next;
+      this.schedule(target);
+    }
+  }
+
+  /** Re-arms `fs.watch` for a directory subscription after its inode changed. */
+  private reattach(subscription: Subscription): FSWatcher {
+    const watcher = watch(subscription.dir, { persistent: false }, (_event, filename) => {
+      if (this.disposed || this.subscriptions.get(subscription.target) !== subscription) {
+        return;
+      }
+      const full =
+        filename === null ? subscription.dir : path.join(subscription.dir, filename);
+      this.schedule(full);
+    });
+    watcher.on('error', () => {});
+    watcher.unref();
+    return watcher;
+  }
+
+  private cancelPoll(subscription: Subscription): void {
+    if (subscription.pollTimer !== undefined) {
+      clearInterval(subscription.pollTimer);
+      subscription.pollTimer = undefined;
+    }
   }
 
   private schedule(resolved: string): void {
@@ -140,4 +247,8 @@ export class PathWatcher {
       this.timers.delete(resolved);
     }
   }
+}
+
+function snapshotOf(stats: { ino: number; mtimeMs: number; size: number }): StatSnapshot {
+  return { ino: stats.ino, mtimeMs: stats.mtimeMs, size: stats.size };
 }
