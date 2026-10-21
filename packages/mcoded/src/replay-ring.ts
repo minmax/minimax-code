@@ -2,9 +2,11 @@
  * The daemon's event replay ring: a bounded, cursor-addressed window of recent
  * runtime events that late or reconnecting clients can replay.
  *
- * Limits follow the mcode SSE turn stream (`local-runtime` `turn-stream.ts`):
- * a frame cap and a UTF-8 byte cap, evicting oldest-first in one pruning pass
- * — here pinned to the Ф4 contract values of 2000 frames / 8 MB. Eviction is
+ * Limits follow the shape of the mcode SSE turn stream (`local-runtime`
+ * `turn-stream.ts`): a frame cap and a UTF-8 byte cap, evicting oldest-first
+ * in one pruning pass. The Ф4 contract pins this ring to 2000 frames / 8 MB
+ * (the upstream turn stream currently runs 5000 frames / 8 MB — same byte
+ * budget, larger window). Eviction is
  * the only way frames leave the ring before shutdown; once a cursor has been
  * evicted it is gone forever, and a replay anchored before it must fail
  * loudly (`replay_gap`) instead of silently skipping events.
@@ -23,7 +25,8 @@ export interface ReplayLimits {
 }
 
 /**
- * Default limits, mirroring the mcode SSE replay budget (2000 frames / 8 MB).
+ * Default limits, pinned by the Ф4 contract (2000 frames / 8 MB; the mcode
+ * SSE turn stream shares the byte budget with a larger frame window).
  */
 export const DEFAULT_REPLAY_LIMITS: ReplayLimits = {
 	maxFrames: 2_000,

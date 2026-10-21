@@ -1,7 +1,8 @@
 /**
- * Replay ring limits (the ask's "ring limits" gate): the mcode SSE budget
- * (2000 frames / 8 MB) is pinned, and eviction behaves oldest-first with an
- * explicit, testable replay gap — never a silent skip.
+ * Replay ring limits (the ask's "ring limits" gate): the Ф4 contract budget
+ * (2000 frames / 8 MB — the byte budget the mcode SSE turn stream shares,
+ * with a smaller frame window) is pinned, and eviction behaves oldest-first
+ * with an explicit, testable replay gap — never a silent skip.
  *
  * @module
  */
@@ -10,7 +11,7 @@ import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_REPLAY_LIMITS, ReplayRing } from '../src/replay-ring.js';
 
-describe('default limits (mcode SSE budget)', () => {
+describe('default limits (Ф4 contract budget)', () => {
 	it('pin 2000 frames / 8 MB as the Ф4 contract states', () => {
 		expect(DEFAULT_REPLAY_LIMITS.maxFrames).toBe(2_000);
 		expect(DEFAULT_REPLAY_LIMITS.maxBytes).toBe(8 * 1024 * 1024);

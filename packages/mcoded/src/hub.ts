@@ -44,7 +44,7 @@ export interface McodedHubOptions {
 	readonly adapter: RuntimeAdapter;
 	/** Durable checkpoint seam. */
 	readonly checkpoint: CheckpointStore;
-	/** Replay window limits; defaults to the mcode SSE budget (2000 / 8 MB). */
+	/** Replay window limits; defaults to the Ф4 contract budget (2000 / 8 MB). */
 	readonly replayLimits?: Partial<ReplayLimits>;
 	/** Bounded wait for in-flight submissions during drain. Default 5000 ms. */
 	readonly drainTimeoutMs?: number;

@@ -96,7 +96,7 @@ export class McodedDaemonError extends Error {
 
 /** Hub tuning forwarded to the {@link McodedHub}. */
 export interface DaemonHubOptions {
-	/** Replay window limits; defaults to the mcode SSE budget (2000 / 8 MB). */
+	/** Replay window limits; defaults to the Ф4 contract budget (2000 / 8 MB). */
 	readonly replayLimits?: McodedHubOptions['replayLimits'];
 	/** Bounded wait for in-flight submissions during drain. */
 	readonly drainTimeoutMs?: number;

@@ -25,7 +25,8 @@ with an echo stub behind the runtime seam.
   pair (`transport.ts`) for tests and embedding, a `net.Socket` adapter
   (`socket-transport.ts`) for the daemon.
 - **Replay ring** (`replay-ring.ts`). Bounded window of recent event frames
-  with the mcode SSE budget (2000 frames / 8 MB, oldest-first eviction).
+  at the Ф4 contract budget (2000 frames / 8 MB, oldest-first eviction — the
+  shape of the mcode SSE turn stream, with a smaller frame window).
   Reconnects resume by cursor; anything evicted surfaces as an explicit
   `replay_gap`, never a silent skip.
 - **Crash-only restart** (`checkpoint.ts`). The one durable sliver of daemon
