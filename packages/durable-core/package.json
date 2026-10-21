@@ -1,0 +1,14 @@
+{
+	"name": "@mavis/durable-core",
+	"version": "0.1.0",
+	"description": "Type-only shared contracts of the durable-core wave: the single Entry/Commit declaration, the worker/backend dictionary reconciliation, the entryId uniqueness/replay contract, and the dead-letter (quarantine) ack contract. Ships no runtime code.",
+	"license": "MIT",
+	"type": "module",
+	"types": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/index.ts"
+		}
+	},
+	"private": true
+}

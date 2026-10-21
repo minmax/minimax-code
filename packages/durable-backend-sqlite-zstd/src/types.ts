@@ -4,9 +4,34 @@
  * The backend is an append-only delta log: the caller supplies entry content,
  * the backend stamps the log position (`seq`, `ordinal`) atomically with the
  * write and never rewrites a committed byte.
+ *
+ * The durable-core wave contract — the canonical `Entry`/`Commit` the storage
+ * worker speaks — is declared ONCE, type-only, in `@mavis/durable-core` and
+ * re-exported below as `DurableCoreEntry`/`DurableCoreCommit`. This package
+ * keeps its own published, richer dictionary (branded numeric `seq`/`batchId`,
+ * `entryCount`/`codec`/byte counts, read-side `Entry`); the field-by-field
+ * reconciliation of the two dictionaries is fixed in
+ * `packages/durable-core/src/contracts.ts`, and the runtime translation
+ * between them remains in `packages/storage-worker/src/sqlite-zstd-adapter.ts`
+ * — the only bridge.
  */
 
 import type { CodecName } from './codec.js';
+
+/**
+ * Canonical durable-core wave `Entry` (worker dictionary), re-exported
+ * type-only from `@mavis/durable-core`. Not this backend's runtime input —
+ * `appendBatch` keeps taking {@link EntryDraft} until the DB-side dictionary
+ * unification lands.
+ */
+export type { Entry as DurableCoreEntry } from '../../durable-core/src/index.js';
+
+/**
+ * Canonical durable-core wave `Commit` (worker dictionary: string
+ * `batchId`/`head`), re-exported type-only from `@mavis/durable-core`. This
+ * backend's {@link Commit} is richer and stays as published.
+ */
+export type { Commit as DurableCoreCommit } from '../../durable-core/src/index.js';
 
 declare const seqBrand: unique symbol;
 

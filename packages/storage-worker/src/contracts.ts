@@ -1,51 +1,23 @@
 /**
  * Public contracts of the storage worker.
  *
- * `Entry`/`Commit` below are the durable-core wave contract, pinned verbatim
- * by the storage-worker task spec:
+ * `Entry`/`Commit` are the durable-core wave contract and are declared ONCE,
+ * type-only, in `@mavis/durable-core` (`packages/durable-core`); this module
+ * re-exports them. The field-by-field reconciliation with the sqlite-zstd
+ * backend's richer (branded, `id`-keyed) dictionary is fixed in that single
+ * declaration too. The runtime translation between the dictionaries stays in
+ * `sqlite-zstd-adapter.ts` — the only bridge between the two.
  *
- *   Entry  = { entryId: string; parentId: string | null; kind: string;
- *              payload: unknown; bytes: number }
- *   Commit = { batchId: string; seq: number; head: string }
- *
- * The spec named `@mavis/durable-backend-sqlite-zstd` as the package that
- * would declare these types. The backend package as actually implemented
- * ships a different shape: its `appendBatch` takes `EntryDraft`
- * (`{ id, kind, payload }`, no `entryId`/`parentId`/`bytes`) and its `Commit`
- * carries branded numeric `batchId`/`seq`/`head` plus extra fields. Until the
- * two packages are reconciled on one shared declaration, the pinned shapes
- * are declared here so this package compiles and tests standalone; moving to
- * a shared declaration later is a one-line change in this file plus a re-export.
- *
- * The worker never depends on any backend at runtime — it only forwards
- * entries to whichever `StorageWorkerBackend` handle it was given.
+ * The import below is type-only: the worker never depends on any backend (or
+ * on anything else) at runtime — it only forwards entries to whichever
+ * `StorageWorkerBackend` handle it was given.
  *
  * @module
  */
 
-/** One record to persist; `bytes` drives the byte-bounded queue and batch windows. */
-export interface Entry {
-  /** Stable application identity, unique across the whole database. */
-  entryId: string;
-  /** Log position of the predecessor entry, `null` for the first entry. */
-  parentId: string | null;
-  /** Application-defined discriminator (for example a `pi.*` entry kind). */
-  kind: string;
-  /** JSON-serializable payload stored inside the batch frame. */
-  payload: unknown;
-  /** Serialized size of the entry in bytes; the unit of queue/window budgets. */
-  bytes: number;
-}
+import type { Commit, Entry } from '../../durable-core/src/index.js';
 
-/** Result of one committed batch, as produced by `backend.appendBatch`. */
-export interface Commit {
-  /** Primary key of the stored batch. */
-  batchId: string;
-  /** Strictly increasing sequence of this commit. */
-  seq: number;
-  /** Log head after the commit. */
-  head: string;
-}
+export type { Commit, Entry };
 
 /**
  * The persistence surface the worker drives. `appendBatch` must persist the
@@ -165,3 +137,41 @@ export interface StorageWorker {
    */
   dispose(): Promise<void>;
 }
+
+// ---------------------------------------------------------------------------
+// Checkpoint policy: interrupted effects (SE-SW-002)
+// ---------------------------------------------------------------------------
+
+/**
+ * Outcome label for a tool call whose effect could not be confirmed
+ * (`final-architecture.md` checkpoint policy: "Прерванный вызов получает
+ * TOOL_OUTCOME_UNKNOWN без автоповтора").
+ *
+ * Contract:
+ * - A call is interrupted when its completion cannot be observed — aborted
+ *   mid-flight, or the durability barrier between the committed intent and
+ *   the recorded result failed. The effect MAY or MAY NOT have taken place.
+ * - An interrupted call is NEVER retried automatically: re-running an effect
+ *   with an unconfirmed outcome risks a double effect. A next attempt is only
+ *   allowed as an explicit recovery decision (see
+ *   `RunToolEffectOptions.allowAfterUnknownOutcome` in `checkpoint-policy.ts`).
+ */
+export const TOOL_OUTCOME_UNKNOWN = 'tool-outcome-unknown';
+
+/** Terminal outcomes of one tool call under the checkpoint policy. */
+export type ToolOutcome = 'completed' | 'failed' | typeof TOOL_OUTCOME_UNKNOWN;
+
+/**
+ * Discriminated result of one tool effect driven through the checkpoint
+ * barrier (`createCheckpointBarrier`):
+ * - `completed` — the effect ran to completion and reported a value;
+ * - `failed` — the effect itself reported a definitive failure (`error`);
+ *   nothing was retried;
+ * - {@link TOOL_OUTCOME_UNKNOWN} — the call was interrupted after the
+ *   durability barrier; the effect's outcome is unconfirmed and auto-retry is
+ *   forbidden (see {@link TOOL_OUTCOME_UNKNOWN}).
+ */
+export type ToolEffectOutcome<A = unknown> =
+  | { readonly outcome: 'completed'; readonly value: A }
+  | { readonly outcome: 'failed'; readonly error: Error }
+  | { readonly outcome: typeof TOOL_OUTCOME_UNKNOWN };
