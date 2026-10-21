@@ -192,9 +192,17 @@ export class PathWatcher {
     if (subscription.base === undefined && stats.ino !== subscription.watchedIno) {
       // Directory deleted and recreated under a dead watcher: re-attach the
       // event stream to the new inode, then report the recreation below.
-      subscription.watcher.close();
-      subscription.watcher = this.reattach(subscription);
-      subscription.watchedIno = stats.ino;
+      // The path can vanish again between the stat and the watch — a throw
+      // here would escape the interval callback and crash the process, so
+      // stay on the (dead) watcher and let the next tick retry.
+      try {
+        const replacement = this.reattach(subscription);
+        subscription.watcher.close();
+        subscription.watcher = replacement;
+        subscription.watchedIno = stats.ino;
+      } catch {
+        return;
+      }
     }
     const next = snapshotOf(stats);
     if (
