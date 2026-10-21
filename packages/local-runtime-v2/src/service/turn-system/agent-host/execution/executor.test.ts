@@ -81,6 +81,8 @@ import {
   type LocalRuntimeTurnRunnerInput,
   type LocalRuntimeTurnRunnerResult,
 } from "./executor.js";
+import { turnCheckpointBarrier } from "./turn-checkpoint-policy.js";
+import type { StorageWorker } from "@mavis/storage-worker";
 import { localPluginHookCoordinator } from "../assembly/local-turn-plugin-hooks.js";
 import { NativeLocalTurnExecutionPreparationSource } from "../assembly/local-turn-execution-preparation.js";
 import { LocalTurnInputPreparer } from "../assembly/local-turn-input-preparation.js";
@@ -6341,5 +6343,129 @@ describe("incremental runtime event outcomes", () => {
     const executor = new LocalRuntimeTurnExecutor({ ...runnerOptions,
       runtime: { ...runnerOptions.runtime, acceptsEventSummary } });
     await expect(executor.execute(executionInput())).resolves.toEqual({ status: "completed" });
+  });
+});
+
+function checkpointWorker(
+  checkpointCalls: string[],
+  readCheckpointError?: () => Error | undefined,
+): StorageWorker {
+  return {
+    enqueue: async () => undefined,
+    flush: async () => null,
+    checkpoint: async () => {
+      checkpointCalls.push("checkpoint");
+      const error = readCheckpointError?.();
+      if (error) throw error;
+    },
+    quarantined: [],
+    dispose: async () => undefined,
+  };
+}
+
+describe("LocalRuntimeTurnExecutor checkpoint policy wiring (SE-SW-002)", () => {
+  it("puts the fail-closed durability flush first in beforeLlmCallHook", async () => {
+    const checkpointCalls: string[] = [];
+    const failure: { error?: Error } = {};
+    let captured: LocalRuntimeTurnRunnerInput<LocalToolContext> | undefined;
+    const executorOptions = options(async (runInput) => {
+      captured = runInput;
+      await runInput.eventWriter.pushRuntime(terminalEvent(RuntimeEventStatus.COMPLETED));
+    });
+    const runner = new LocalRuntimeTurnExecutor({
+      ...executorOptions,
+      checkpointBarrier: turnCheckpointBarrier(
+        checkpointWorker(checkpointCalls, () => failure.error),
+      ),
+    });
+    const input = executionInput();
+    await expect(runner.execute(input)).resolves.toEqual({ status: "completed" });
+
+    const hooks = captured?.hooks?.beforeLlmCallHook ?? [];
+    // First position: durability is confirmed before any other before-LLM
+    // decision, ahead of the assembled runtime hooks.
+    expect(hooks[0]).toEqual(expect.any(Function));
+    expect(hooks[1]).toBe(input.assembly.hooks.beforeLlmCallHook?.[0]);
+    const hookInput = {
+      sessionId: "session-1",
+      turnId: "turn-1",
+      phase: "initial",
+    } as PiBeforeLlmCallHookInput;
+    // A confirmed barrier emits no decision: the request proceeds.
+    expect(await hooks[0]?.(hookInput)).toBeUndefined();
+    expect(checkpointCalls).toEqual(["checkpoint"]);
+    // Fail-closed: a barrier failure aborts the request before it is issued.
+    failure.error = new Error("worker sealed");
+    expect(await hooks[0]?.(hookInput)).toMatchObject({
+      type: "abort",
+      reason: expect.stringContaining("checkpoint policy"),
+    });
+  });
+
+  it("runs every admitted tool effect under the barrier", async () => {
+    const checkpointCalls: string[] = [];
+    const tool: RuntimeTool = {
+      def: {
+        name: "echo",
+        description: "echo tool",
+        schema: { type: "object" } as never,
+      },
+      impl: {
+        execute: async () => ({
+          tool_name: "echo",
+          text: "ok",
+          content: [{ type: "text", text: "ok" }],
+        }),
+      },
+    };
+    let captured: LocalRuntimeTurnRunnerInput<LocalToolContext> | undefined;
+    const executorOptions = options(async (runInput) => {
+      captured = runInput;
+      await runInput.eventWriter.pushRuntime(terminalEvent(RuntimeEventStatus.COMPLETED));
+    });
+    const runner = new LocalRuntimeTurnExecutor({
+      ...executorOptions,
+      checkpointBarrier: turnCheckpointBarrier(checkpointWorker(checkpointCalls)),
+    });
+    await runner.execute(
+      executionInput({ assembly: { ...assembly(), tools: [tool] } }),
+    );
+
+    const wrapped = captured?.tools?.find((candidate) => candidate.def.name === "echo");
+    expect(wrapped).toBeDefined();
+    expect(wrapped?.impl).not.toBe(tool.impl);
+    const result = await wrapped!.impl.execute(
+      { sessionId: "session-1", turnId: "turn-1", toolCallId: "call-1" },
+      {},
+    );
+    expect(result.text).toBe("ok");
+    // The flush strictly precedes the effect (one checkpoint for the call).
+    expect(checkpointCalls).toEqual(["checkpoint"]);
+  });
+
+  it("leaves the turn path untouched without a barrier", async () => {
+    const tool: RuntimeTool = {
+      def: {
+        name: "echo",
+        description: "echo tool",
+        schema: { type: "object" } as never,
+      },
+      impl: { execute: vi.fn(async () => ({
+        tool_name: "echo",
+        text: "ok",
+        content: [{ type: "text", text: "ok" }],
+      })) },
+    };
+    let captured: LocalRuntimeTurnRunnerInput<LocalToolContext> | undefined;
+    const executorOptions = options(async (runInput) => {
+      captured = runInput;
+      await runInput.eventWriter.pushRuntime(terminalEvent(RuntimeEventStatus.COMPLETED));
+    });
+    await new LocalRuntimeTurnExecutor(executorOptions).execute(
+      executionInput({ assembly: { ...assembly(), tools: [tool] } }),
+    );
+    expect(captured?.tools?.find((candidate) => candidate.def.name === "echo")?.impl).toBe(
+      tool.impl,
+    );
   });
 });
