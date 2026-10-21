@@ -27,42 +27,19 @@
 import os from 'node:os';
 import { join } from 'node:path';
 
+// The `cas://` reference format and the fatal store-error classification are
+// single-sourced in `@mavis/cas` (`cas-ref` / `store-errors`). The local
+// copies this module used to carry ("format synchronized with
+// @mavis/agent-tools truncation/cas-spill; if either side changes, update
+// both") were removed: a drift between the copies would break cross-reading
+// references between the spill tools and the v2 import. The re-exports below
+// keep this module's public surface unchanged.
+import { casSpillRef, parseCasSpillRef } from '@mavis/cas/cas-ref';
+import { errnoCodeOf, FATAL_STORE_ERROR_CODES } from '@mavis/cas/store-errors';
+
 import type { V2ImageHook } from './session-reader.js';
 
-/**
- * Canonical `cas://` reference builder and parser for stored blobs.
- *
- * Local pin of the canonical helpers in `@mavis/agent-tools`
- * (`src/truncation/cas-spill.ts`, `casSpillRef`/`parseCasSpillRef`): same
- * format, same parse pattern. This adapter cannot import them today — the
- * `@mavis/agent-tools` export map exposes no truncation subpath and this
- * package deliberately carries no dependency on it — so the format is
- * pinned here in one place (builder AND parser together) and every ref this
- * package builds or accepts flows through these two functions. If the
- * canonical module ever becomes importable, replace these two functions
- * with the real import and nothing else changes.
- *
- * Format synchronized with `@mavis/agent-tools` `truncation/cas-spill`;
- * if either side changes the ref format or the parse pattern, update both.
- */
-
-/** Lowercase-hex SHA-256 digest followed by the byte size. */
-const CAS_SPILL_REF_PATTERN = /^cas:\/\/sha256\/([0-9a-f]{64})#(\d+)$/u;
-
-/** Builds the canonical `cas://sha256/<digest>#<size in bytes>` reference. */
-export function casSpillRef(sha256: string, size: number): string {
-	return `cas://sha256/${sha256}#${size}`;
-}
-
-/** Parses a reference produced by {@link casSpillRef}; `null` when foreign. */
-export function parseCasSpillRef(reference: string): {
-	readonly sha256: string;
-	readonly size: number;
-} | null {
-	const match = CAS_SPILL_REF_PATTERN.exec(reference);
-	if (match === null) return null;
-	return { sha256: match[1]!, size: Number(match[2]) };
-}
+export { casSpillRef, parseCasSpillRef };
 
 /**
  * Canonical base64 acceptance for image payloads. `Buffer.from(..., 'base64')`
@@ -149,18 +126,13 @@ export class CasSpillError extends Error {
 }
 
 /**
- * errno codes that mean the store or its volume is broken. A `putBytes`
+ * errno codes that mean the store or its volume is broken live in
+ * `@mavis/cas/store-errors` ({@link FATAL_STORE_ERROR_CODES}, imported
+ * above): the same set the agent-tools spill classifies with, so both seams
+ * refuse the inline degradation on exactly the same failures. A `putBytes`
  * failure with one of these must never degrade to inline: the history log
  * would silently absorb the blob bytes the CAS was supposed to keep out.
  */
-const FATAL_STORE_ERROR_CODES: ReadonlySet<string> = new Set([
-	'ENOSPC', // volume full
-	'EDQUOT', // quota exceeded
-	'EACCES', // permission denied
-	'EPERM', // operation not permitted
-	'EROFS', // read-only filesystem
-	'EIO', // I/O error
-]);
 
 /** Bound on the base64 -> reference memoization (repeated image blocks). */
 const REF_CACHE_LIMIT = 128;
@@ -171,10 +143,6 @@ function rememberRef(cache: Map<string, string>, base64: string, ref: string): v
 		if (!oldest.done) cache.delete(oldest.value);
 	}
 	cache.set(base64, ref);
-}
-
-function errnoCode(error: unknown): string | undefined {
-	return (error as NodeJS.ErrnoException | null | undefined)?.code;
 }
 
 function errorText(error: unknown): string {
@@ -217,7 +185,7 @@ export function createCasImageHook(store: CasStoreLike, onIssue?: CasIssueListen
 			rememberRef(refCache, base64, ref);
 			return ref;
 		} catch (error) {
-			const code = errnoCode(error);
+			const code = errnoCodeOf(error);
 			if (code !== undefined && FATAL_STORE_ERROR_CODES.has(code)) {
 				throw new CasSpillError(
 					`CAS store rejected image bytes (${code}); refusing to keep the blob inline: ${errorText(error)}`,
@@ -289,7 +257,7 @@ async function openStoreHook(root: string, policy: CasHookPolicy | undefined): P
 		const store = await casModule.openCas(root);
 		return createCasImageHook(store, policy?.onIssue);
 	} catch (error) {
-		const code = errnoCode(error);
+		const code = errnoCodeOf(error);
 		const message = `CAS is unavailable at "${root}" (${code ?? 'unresolvable @mavis/cas'}): ${errorText(error)}`;
 		if (policy?.casUnavailable !== 'keep-inline') {
 			// Default policy: never degrade silently — fail the import loudly.

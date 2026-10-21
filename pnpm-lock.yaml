@@ -408,6 +408,9 @@ importers:
       '@mavis/background-task':
         specifier: workspace:^
         version: link:../agent-modules/background-task
+      '@mavis/cas':
+        specifier: workspace:*
+        version: link:../cas
       '@mavis/context-manager':
         specifier: workspace:^
         version: link:../agent-modules/context-manager
@@ -460,9 +463,6 @@ importers:
         specifier: ^3
         version: 3.25.76
     devDependencies:
-      '@mavis/cas':
-        specifier: workspace:*
-        version: link:../cas
       '@types/js-yaml':
         specifier: ^4
         version: 4.0.9

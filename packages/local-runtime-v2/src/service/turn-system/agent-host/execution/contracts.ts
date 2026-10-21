@@ -20,6 +20,7 @@ import type {
   AgentHostChannelContext,
   ContextUsagePromptRange,
 } from '../preparation/contracts.js';
+import type { CheckpointBarrier } from './turn-checkpoint-policy.js';
 import type { SessionRecord } from '../../../session-system/index.js';
 import type {
   AgentHostFileChangeObservation,
@@ -198,6 +199,8 @@ export interface LocalTurnHookMergeOptions<
   readonly toolResolution: LocalTurnPermissionResolution<TContext>;
   readonly pendingToolResultTailClaims: Set<string>;
   readonly hostBeforeLlmCallHooks: readonly PiBeforeLlmCallHook[];
+  /** SE-SW-002: fail-closed durability flush before every provider request. */
+  readonly checkpointBarrier?: CheckpointBarrier;
   readonly readTaskOutputTaskIds: Set<string>;
   readonly terminalTaskOutputReadIds?: Set<string>;
   readonly toolsDisabled: boolean;
@@ -316,6 +319,22 @@ export interface LocalRuntimeTurnExecutorOptions<
   /** TUI-only region policy: only CN TUI hosts review MiniMax-managed turns. */
   readonly contentReviewEnabled?: boolean;
   readonly disableTools?: boolean;
+  /**
+   * SE-SW-002 checkpoint policy: the durability barrier composed around a
+   * durable storage worker. When present, every provider request is preceded
+   * by a fail-closed flush (`beforeLlmRequest`) and every tool effect of the
+   * turn runs under the barrier (`runToolEffect`): an interrupted call is
+   * recorded as `TOOL_OUTCOME_UNKNOWN` and never re-run implicitly.
+   * Compositions without a durable storage worker omit it; the turn path
+   * behaves exactly as before.
+   */
+  readonly checkpointBarrier?: CheckpointBarrier;
+  /**
+   * Explicit recovery decision of the checkpoint policy: allows re-running a
+   * tool call whose earlier recorded outcome was `TOOL_OUTCOME_UNKNOWN`.
+   * Default: forbidden — the previous attempt may have taken effect already.
+   */
+  readonly checkpointAllowAfterUnknownOutcome?: boolean;
   /** Creates isolated safety state once for each admitted product Turn. */
   readonly createTurnToolSafetyGuard?: () => LocalTurnToolSafetyGuard;
   readonly toolPolicyGuard?: LocalTurnToolPolicyGuard;

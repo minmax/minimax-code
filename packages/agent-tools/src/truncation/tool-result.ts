@@ -6,7 +6,7 @@ import {
   type DesktopOutputContinuationHint,
 } from '../desktop/output-limit.js';
 import type { ToolOutputSpill } from './spill.js';
-import { base64SpillFromHook } from './cas-spill.js';
+import { base64SpillFromHook, isCasSpillFatalError } from './cas-spill.js';
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead, truncateTail } from './truncate.js';
 
 export interface ToolResultTruncationOptions {
@@ -47,9 +47,16 @@ export interface ToolResultTruncationOptions {
  * `[image: cas://sha256/<digest>#<size>]` text placeholder, the same
  * reference shape and placeholder convention the v2 importer and the wire
  * compiler publish. Blocks that cannot be externalized (no hook, hook
- * without a base64-native put, hook failure, or video/documents, which have
- * no inline-base64 contract here) stay untouched, and the text part is
- * truncated exactly like a text-only result.
+ * without a base64-native put, non-fatal hook failure, or video/documents,
+ * which have no inline-base64 contract here) stay untouched, and the text
+ * part is truncated exactly like a text-only result.
+ *
+ * A FATAL store failure (ENOSPC/EDQUOT/EACCES/EPERM/EROFS/EIO — the
+ * `@mavis/cas` fatal family) is never converted into an inline block: the
+ * image path fails this result loudly (the hook throws
+ * `CasSpillFatalError`, which propagates), and the text path rethrows it
+ * from {@link spillFullOutput} — a silently unreferenced full payload on a
+ * broken volume is the same "worse outcome" the v2 importer refuses.
  */
 export async function truncateToolResultText(
   result: ToolResult,
@@ -133,8 +140,11 @@ export async function truncateToolResultText(
 /**
  * Replace inline base64 image blocks with `[image: cas://…]` text placeholders
  * backed by the spill sink. Best-effort per block: a hook without a
- * base64-native put, or a failing store, keeps that block inline. Video and
- * document blocks have no inline-base64 contract here and always stay.
+ * base64-native put, or a non-fatal failing store (reported by the hook's
+ * diagnostics channel), keeps that block inline. A FATAL store error
+ * (`CasSpillFatalError`) propagates — the result is never completed with the
+ * image left inline. Video and document blocks have no inline-base64
+ * contract here and always stay.
  */
 async function externalizeInlineImages(
   result: ToolResult,
@@ -216,8 +226,10 @@ function buildTruncationNotice(context: {
 }
 
 /**
- * Delegate the full payload to the spill hook. Best-effort: a failing sink
- * keeps the result usable without a full-output reference.
+ * Delegate the full payload to the spill hook. Best-effort: a non-fatal
+ * failing sink keeps the result usable without a full-output reference. A
+ * fatal store error (`CasSpillFatalError`) is rethrown — on a broken volume
+ * the truncation must not pretend the complete payload is retrievable.
  */
 async function spillFullOutput(
   spill: ToolOutputSpill | undefined,
@@ -226,7 +238,8 @@ async function spillFullOutput(
   if (!spill) return undefined;
   try {
     return await spill.spill(payload);
-  } catch {
+  } catch (error) {
+    if (isCasSpillFatalError(error)) throw error;
     return undefined;
   }
 }

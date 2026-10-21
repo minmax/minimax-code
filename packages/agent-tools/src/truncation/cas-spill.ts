@@ -21,7 +21,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
+// The `cas://` reference format and the fatal store-error classification are
+// single-sourced in `@mavis/cas` (`cas-ref` / `store-errors`); both are
+// re-exported here so this module stays the truncation-seam's public surface.
+// Only the FORMAT module is a runtime import — the store itself stays
+// structural (`CasSpillStoreLike`), composition happens at the call site.
+import { casSpillRef } from '@mavis/cas/cas-ref';
+import { errnoCodeOf, isFatalStoreError } from '@mavis/cas/store-errors';
+
 import type { ToolOutputSpill } from './spill.js';
+
+export { casSpillRef, parseCasSpillRef } from '@mavis/cas/cas-ref';
+export { FATAL_STORE_ERROR_CODES, isFatalStoreError } from '@mavis/cas/store-errors';
 
 /** Result of publishing content into the spill store. */
 export interface CasSpillPutResult {
@@ -91,26 +102,73 @@ export const STRING_SPILL_FILE_THRESHOLD_BYTES = 1024 * 1024;
 const STRING_STAGING_CHUNK_UNITS = 1 << 16;
 
 /**
- * Canonical `cas://` reference for a stored blob: parseable, and human- and
- * model-readable (`cas://sha256/<digest>#<size in bytes>`).
+ * Thrown when the store fails with a fatal filesystem error (disk full,
+ * quota, permission, read-only, I/O — the {@link FATAL_STORE_ERROR_CODES}
+ * family classified by `@mavis/cas/store-errors`). The spill never degrades
+ * such a failure to `undefined`: for the image path that would silently
+ * flood the history log with inline base64, the exact outcome the CAS
+ * exists to prevent (same policy as the v2 importer's `CasSpillError`).
+ * Non-fatal store failures degrade to `undefined` and are reported to the
+ * caller's diagnostics listener instead.
  */
-export function casSpillRef(sha256: string, size: number): string {
-	return `cas://sha256/${sha256}#${size}`;
+export class CasSpillFatalError extends Error {
+	readonly code: string | undefined;
+
+	constructor(message: string, options?: { readonly cause?: unknown; readonly code?: string }) {
+		super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
+		this.name = 'CasSpillFatalError';
+		this.code = options?.code;
+	}
 }
 
-/** Parses a reference produced by {@link casSpillRef}; `null` when foreign. */
-export function parseCasSpillRef(reference: string): { readonly sha256: string; readonly size: number } | null {
-	const match = /^cas:\/\/sha256\/([0-9a-f]{64})#(\d+)$/u.exec(reference);
-	if (match === null) return null;
-	return { sha256: match[1], size: Number(match[2]) };
+/** Whether `error` is a spill failure that must never degrade to `undefined`. */
+export function isCasSpillFatalError(error: unknown): boolean {
+	return error instanceof CasSpillFatalError;
 }
+
+/** One reported spill degradation (a non-fatal store failure). */
+export interface CasSpillIssue {
+	readonly message: string;
+	/** errno-style code when the underlying failure carries one. */
+	readonly code?: string | undefined;
+	readonly cause?: unknown;
+}
+
+/** Diagnostics channel: receives every non-fatal spill degradation. */
+export type CasSpillIssueListener = (issue: CasSpillIssue) => void;
 
 /**
  * Creates a spill hook that persists the full output payload into the CAS
- * store. Ordinary store failures degrade to `undefined` (the truncated result
- * simply carries no full-output reference), matching the hook contract.
+ * store. Failure policy is differentiated, never silent:
+ *
+ * - fatal store errors (ENOSPC/EDQUOT/EACCES/EPERM/EROFS/EIO) throw
+ *   {@link CasSpillFatalError} — the caller fails loudly instead of writing
+ *   the payload inline into the log;
+ * - any other store failure degrades to `undefined` (the truncated result
+ *   simply carries no full-output reference) and is reported to `onIssue`.
  */
-export function createCasToolOutputSpill(store: CasSpillStoreLike): CasToolOutputSpill {
+export function createCasToolOutputSpill(
+	store: CasSpillStoreLike,
+	onIssue?: CasSpillIssueListener,
+): CasToolOutputSpill {
+	const degrade = (operation: string, error: unknown): undefined => {
+		const code = errnoCodeOf(error);
+		if (isFatalStoreError(error)) {
+			throw new CasSpillFatalError(
+				`CAS store rejected the spill (${operation}${code === undefined ? '' : `, ${code}`}); ` +
+					`refusing to fall back to an unreferenced/inline payload: ${errorText(error)}`,
+				{ cause: error, code },
+			);
+		}
+		onIssue?.({
+			message:
+				`CAS store ${operation} failed (${code ?? 'unknown error'}); ` +
+				`degrading to a result without a full-output reference: ${errorText(error)}`,
+			code,
+			cause: error,
+		});
+		return undefined;
+	};
 	return {
 		async spill(payload: string): Promise<string | undefined> {
 			try {
@@ -119,8 +177,8 @@ export function createCasToolOutputSpill(store: CasSpillStoreLike): CasToolOutpu
 						? await putStringViaFile(store, payload)
 						: await store.putBytes(Buffer.from(payload, 'utf8'));
 				return casSpillRef(put.sha256, put.size);
-			} catch {
-				return undefined;
+			} catch (error) {
+				return degrade('putBytes', error);
 			}
 		},
 		async spillFile(sourcePath: string): Promise<string | undefined> {
@@ -128,8 +186,8 @@ export function createCasToolOutputSpill(store: CasSpillStoreLike): CasToolOutpu
 			try {
 				const put = await store.putFile(sourcePath);
 				return casSpillRef(put.sha256, put.size);
-			} catch {
-				return undefined;
+			} catch (error) {
+				return degrade('putFile', error);
 			}
 		},
 		async spillBase64(base64: string): Promise<string | undefined> {
@@ -140,11 +198,15 @@ export function createCasToolOutputSpill(store: CasSpillStoreLike): CasToolOutpu
 					? await store.putBase64(base64)
 					: await store.putBytes(Buffer.from(base64, 'base64'));
 				return casSpillRef(put.sha256, put.size);
-			} catch {
-				return undefined;
+			} catch (error) {
+				return degrade('putBase64', error);
 			}
 		},
 	};
+}
+
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 /**

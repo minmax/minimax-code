@@ -4,8 +4,13 @@
 // only the retained window, then `ProjectionService.fromCapsule` over the
 // slice — the log is NEVER materialized; RAM holds the window alone.
 //
-// This is the path bench-open.mjs contrasts with: that one reads and
-// JSON.parses the WHOLE fixture (the legacy materialization this replaces).
+// NOTE (round-2 review): the streamed scan is O(fixture size) — 6.5 s on a
+// 12.9 GB corpus — so THE GATE for "открытие ≤1 с при любом размере" lives
+// in bench-open-backend.mjs: the real indexed backend path (capsule meta row
+// + range read), O(window) at any size, with the opt-in 10 GB gate. This
+// bench stays as the fixed-window fold measurement over a file fixture and
+// the legacy-contrast companion of bench-open.mjs (which reads and
+// JSON.parses the WHOLE fixture).
 //
 // CORPUS: the FIXTURE jsonl. Each line becomes one frozen entry; only the
 // last WINDOW lines are retained in memory — history size above the window

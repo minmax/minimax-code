@@ -28,6 +28,14 @@ Baseline import; no upstream source files are changed.
 - Both renames exist only to avoid colliding with pi's npm publication. Dependency declarations still reference the upstream internal names (`@earendil-works/*`) on purpose.
 - `../../tsconfig.base.json` (repository `src/tsconfig.base.json`): created for this vendor import, content identical to the upstream `pi` root `tsconfig.base.json`, because both vendored `tsconfig.build.json` files extend `../../tsconfig.base.json`.
 
+### 2026-10-21 — removed the `test` scripts (MiniMax-specific glue, not upstream material)
+
+- Affected: `pi-durable/package.json` (`test` script: `vitest --run && PI_DURABLE_DOCUMENT_RETENTION_MS=0 vitest --run && npm run test:workers` removed), `chord/package.json` (`test` script: `vitest --run` removed).
+- Reason: both suites require the full upstream monorepo that this distribution does not vendor — `test/telemetry-sqlite.test.ts` imports `../../telemetry/src/testing/index.ts` (no `third_party/telemetry` exists), pi-durable tests import `../../ai/src/api/*.ts` (no `third_party/ai`; see "TypeScript paths left dangling on purpose") and resolve `@earendil-works/pi-codemode` (declared, not vendored) — and chord's `test/context.test.ts` calls `addLink`, which the vendored `@earendil-works/pi-telemetry@1.3.0` spans do not implement. Their suites are excluded from this distribution's verification per `src/AGENTS.md` ("Their test suites are not part of this distribution's verification"); keeping the scripts only made the workspace-wide `pnpm -r test` fail (`ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL @minimax/local/chord@1.3.0`).
+- Failure counts at removal time: chord 3 files / 2 tests failed of 50 files / 548; pi-durable 45 files / 632 tests failed of 70 files / 1170.
+- `pi-durable`'s `test:workers` script is kept — `pnpm -r test` never invokes it.
+- Validation: `pnpm -r test` green across all workspace packages (2026-10-21); `node scripts/run-vitest-suite.mjs status-contract|policy|sandbox` green.
+
 ## Required from the integrator
 
 Dependency declarations were left untouched; the integrator must resolve them on the next step. Both packages declare `engines: node >=22.19.0`.

@@ -10,9 +10,11 @@ import type { ToolResult, ToolResultContent } from '@mavis/agent-core/tools';
 import { openCas } from '@mavis/cas';
 
 import {
+  CasSpillFatalError,
   casSpillRef,
   createCasToolOutputSpill,
   fileSpillFromHook,
+  isCasSpillFatalError,
   parseCasSpillRef,
   STRING_SPILL_FILE_THRESHOLD_BYTES,
 } from './cas-spill.js';
@@ -95,6 +97,107 @@ describe('CAS tool-output spill', () => {
       },
     });
     await expect(spill.spill('payload')).resolves.toBeUndefined();
+  });
+
+  it('reports every non-fatal degradation to the diagnostics channel', async () => {
+    const issues: string[] = [];
+    const spill = createCasToolOutputSpill(
+      {
+        putBytes: async () => {
+          throw Object.assign(new Error('transient'), { code: 'EAGAIN' });
+        },
+      },
+      (issue) => issues.push(`${issue.code}: ${issue.message}`),
+    );
+    await expect(spill.spill('payload')).resolves.toBeUndefined();
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toContain('EAGAIN');
+    expect(issues[0]).toContain('degrading');
+  });
+
+  it('refuses to degrade on fatal store errors: ENOSPC throws, never returns undefined', async () => {
+    const failure = (): Error => Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+    const spill = createCasToolOutputSpill({
+      putBytes: async () => {
+        throw failure();
+      },
+      putFile: async () => {
+        throw failure();
+      },
+      putBase64: async () => {
+        throw failure();
+      },
+    });
+    // The image path depends on this: an `undefined` here would put the
+    // inline base64 payload back into the history log.
+    await expect(spill.spillBase64('aGVsbG8=')).rejects.toThrow(CasSpillFatalError);
+    await expect(spill.spillBase64('aGVsbG8=')).rejects.toThrow(/ENOSPC/);
+    await expect(spill.spill('payload')).rejects.toThrow(CasSpillFatalError);
+    await expect(spill.spillFile('/tmp/any-path')).rejects.toThrow(CasSpillFatalError);
+    expect(isCasSpillFatalError(new Error('plain'))).toBe(false);
+  });
+
+  it('classifies the same fatal errno family as the v2 importer on every put entry point', async () => {
+    for (const code of ['ENOSPC', 'EDQUOT', 'EACCES', 'EPERM', 'EROFS', 'EIO']) {
+      const spill = createCasToolOutputSpill({
+        putBytes: async () => {
+          throw Object.assign(new Error(code), { code });
+        },
+        putBase64: async () => {
+          throw Object.assign(new Error(code), { code });
+        },
+        putFile: async () => {
+          throw Object.assign(new Error(code), { code });
+        },
+      });
+      await expect(spill.spillBase64('aGVsbG8=')).rejects.toThrow(CasSpillFatalError);
+      await expect(spill.spill('payload')).rejects.toThrow(CasSpillFatalError);
+      await expect(spill.spillFile('/tmp/any-path')).rejects.toThrow(CasSpillFatalError);
+    }
+  });
+
+  it('fails truncation loudly instead of keeping an inline image on a fatal store error', async () => {
+    // The gate from the wave invariant ("base64 is forbidden in the log from
+    // the first commit"): putBytes fails with ENOSPC -> there is NO result
+    // containing the inline base64, the externalization fails the result.
+    // The text fits the limits on purpose: only the image path runs.
+    const spill = createCasToolOutputSpill({
+      putBytes: async () => {
+        throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+      },
+      putBase64: async () => {
+        throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+      },
+    });
+    const image = { type: 'image' as const, data: 'aGVsbG8='.repeat(16384), mimeType: 'image/png' };
+    const result: ToolResult = {
+      tool_name: 'bash',
+      text: 'tiny',
+      content: [{ type: 'text', text: 'tiny' }, image],
+      details: {},
+    };
+    await expect(truncateToolResultText(result, { spill })).rejects.toThrow(CasSpillFatalError);
+    // A non-fatal store error keeps the documented tolerant degradation.
+    const tolerant = createCasToolOutputSpill({
+      putBytes: async () => {
+        throw Object.assign(new Error('transient'), { code: 'EAGAIN' });
+      },
+      putBase64: async () => {
+        throw Object.assign(new Error('transient'), { code: 'EAGAIN' });
+      },
+    });
+    const degraded = await truncateToolResultText(result, { spill: tolerant });
+    expect(degraded.content[1]).toBe(image);
+  });
+
+  it('rethrows a fatal error from the full-output text spill instead of losing the payload silently', async () => {
+    const spill = createCasToolOutputSpill({
+      putBytes: async () => {
+        throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+      },
+    });
+    const text = Array.from({ length: 5000 }, (_, index) => `row-${index}-${'x'.repeat(60)}`).join('\n');
+    await expect(truncateToolResultText(textResult(text), { spill })).rejects.toThrow(/ENOSPC/);
   });
 
   it('prefers putBytes for small payloads and stages large ones through a chunked temp file', async () => {

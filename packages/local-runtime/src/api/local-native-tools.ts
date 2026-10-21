@@ -73,13 +73,16 @@ export type {
  * The store is opened lazily on the first spill — building the per-Turn tool
  * set must stay synchronous and must not touch the filesystem when no output
  * is ever truncated — and memoized per `buildLocalNativeRuntimeTools` call so
- * concurrent spills share one store handle. Every failure degrades to
+ * concurrent spills share one store handle. Non-fatal failures degrade to
  * `undefined` (a truncated result without a full-output reference), matching
- * the {@link ToolOutputSpill} contract. All three entry points are forwarded
- * so the bash route can hand the persisted full-output file straight to the
- * store's `putFile`, and the truncation seam can externalize inline base64
- * images through the store's decoded-bytes `putBase64`, without extra
- * in-memory copies.
+ * the {@link ToolOutputSpill} contract; a FATAL store error (ENOSPC/
+ * EDQUOT/EACCES/EPERM/EROFS/EIO — the `@mavis/cas` fatal family) propagates
+ * from the spill entry points as `CasSpillFatalError`, so the history log is
+ * never silently flooded with inline payloads on a broken volume. All three
+ * entry points are forwarded so the bash route can hand the persisted
+ * full-output file straight to the store's `putFile`, and the truncation seam
+ * can externalize inline base64 images through the store's decoded-bytes
+ * `putBase64`, without extra in-memory copies.
  */
 function durableCasToolOutputSpill(): CasToolOutputSpill {
   let spillPromise: Promise<CasToolOutputSpill | undefined> | undefined;

@@ -50,6 +50,10 @@ import { AgentEventAssociationError } from '../local-agent-host.js';
 import { inputReviewRunnerOptions } from '../runner/policy/input-review-runner-options.js';
 import { createLocalCuScreenshotPruner } from '../runner/local-cu-screenshot-pruner.js';
 import { applyProcessLocalToolResultPolicy } from '../runner/policy/process-local-tool-result-policy.js';
+import {
+  checkpointBeforeLlmCallHook,
+  withCheckpointPolicy,
+} from './turn-checkpoint-policy.js';
 import type {
   LocalContextUsagePromptRange,
   LocalRuntimeTurnExecutorOptions,
@@ -359,6 +363,9 @@ export class LocalRuntimeTurnExecutor<
             toolResolution: prepared.toolResolution,
             pendingToolResultTailClaims,
             hostBeforeLlmCallHooks: prepared.beforeLlmCallHooks,
+            ...(this.options.checkpointBarrier
+              ? { checkpointBarrier: this.options.checkpointBarrier }
+              : {}),
             readTaskOutputTaskIds,
             terminalTaskOutputReadIds,
             toolsDisabled: this.options.disableTools === true,
@@ -488,11 +495,21 @@ export class LocalRuntimeTurnExecutor<
       validateRoutedTurnTools(input.assembly.tools),
       this.options.cliProductPolicy === true,
     );
+    // SE-SW-002: every tool effect of the turn runs under the checkpoint
+    // barrier when one is composed — flush before the effect, one execution,
+    // interrupted calls recorded as unknown and never re-run implicitly.
+    const policyTools = withCheckpointPolicy(admittedTools, {
+      ...(this.options.checkpointBarrier ? { barrier: this.options.checkpointBarrier } : {}),
+      signal: input.lease.signal,
+      ...(this.options.checkpointAllowAfterUnknownOutcome
+        ? { allowAfterUnknownOutcome: true }
+        : {}),
+    });
     const canConsumeBackgroundBashOutput = admittedTools.some(
       (tool) =>
         tool.def.name === 'task_output' && (tool.source === undefined || tool.source === 'builtin'),
     );
-    const standardTools = prepareBashTurnTools(admittedTools, canConsumeBackgroundBashOutput);
+    const standardTools = prepareBashTurnTools(policyTools, canConsumeBackgroundBashOutput);
     const toolContext = {
       ...toolResolution.context,
       ...(input.pluginHooks?.length
@@ -854,6 +871,7 @@ function mergeHooks<TAgent extends AgentExecutionSnapshot, TContext extends Tool
     toolResolution,
     pendingToolResultTailClaims,
     hostBeforeLlmCallHooks,
+    checkpointBarrier,
     readTaskOutputTaskIds,
     terminalTaskOutputReadIds,
     toolsDisabled,
@@ -875,7 +893,11 @@ function mergeHooks<TAgent extends AgentExecutionSnapshot, TContext extends Tool
   return {
     ...input.assembly.hooks,
     ...toolHooks,
+    // SE-SW-002: first position, so durability is confirmed before any other
+    // before-LLM decision and the provider request is never issued on a
+    // barrier failure.
     beforeLlmCallHook: [
+      ...(checkpointBarrier ? [checkpointBeforeLlmCallHook(checkpointBarrier)] : []),
       ...(input.assembly.hooks.beforeLlmCallHook ?? []),
       ...hostBeforeLlmCallHooks,
     ],
