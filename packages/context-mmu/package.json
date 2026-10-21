@@ -1,0 +1,25 @@
+{
+  "name": "@mavis/context-mmu",
+  "version": "0.1.0",
+  "description": "Context MMU: resident/digest paging of CAS-backed pages with a byte-budget LRU, pin hysteresis and fs.watch coherence.",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "devDependencies": {
+    "@mavis/cas": "workspace:*",
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
+  "private": true,
+  "license": "MIT"
+}
