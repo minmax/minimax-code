@@ -68,6 +68,7 @@ full GC and benches run in isolated child processes.
 | `BATCHES`      | `200`   | `bench-worker-commit`; committed batches |
 | `ENTRY_KB`     | `64`    | `bench-worker-commit`; entry payload size |
 | `MMU_RESIDENT_BYTES` | `262144` | `bench-prep`; Context-MMU budget behind the prep bench's residency overlay (at the images corpus's 64 KiB images this keeps exactly 4 pages resident — the architecture's ≤4-resident shape; resident pages ride the measured payload as data URLs) |
+| `WARM_PASSES`    | `5`     | `bench-prep`; warm-p95 windows (median-of-windows, pass 0 discarded — the same methodology as `bench-worker-commit.mjs`'s stall p99); single-window p95 flapped the merge barrier on shared CI runners |
 
 Every bench also reports event-loop stall metrics (`<bench>.stallP99Ms`,
 `<bench>.stallMaxMs`) sampled across the measured path.
