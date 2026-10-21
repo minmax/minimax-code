@@ -276,7 +276,25 @@
       "packages/wire-compiler/test/unit/budget-guard.test.ts",
       "packages/wire-compiler/test/unit/determinism.test.ts",
       "packages/wire-compiler/test/unit/lru.test.ts",
-      "packages/wire-compiler/test/unit/normalizer-invalidation.test.ts"
+      "packages/wire-compiler/test/unit/normalizer-invalidation.test.ts",
+      "packages/delegation-supervisor/test/unit/auto-detach.test.ts",
+      "packages/delegation-supervisor/test/unit/complete-dedup.test.ts",
+      "packages/delegation-supervisor/test/unit/fork-recovery.test.ts",
+      "packages/delegation-supervisor/test/unit/recovery-bounds.test.ts",
+      "packages/delegation-supervisor/test/unit/spawn-replay.test.ts",
+      "packages/delegation-supervisor/test/unit/stop-cascade.test.ts",
+      "packages/durable-seam/test/unit/accept-owner-input.test.ts",
+      "packages/durable-seam/test/unit/release-finalize.test.ts",
+      "packages/durable-seam/test/unit/restart-recovery.test.ts",
+      "packages/input-delivery/test/unit/bounded-cleanup.test.ts",
+      "packages/input-delivery/test/unit/lifecycle.test.ts",
+      "packages/input-delivery/test/unit/withdraw.test.ts",
+      "packages/steering-control/test/control-plane.test.ts",
+      "packages/steering-control/test/crash-recovery.test.ts",
+      "packages/steering-control/test/finalize-failure.test.ts",
+      "packages/steering-control/test/release-latency.test.ts",
+      "packages/steering-control/test/single-outcome.test.ts",
+      "packages/steering-control/test/wait-set.test.ts"
     ],
     "status-contract": [
       "packages/tui/test/unit/tui-build-mode-contract.test.ts"

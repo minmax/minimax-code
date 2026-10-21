@@ -582,6 +582,18 @@ importers:
         specifier: ^2
         version: 2.1.9(@types/node@20.19.43)
 
+  packages/delegation-supervisor:
+    devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.43
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.43)
+
   packages/durable-backend-sqlite-zstd:
     dependencies:
       better-sqlite3:
@@ -599,6 +611,30 @@ importers:
         version: 2.1.9(@types/node@20.19.43)
 
   packages/durable-core: {}
+
+  packages/durable-seam:
+    devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.43
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.43)
+
+  packages/input-delivery:
+    devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.43
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.43)
 
   packages/local-runtime:
     dependencies:
@@ -877,6 +913,18 @@ importers:
       '@vitest/coverage-v8':
         specifier: ^2
         version: 2.1.9(vitest@2.1.9(@types/node@20.19.43))
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.43)
+
+  packages/steering-control:
+    devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.43
       typescript:
         specifier: ^5
         version: 5.9.3

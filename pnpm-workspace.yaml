@@ -40,6 +40,10 @@ packages:
   - packages/context-projection
   - packages/convert-to-llm
   - packages/wire-compiler
+  - packages/delegation-supervisor
+  - packages/durable-seam
+  - packages/input-delivery
+  - packages/steering-control
   - third_party/pi-durable
   - third_party/chord
 overrides:

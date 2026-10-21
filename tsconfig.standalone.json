@@ -169,6 +169,9 @@
       "@mavis/cron": [
         "./packages/agent-modules/cron/src/index.ts"
       ],
+      "@mavis/delegation-supervisor": [
+        "./packages/delegation-supervisor/src/index.ts"
+      ],
       "@mavis/durable-backend-sqlite-zstd": [
         "./packages/durable-backend-sqlite-zstd/src/index.ts"
       ],
@@ -178,8 +181,14 @@
       "@mavis/durable-core": [
         "./packages/durable-core/src/index.ts"
       ],
+      "@mavis/durable-seam": [
+        "./packages/durable-seam/src/index.ts"
+      ],
       "@mavis/goal": [
         "./packages/agent-modules/goal/src/index.ts"
+      ],
+      "@mavis/input-delivery": [
+        "./packages/input-delivery/src/index.ts"
       ],
       "@mavis/local-runtime": [
         "./packages/local-runtime/src/index.ts"
@@ -399,6 +408,9 @@
       ],
       "@mavis/skills": [
         "./packages/agent-modules/skills/src/index.ts"
+      ],
+      "@mavis/steering-control": [
+        "./packages/steering-control/src/index.ts"
       ],
       "@mavis/storage-worker": [
         "./packages/storage-worker/src/index.ts"
