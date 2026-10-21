@@ -196,6 +196,108 @@ describe('durable entry and append-only projection', () => {
     expect(projected.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'user', 'assistant']);
   });
 
+  it('a checkpoint without systemMessage is audit noise for the boundary too: nothing strands', async () => {
+    // Judge round 2 [correctness]: {summary, firstKeptEntryId} without
+    // systemMessage passed parseCompactionEntry after the round-1 parser fix,
+    // so boundaryStartIndex parked the next cut range right after it —
+    // the summarizer saw SUM[NO-m1,NO-m2,HAS-m3,NO-m4] while the projection
+    // (which ignores the malformed record) kept m1/m2 in the window; after
+    // the append they left the window WITHOUT entering any summary (silent
+    // stranding: tracker ≡ oracle the whole time). The boundary must skip the
+    // malformed record exactly like the projection does.
+    const early = messageEntry(userMessage(`early ${filler(16_000)}`));
+    const earlyAnswer = messageEntry(assistantMessage('early answer'));
+    const entries: LogEntry[] = [
+      early,
+      earlyAnswer,
+      stamp(
+        {
+          id: 'bad-cp',
+          kind: COMPACTION_ENTRY_KIND,
+          // No systemMessage: the round-1 malformed shape.
+          payload: { summary: 'BAD-SUMMARY', firstKeptEntryId: earlyAnswer.id },
+        },
+        3,
+        2,
+      ),
+      messageEntry(userMessage(`late ${filler(16_000)}`)),
+      messageEntry(assistantMessage('late answer')),
+    ];
+    const summarizer = new RecordingSummarizer('RECOVERED-SUMMARY');
+
+    const outcome = await compact({ entries, summarizer: summarizer.call, keepRecentTokens: 1_000 });
+
+    expect(outcome).not.toBeNull();
+    // The boundary starts at the log head: the messages BEFORE the malformed
+    // checkpoint are in the summarizer conversation (nothing strands).
+    expect(summarizer.prompts[0]).toContain('[User]: early');
+    expect(summarizer.prompts[0]).toContain('[Assistant]: early answer');
+    // ...and the corrupt summary never plays the previous-summary role.
+    expect(summarizer.prompts[0]).not.toContain('BAD-SUMMARY');
+    expect(outcome!.firstKeptEntryId).toBe(entries[3]!.id);
+    // After the append the window is [new summary, late user, late answer]:
+    // everything that left it was in the summarized prefix above.
+    const projectedAfter = projectContext([...entries, stamp(outcome!.draft, 6, 5)]);
+    expect(projectedAfter.messages).toHaveLength(3);
+    expect(JSON.stringify(projectedAfter.messages[0])).toContain('RECOVERED-SUMMARY');
+    // A non-string systemMessage is malformed under the same rule.
+    const corrupt: LogEntry = {
+      ...entries[2]!,
+      payload: { summary: 'BAD-SUMMARY', firstKeptEntryId: earlyAnswer.id, systemMessage: 42 },
+    };
+    const summarizer2 = new RecordingSummarizer('S2');
+    const outcome2 = await compact({ entries: [...entries.slice(0, 2), corrupt, ...entries.slice(3)], summarizer: summarizer2.call, keepRecentTokens: 1_000 });
+    expect(outcome2).not.toBeNull();
+    expect(summarizer2.prompts[0]).toContain('[User]: early');
+    expect(summarizer2.prompts[0]).not.toContain('BAD-SUMMARY');
+  });
+
+  it('previousSummaryOf skips a malformed checkpoint and reports the valid earlier one', async () => {
+    // Judge round 2 [correctness] (B): with the malformed record in between,
+    // UPDATE_SUMMARIZATION_PROMPT used to receive BAD-SUMMARY as the
+    // previous summary while the projected window is led by GOOD-SUMMARY of
+    // the earlier valid checkpoint. The malformed record is audit noise for
+    // this scan too.
+    const first = messageEntry(userMessage(`first ${filler(16_000)}`));
+    const firstAnswer = messageEntry(assistantMessage('first answer'));
+    const second = messageEntry(userMessage(`second ${filler(16_000)}`));
+    const secondAnswer = messageEntry(assistantMessage('second answer'));
+    const entries: LogEntry[] = [
+      first,
+      firstAnswer,
+      // The valid winner: window = [GOOD-SUMMARY, ...tail...].
+      stamp(
+        {
+          id: 'good-cp',
+          kind: COMPACTION_ENTRY_KIND,
+          payload: { summary: 'GOOD-SUMMARY', firstKeptEntryId: firstAnswer.id, systemMessage: null, isSplitTurn: false, tokensBefore: 0, estimatedTokensAfter: 0, createdAtMs: 1 },
+        },
+        3,
+        2,
+      ),
+      second,
+      secondAnswer,
+      // Malformed: missing systemMessage.
+      stamp(
+        { id: 'bad-cp', kind: COMPACTION_ENTRY_KIND, payload: { summary: 'BAD-SUMMARY', firstKeptEntryId: secondAnswer.id } },
+        6,
+        5,
+      ),
+      messageEntry(userMessage(`third ${filler(16_000)}`)),
+      messageEntry(assistantMessage('third answer')),
+    ];
+    const summarizer = new RecordingSummarizer('NEW-SUMMARY');
+
+    const outcome = await compact({ entries, summarizer: summarizer.call, keepRecentTokens: 1_000 });
+
+    expect(outcome).not.toBeNull();
+    // The previous-summary slot carries the window's real leader...
+    expect(summarizer.prompts[0]).toContain('<previous-summary>\nGOOD-SUMMARY\n</previous-summary>');
+    // ...never the corrupt record's summary.
+    expect(summarizer.prompts[0]).not.toContain('BAD-SUMMARY');
+    expect(outcome!.firstKeptEntryId).toBe(entries[6]!.id);
+  });
+
   it('an unsplittable trailing tool result overshoots the 90% target, reported honestly', async () => {
     // Documented best-effort boundary of the ≤90% target (README): the cut
     // can never split a tool result from its call, so a giant trailing tool

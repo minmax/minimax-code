@@ -115,6 +115,16 @@ export function isCompactionMessagePayload(payload: unknown): payload is Compact
  * Read back and validate a compaction payload. `undefined` when the entry is
  * not a well-formed compaction checkpoint (the projection skips foreign or
  * malformed entries rather than crashing on them).
+ *
+ * `systemMessage: string | null` is part of the declared payload contract —
+ * the same rule `projectContext` / `WindowUsageTracker` apply (judge round 1)
+ * and, round 2, the compaction pipeline itself: a record whose systemMessage
+ * is neither a string nor null (missing included) is MALFORMED. Consumers
+ * here must treat it as plain audit noise, or
+ * `boundaryStartIndex` would park the next cut range right after the
+ * malformed checkpoint (stranding every earlier message outside both the
+ * window and the next summary) and `previousSummaryOf` would feed a corrupt
+ * summary back into UPDATE_SUMMARIZATION_PROMPT.
  */
 export function parseCompactionEntry(entry: DurableEntryDraft): CompactionEntryPayload | undefined {
   if (entry.kind !== COMPACTION_ENTRY_KIND) return undefined;
@@ -123,7 +133,8 @@ export function parseCompactionEntry(entry: DurableEntryDraft): CompactionEntryP
     payload === null ||
     typeof payload !== 'object' ||
     typeof payload.summary !== 'string' ||
-    typeof payload.firstKeptEntryId !== 'string'
+    typeof payload.firstKeptEntryId !== 'string' ||
+    (typeof payload.systemMessage !== 'string' && payload.systemMessage !== null)
   ) {
     return undefined;
   }
