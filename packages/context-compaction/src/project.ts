@@ -27,6 +27,7 @@ import {
   type ProjectedContext,
   type ProjectedEntry,
 } from './types.js';
+import { isCompactionMessagePayload } from './entries.js';
 
 /** Thrown when a compaction checkpoint references an unknown first-kept entry. */
 export class UnknownFirstKeptEntryError extends Error {
@@ -62,7 +63,10 @@ function parseOmissionPayload(entry: LogEntry): ContextEditOmissionPayload | und
 
 function messageOf(entry: LogEntry): CompactionMessage | undefined {
   if (entry.kind !== MESSAGE_ENTRY_KIND) return undefined;
-  return entry.payload as CompactionMessage;
+  // A malformed payload (no role, wrong content shape) projects NOTHING —
+  // dead weight, exactly like the usage tracker treats it. Letting it through
+  // would make the estimator return `undefined` and poison window totals.
+  return isCompactionMessagePayload(entry.payload) ? entry.payload : undefined;
 }
 
 /**

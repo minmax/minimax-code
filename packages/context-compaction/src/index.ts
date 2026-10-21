@@ -58,6 +58,7 @@ export {
   createOmissionEntryDraft,
   createSystemEntryDraft,
   generateLogEntryId,
+  isCompactionMessagePayload,
   parseCompactionEntry,
 } from './entries.js';
 export { compact } from './compact.js';

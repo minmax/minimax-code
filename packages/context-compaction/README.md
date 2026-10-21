@@ -41,7 +41,19 @@ const { result } = await runWithOverflowRecovery({
   kind `mcode.compaction`, carrying `summary`, `firstKeptEntryId`, the
   FROZEN `systemMessage`, and token accounting. Nothing is ever rewritten or
   deleted: projection derives the short window from the log, the original
-  entries stay readable byte-for-byte.
+  entries stay readable byte-for-byte. `firstKeptEntryId` always names a
+  CONTEXT-VISIBLE entry (a cut is never parked on audit/control bookkeeping):
+  the projection fold resolves the id against visible segments only, so an
+  invisible id could never be applied and would wedge the session at that seq.
+  The id resolves to a RAW LOG POSITION: everything appended before that
+  position leaves the window — including entries a previous checkpoint had
+  kept visible (a kept tail precedes its summary in the log) — and only the
+  WINNING checkpoint contributes its summary, so a checkpoint named by a
+  later checkpoint's `firstKeptEntryId` projects empty. Only an
+  `mcode.compaction` KIND can freeze the system prompt; a compaction-shaped
+  payload on any other entry kind is inert bookkeeping. The usage tracker's
+  incremental counters mirror exactly these rules (raw-index kept filter,
+  previous-checkpoint exclusion, kind-checked freeze).
 - **Overflow recovery** — an overflow failure compacts once and retries the
   attempt EXACTLY once. A second failure records a `mcode.context_edit`
   omission entry hiding the failed attempt's entries and propagates.
@@ -50,7 +62,8 @@ const { result } = await runWithOverflowRecovery({
   the PROJECTED WINDOW — kept entries, the winning checkpoint payload and
   the active system prompt). Both axes are maintained INCREMENTALLY
   (`WindowUsageTracker`: O(delta) per appended entry, per-entry estimates
-  memoized — `notify()` never re-reads or re-stringifies the log), and the
+  memoized and pruned back to the live window after every ingest — O(window)
+  memory, `notify()` never re-reads or re-stringifies the log), and the
   byte axis RESETS when a checkpoint cuts the window: audit/control
   bookkeeping (`mcode.owner-input.received` and friends) contributes
   nothing, and entries behind a checkpoint leave the axis instead of

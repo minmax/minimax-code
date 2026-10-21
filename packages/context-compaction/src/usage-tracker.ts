@@ -20,7 +20,9 @@
  * `usage()` is O(1); `ingest` is O(delta) over the entries appended since the
  * last call. `estimateMessageTokens` results and payload byte lengths are
  * memoized per entry id, so an entry is measured exactly once — never a
- * re-stringify of the whole log per notification.
+ * re-stringify of the whole log per notification — and the memos are pruned
+ * to the live window on every ingest, keeping the tracker's memory O(window),
+ * not O(log).
  *
  * Histories the counters cannot mirror incrementally (a checkpoint whose
  * `firstKeptEntryId` is no longer in the window — the re-expansion of an
@@ -39,6 +41,7 @@ import {
   estimateProjectedContextTokens,
   hasValidUsageAnchor,
 } from './estimate.js';
+import { isCompactionMessagePayload } from './entries.js';
 import { projectContext } from './project.js';
 import {
   COMPACTION_ENTRY_KIND,
@@ -60,6 +63,14 @@ export interface WindowUsage {
 /** One LLM-visible window member: the winning checkpoint or a kept message entry. */
 interface WindowMember {
   readonly id: string;
+  /**
+   * The member's position in the RAW append-only log. The projection resolves
+   * `firstKeptEntryId` against raw log positions — everything before that
+   * position leaves the window, even members a previous checkpoint had kept
+   * (message order alone cannot express that: a kept tail follows the summary
+   * member while sitting BEFORE it in the log).
+   */
+  readonly rawIndex: number;
   /** Memoized `chars/4` estimate of the entry's context message. */
   readonly tokens: number;
   /** Memoized UTF-8 byte length of the serialized payload. */
@@ -130,10 +141,15 @@ export class WindowUsageTracker {
    * Consumes every entry appended since the last call. `entries` must be the
    * live append-only session log, oldest first. A shrunk log (never legal)
    * forces a full re-sync instead of miscounting.
+   *
+   * Every exit path prunes the measurement memos down to the live window, so
+   * a scheduler that lives across a whole agent session holds O(window)
+   * memoized state, not O(log).
    */
   ingest(entries: readonly LogEntry[]): void {
     if (entries.length < this.consumed) {
       this.resync(entries);
+      this.pruneMemos();
       return;
     }
     while (this.consumed < entries.length) {
@@ -146,8 +162,30 @@ export class WindowUsageTracker {
         // (re-expansion of an omitted checkpoint, retracted system source):
         // one slow authoritative pass re-syncs everything.
         this.resync(entries);
+        this.pruneMemos();
         return;
       }
+    }
+    this.pruneMemos();
+  }
+
+  /**
+   * Number of memoized measurements (token estimates + payload byte lengths),
+   * for memory tests and metrics. Bounded by twice the live window size
+   * between `ingest` calls.
+   */
+  get memoSize(): number {
+    return this.tokenMemo.size + this.byteMemo.size;
+  }
+
+  /** Drops memoized measurements of entries that left the projected window. */
+  private pruneMemos(): void {
+    const live = new Set(this.window.map((member) => member.id));
+    for (const id of this.tokenMemo.keys()) {
+      if (!live.has(id)) this.tokenMemo.delete(id);
+    }
+    for (const id of this.byteMemo.keys()) {
+      if (!live.has(id)) this.byteMemo.delete(id);
     }
   }
 
@@ -188,6 +226,26 @@ export class WindowUsageTracker {
     return bytes;
   }
 
+  /**
+   * Tokens of one window member. For the winning CHECKPOINT this is its
+   * summary message (`{role:'user', content: payload.summary}`) — the exact
+   * incremental rule — NOT `estimateMessageTokens` of the raw checkpoint
+   * payload: that payload carries no `role`, the estimator returns
+   * `undefined`, and one undefined member would poison `windowTokens` into
+   * NaN, silently disabling the token trigger after every resync.
+   */
+  private memberTokens(entry: LogEntry): number {
+    if (entry.kind === COMPACTION_ENTRY_KIND) {
+      const payload = parseCompactionPayload(entry.payload);
+      if (payload !== undefined) {
+        const tokens = estimateTokensOf({ role: 'user', content: payload.summary });
+        this.tokenMemo.set(entry.id, tokens);
+        return tokens;
+      }
+    }
+    return this.memoTokens(entry);
+  }
+
   /** Resets every counter and rebuilds them from one slow `projectContext` pass. */
   private resync(entries: readonly LogEntry[]): void {
     this.clearCounters();
@@ -203,7 +261,8 @@ export class WindowUsageTracker {
       if (contextMessages.length === 0) continue;
       const member: WindowMember = {
         id: entry.id,
-        tokens: this.memoTokens(entry),
+        rawIndex: i,
+        tokens: this.memberTokens(entry),
         bytes: this.memoBytes(entry),
       };
       if (entry.kind === COMPACTION_ENTRY_KIND) checkpointMember = member;
@@ -254,12 +313,32 @@ export class WindowUsageTracker {
     // System prompt: the projected value is authoritative; the newest visible
     // system entry stays the fallback for future checkpoints without a freeze.
     this.systemText = projected.systemMessage;
-    this.systemFrozen = false;
     const omitted = new Set<string>();
     for (const entry of entries) {
       if (entry.kind !== CONTEXT_EDIT_ENTRY_KIND) continue;
       const targets = parseOmissionTargetIds(entry.payload);
       if (targets !== undefined) for (const id of targets) omitted.add(id);
+    }
+    // The frozen-source rule must SURVIVE the resync: when the projected
+    // system message came from the winning checkpoint (`systemMessage` frozen
+    // non-null), later `mcode.system` entries do not override it — the
+    // projection keeps the frozen value (project.ts). Resetting the flag
+    // unconditionally here let a post-resync system entry leak into
+    // `systemText` while the slow reference still reported the frozen prompt.
+    this.systemFrozen = false;
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      const entry = entries[i]!;
+      // Same winner rule as the projection: only `mcode.compaction` entries
+      // can freeze the system prompt. The payload parser alone is not enough
+      // — audit/control bookkeeping with a coincidentally compaction-shaped
+      // payload ({summary, firstKeptEntryId, systemMessage}) would otherwise
+      // freeze the tracker on a value the projection never applies.
+      if (entry.kind !== COMPACTION_ENTRY_KIND || omitted.has(entry.id)) continue;
+      const winner = parseCompactionPayload(entry.payload);
+      if (winner !== undefined) {
+        this.systemFrozen = winner.systemMessage !== null;
+        break;
+      }
     }
     for (let i = entries.length - 1; i >= 0; i -= 1) {
       const entry = entries[i]!;
@@ -308,9 +387,16 @@ export class WindowUsageTracker {
   }
 
   private consumeMessage(entry: LogEntry): void {
+    // Same boundary the projection applies (`messageOf`): a malformed payload
+    // — no role, wrong content shape — projects nothing, so it must count
+    // nothing. Estimating it anyway would run `estimateMessageTokens` off the
+    // end of its exhaustive switch (undefined) and NaN the window totals,
+    // silently disabling the token trigger on a corrupt log.
+    if (!isCompactionMessagePayload(entry.payload)) return;
+    const rawIndex = this.consumed - 1; // ingest advanced past this entry already
     const tokens = this.memoTokens(entry);
     const bytes = this.memoBytes(entry);
-    this.window.push({ id: entry.id, tokens, bytes });
+    this.window.push({ id: entry.id, rawIndex, tokens, bytes });
     this.windowTokens += tokens;
     this.windowEntryBytes += bytes;
     if (this.anchor !== null) this.suffixTokens += tokens;
@@ -339,14 +425,27 @@ export class WindowUsageTracker {
     const payload = parseCompactionPayload(entry.payload);
     if (payload === undefined) return; // projects as plain audit noise
 
-    const keptFrom = this.window.findIndex((member) => member.id === payload.firstKeptEntryId);
-    if (keptFrom < 0) {
-      // The checkpoint references an entry outside the maintained window
-      // (re-expansion of an omitted checkpoint, or a foreign history) —
+    // The projection resolves `firstKeptEntryId` to a RAW LOG POSITION and
+    // hides everything before it. Two rules follow, and message order alone
+    // cannot express either:
+    // 1. members named-position-or-later survive — including members a
+    //    previous checkpoint had kept whose raw index still precedes the name
+    //    (the kept tail sits BEFORE the summary in the log);
+    // 2. only the WINNING checkpoint contributes its summary: the previous
+    //    checkpoint member — the only other one a window can hold — projects
+    //    empty, even when the new checkpoint's name points at it directly
+    //    (`cp2` with `firstKeptEntryId` = `cp1`).
+    const named = this.window.find((member) => member.id === payload.firstKeptEntryId);
+    if (named === undefined) {
+      // The named entry is outside the maintained window (already summarized
+      // away, re-expansion of an omitted checkpoint, or a foreign history) —
       // beyond the incremental mirror; ingest re-syncs.
       throw new RangeError(`window re-expansion for checkpoint ${entry.id}`);
     }
-    const kept = this.window.slice(keptFrom);
+    const previousCheckpointId = this.checkpointMemberId;
+    const kept = this.window.filter(
+      (member) => member.rawIndex >= named.rawIndex && member.id !== previousCheckpointId,
+    );
     this.windowTokens -= this.windowTokens - kept.reduce((sum, member) => sum + member.tokens, 0);
     this.windowEntryBytes -= this.windowEntryBytes - kept.reduce((sum, member) => sum + member.bytes, 0);
     this.window = kept;
@@ -354,7 +453,12 @@ export class WindowUsageTracker {
     // The checkpoint contributes its summary (a user message) and its payload
     // bytes — both travel on the wire — and leads the message order.
     const summaryTokens = estimateTokensOf({ role: 'user', content: payload.summary });
-    const checkpointMember: WindowMember = { id: entry.id, tokens: summaryTokens, bytes: serializedBytes(entry.payload) };
+    const checkpointMember: WindowMember = {
+      id: entry.id,
+      rawIndex: this.consumed - 1,
+      tokens: summaryTokens,
+      bytes: serializedBytes(entry.payload),
+    };
     this.window = [checkpointMember, ...this.window];
     this.checkpointMemberId = entry.id;
     this.windowTokens += summaryTokens;

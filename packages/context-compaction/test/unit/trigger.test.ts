@@ -20,6 +20,7 @@ import {
   estimateMessageTokens,
   estimateProjectedContextTokens,
   evaluateTriggers,
+  isCompactionMessagePayload,
   projectContext,
   resolveKeepRecentTokens,
 } from '../../src/index.js';
@@ -80,6 +81,32 @@ describe('token estimation', () => {
       content: [{ type: 'thinking', thinking: filler(400) }, { type: 'text', text: 'ok' }],
     } as const;
     expect(estimateMessageTokens(thinkingAssistant)).toBe(101);
+  });
+
+  it('returns a hard 0 (never undefined) for a payload an unknown role falls through on', () => {
+    // A corrupt role-less payload must not poison window totals into NaN.
+    expect(estimateMessageTokens({ broken: true } as never)).toBe(0);
+    expect(Number.isFinite(estimateMessageTokens({ role: 'martian' } as never))).toBe(true);
+  });
+});
+
+describe('isCompactionMessagePayload', () => {
+  it('accepts the four message roles with walkable content', () => {
+    expect(isCompactionMessagePayload({ role: 'user', content: 'text' })).toBe(true);
+    expect(isCompactionMessagePayload({ role: 'user', content: [{ type: 'text', text: 'a' }] })).toBe(true);
+    expect(isCompactionMessagePayload({ role: 'assistant', content: [{ type: 'text', text: 'a' }] })).toBe(true);
+    expect(isCompactionMessagePayload({ role: 'toolResult', content: [{ type: 'image' }] })).toBe(true);
+    expect(isCompactionMessagePayload({ role: 'custom', customType: 'hook', text: 'x' })).toBe(true);
+  });
+
+  it('rejects role-less, unknown-role, and non-walkable payloads', () => {
+    expect(isCompactionMessagePayload({ broken: true })).toBe(false);
+    expect(isCompactionMessagePayload({ role: 'martian', content: 'x' })).toBe(false);
+    expect(isCompactionMessagePayload({ role: 'user', content: 42 })).toBe(false);
+    expect(isCompactionMessagePayload({ role: 'assistant', content: 'plain string' })).toBe(false);
+    expect(isCompactionMessagePayload({ role: 'custom' })).toBe(false);
+    expect(isCompactionMessagePayload(null)).toBe(false);
+    expect(isCompactionMessagePayload('user')).toBe(false);
   });
 });
 

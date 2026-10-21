@@ -211,6 +211,33 @@ describe('runWithOverflowRecovery', () => {
     expect(attempts).toBe(1);
   });
 
+  it('generates unique omission ids even within the same millisecond', async () => {
+    // Review round 3: `omission-${Date.now()}` collides for two omissions
+    // recorded in the same millisecond; the id discipline is `randomUUID`
+    // (see `generateLogEntryId`), duplicate entry ids corrupt the log.
+    const log = new MemoryLog();
+    const now = (): number => 42; // frozen clock: every omission lands in "the same" ms
+    const terminalFailure = async (): Promise<void> => {
+      await expect(
+        runWithOverflowRecovery({
+          attempt: async () => {
+            throw overflowError();
+          },
+          compact: async () => undefined,
+          failedAttemptEntryIds: () => ['attempt-x'],
+          appendEntry: (draft) => log.append([draft]),
+          now,
+        }),
+      ).rejects.toThrow(/context length/i);
+    };
+    await terminalFailure();
+    await terminalFailure();
+    expect(log.entries).toHaveLength(2);
+    expect(log.entries[0]!.id).toMatch(/^omission-/);
+    expect(log.entries[1]!.id).toMatch(/^omission-/);
+    expect(log.entries[0]!.id).not.toBe(log.entries[1]!.id);
+  });
+
   it('createCompactionEntryDraft round-trips through parseCompactionEntry', () => {
     const draft = checkpointDraft('c1', 'e9', 's');
     expect(draft.kind).toBe('mcode.compaction');

@@ -108,14 +108,16 @@ export function findCutPoint(
     }
   }
 
-  // Pull the cut back over adjacent metadata entries (context-invisible) so
-  // they are not stranded in the summarized range; stop at compaction
-  // boundaries and at anything context-visible.
-  while (cutIndex > startIndex) {
-    const previous = entries[cutIndex - 1]!;
-    if (previous.isCompaction || previous.contextMessages.length > 0) break;
-    cutIndex -= 1;
-  }
+  // The durable checkpoint names `firstKeptEntryId`, and the projection fold
+  // resolves it against CONTEXT-VISIBLE segments only — audit/control entries
+  // never become segments, so an invisible id could never be applied and the
+  // session would wedge at that seq. That guarantee holds by CONSTRUCTION,
+  // not by a post-pass: `cutIndex` is always a member of `cutPoints` (the
+  // initial fallback or a snapped candidate), and every `cutPoints` member
+  // carries at least one cut-point message (`entryHasCutPoint`), hence
+  // `contextMessages.length > 0`. Zero-message entries simply stay on the
+  // summarized side of the cut, which is harmless — they project nothing on
+  // either side.
 
   const startsTurn = isTurnStartEntry(entries[cutIndex]!);
   const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);

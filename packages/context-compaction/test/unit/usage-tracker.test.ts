@@ -17,6 +17,7 @@ import { describe, expect, it } from 'vitest';
 import {
   WindowUsageTracker,
   createBackgroundCompactionScheduler,
+  estimateMessageTokens,
   estimateProjectedContextTokens,
   projectContext,
   windowManifestBytes,
@@ -35,7 +36,8 @@ function makeLcg(seed: number): () => number {
 
 let auditCounter = 0;
 
-function auditEntry(): LogEntry {
+/** Audit bookkeeping; `evil` embeds a compaction-shaped payload no kind-aware consumer may mistake for a checkpoint. */
+function auditEntry(evil = false): LogEntry {
   auditCounter += 1;
   return {
     id: `audit-${auditCounter}`,
@@ -43,7 +45,9 @@ function auditEntry(): LogEntry {
     // Exactly the bookkeeping kinds that never reach the payload — the
     // finding's scenario had 49.5% of raw-log bytes in these.
     kind: 'mcode.owner-input.received',
-    payload: { received: 'x'.repeat(400), at: auditCounter },
+    payload: evil
+      ? { summary: `evil ${auditCounter}`, firstKeptEntryId: 'm1', systemMessage: `EVIL ${auditCounter}` }
+      : { received: 'x'.repeat(400), at: auditCounter },
     seq: auditCounter,
     ordinal: 0,
   };
@@ -66,11 +70,41 @@ function omissionEntry(targetIds: string[]): LogEntry {
   };
 }
 
+function checkpointEntry(index: number, keptId: string, systemMessage: string | null, seq: number): LogEntry {
+  return {
+    id: `compaction-${index}`,
+    parentId: null,
+    kind: 'mcode.compaction',
+    payload: {
+      summary: `summary ${index} ${'y'.repeat(60)}`,
+      firstKeptEntryId: keptId,
+      systemMessage,
+      isSplitTurn: false,
+      tokensBefore: 1000,
+      estimatedTokensAfter: 500,
+      createdAtMs: 1,
+    },
+    seq,
+    ordinal: 0,
+  };
+}
+
 /** Streams a random mixed history; yields the prefix after every append. */
 function* mixedStream(seed: number, length: number): Generator<LogEntry[]> {
   const lcg = makeLcg(seed);
   const log: LogEntry[] = [];
   const liveIds = (): string[] => log.filter((entry) => entry.kind === 'mcode.message').map((entry) => entry.id);
+  // Ids currently hidden by context_edit omissions (to find VISIBLE checkpoints).
+  const omittedIds = (): Set<string> => {
+    const omitted = new Set<string>();
+    for (const entry of log) {
+      if (entry.kind !== 'mcode.context_edit') continue;
+      const payload = entry.payload as { action?: unknown; targetIds?: unknown };
+      if (payload.action !== 'omission' || !Array.isArray(payload.targetIds)) continue;
+      for (const id of payload.targetIds) if (typeof id === 'string') omitted.add(id);
+    }
+    return omitted;
+  };
   for (let i = 0; i < length; i += 1) {
     const roll = lcg();
     if (roll < 0.5) {
@@ -83,40 +117,44 @@ function* mixedStream(seed: number, length: number): Generator<LogEntry[]> {
         ),
       );
     } else if (roll < 0.65) {
-      log.push(auditEntry());
+      // Sometimes compaction-shaped: only a KIND-aware resync may ignore it.
+      log.push(auditEntry(lcg() < 0.3));
     } else if (roll < 0.75) {
       log.push(systemEntry(`system prompt ${i} ${'s'.repeat(40)}`));
     } else if (roll < 0.9) {
-      const live = liveIds();
-      if (live.length > 2) {
-        // A checkpoint over the CURRENT projected entries (as compact() would
-        // pick one): firstKept is a live message entry of the visible window.
-        const visible = projectContext(log).entries
-          .map((projected, index) => ({ projected, entry: log[index]! }))
-          .filter(({ projected }) => projected.contextMessages.length > 0 && !projected.isCompaction);
-        if (visible.length > 2) {
-          const kept = visible[Math.floor(lcg() * visible.length)]!.entry;
-          log.push({
-            id: `compaction-${i}`,
-            parentId: null,
-            kind: 'mcode.compaction',
-            payload: {
-              summary: `summary ${i} ${'y'.repeat(60)}`,
-              firstKeptEntryId: kept.id,
-              systemMessage: null,
-              isSplitTurn: false,
-              tokensBefore: 1000,
-              estimatedTokensAfter: 500,
-              createdAtMs: 1,
-            },
-            seq: log.length + 1,
-            ordinal: 0,
-          });
+      // A checkpoint either over the CURRENT visible window (as compact()
+      // would pick one) or — review round 3, medium finding — keeping the
+      // PREVIOUS VISIBLE CHECKPOINT itself (cp2 with firstKeptEntryId = cp1):
+      // the projection projects the non-winner as empty, and the incremental
+      // counters used to keep its member. Checkpoints also freeze the system
+      // prompt sometimes (the second medium finding): after a re-expansion
+      // resync a later system entry used to override the frozen value.
+      const frozen = lcg() < 0.3 ? `frozen ${i} ${'f'.repeat(40)}` : null;
+      const visibleCheckpoint = [...log]
+        .reverse()
+        .find((entry) => entry.kind === 'mcode.compaction' && !omittedIds().has(entry.id));
+      if (visibleCheckpoint !== undefined && lcg() < 0.3) {
+        log.push(checkpointEntry(i, visibleCheckpoint.id, frozen, log.length + 1));
+      } else {
+        const live = liveIds();
+        if (live.length > 2) {
+          const visible = projectContext(log).entries
+            .map((projected, index) => ({ projected, entry: log[index]! }))
+            .filter(({ projected }) => projected.contextMessages.length > 0 && !projected.isCompaction);
+          if (visible.length > 2) {
+            const kept = visible[Math.floor(lcg() * visible.length)]!.entry;
+            log.push(checkpointEntry(i, kept.id, frozen, log.length + 1));
+          }
         }
       }
     } else {
       const live = liveIds();
-      if (live.length > 2) {
+      const lastCheckpoint = [...log].reverse().find((entry) => entry.kind === 'mcode.compaction');
+      if (lcg() < 0.4 && lastCheckpoint !== undefined) {
+        // Retract the newest checkpoint: the projection re-expands to raw
+        // history — the counters hit the slow re-sync path.
+        log.push(omissionEntry([lastCheckpoint.id]));
+      } else if (live.length > 2) {
         log.push(omissionEntry([live[Math.floor(lcg() * live.length)]!]));
       }
     }
@@ -136,11 +174,71 @@ describe('WindowUsageTracker equals the slow reference on every prefix', () => {
         const slowBytes = windowManifestBytes(prefix);
         expect(fast.tokens).toBe(slowTokens);
         expect(fast.bytes).toBe(slowBytes);
+        // NaN would silently disable the token trigger (evaluateTriggers
+        // answers `none` on NaN) — both counters must stay finite on EVERY
+        // prefix, resync or not.
+        expect(Number.isFinite(fast.tokens)).toBe(true);
+        expect(Number.isFinite(fast.bytes)).toBe(true);
         steps += 1;
       }
       expect(steps).toBe(60);
     });
   }
+
+  it('keeps the token axis finite through EVERY resync scenario', () => {
+    const message = (id: string, text: string): LogEntry => ({
+      id,
+      parentId: null,
+      kind: 'mcode.message',
+      payload: { role: 'user', content: text },
+      seq: 0,
+      ordinal: 0,
+    });
+    const checkpoint = (id: string, kept: string, summary: string): LogEntry => ({
+      id,
+      parentId: null,
+      kind: 'mcode.compaction',
+      payload: {
+        summary,
+        firstKeptEntryId: kept,
+        systemMessage: null,
+        isSplitTurn: false,
+        tokensBefore: 1000,
+        estimatedTokensAfter: 100,
+        createdAtMs: 1,
+      },
+      seq: 0,
+      ordinal: 0,
+    });
+
+    const scenarios: readonly LogEntry[][][] = [
+      // Shrunk log (never legal) resyncs with a LIVE winning checkpoint.
+      [[message('a', 'x'.repeat(400)), message('b', 'y'.repeat(400)), checkpoint('cp', 'b', 'S'.repeat(40))],
+        [message('a', 'x'.repeat(400)), checkpoint('cp', 'a', 'S'.repeat(40))]],
+      // Re-expansion: the second checkpoint's firstKept fell out of the window.
+      [[message('a', 'x'.repeat(400)), message('b', 'y'.repeat(400)), checkpoint('cp1', 'b', 'first'), checkpoint('cp2', 'a', 'second')]],
+      // System-source retraction resync.
+      [[{ id: 'sys', parentId: null, kind: 'mcode.system', payload: { text: 's'.repeat(40) }, seq: 0, ordinal: 0 },
+        message('a', 'x'.repeat(400)),
+        { id: 'edit', parentId: null, kind: 'mcode.context_edit', payload: { action: 'omission', targetIds: ['sys'], reason: 'r' }, seq: 0, ordinal: 0 }]],
+    ];
+
+    for (const prefixes of scenarios) {
+      const tracker = new WindowUsageTracker();
+      for (const prefix of prefixes) {
+        tracker.ingest(prefix);
+        const usage = tracker.usage();
+        // The defect: resync memoized the checkpoint member's tokens as
+        // estimateMessageTokens(raw checkpoint payload) — no `role` field,
+        // `undefined`, windowTokens poisoned into NaN, evaluateTriggers
+        // answering `none` forever.
+        expect(Number.isFinite(usage.tokens)).toBe(true);
+        expect(Number.isFinite(usage.bytes)).toBe(true);
+        expect(usage.tokens).toBe(estimateProjectedContextTokens(prefix).tokens);
+        expect(usage.bytes).toBe(windowManifestBytes(prefix));
+      }
+    }
+  });
 
   it('audit/control bookkeeping never enters the byte axis', () => {
     const tracker = new WindowUsageTracker();
@@ -231,6 +329,175 @@ describe('WindowUsageTracker equals the slow reference on every prefix', () => {
     tracker.ingest(replacement);
     expect(tracker.usage().tokens).toBe(estimateProjectedContextTokens(replacement).tokens);
     expect(tracker.usage().bytes).toBe(windowManifestBytes(replacement));
+  });
+});
+
+describe('review round 3 regressions', () => {
+  const message = (id: string, text: string): LogEntry => ({
+    id,
+    parentId: null,
+    kind: 'mcode.message',
+    payload: { role: 'user', content: text },
+    seq: 0,
+    ordinal: 0,
+  });
+  const checkpoint = (id: string, kept: string, summary: string, systemMessage: string | null = null): LogEntry => ({
+    id,
+    parentId: null,
+    kind: 'mcode.compaction',
+    payload: {
+      summary,
+      firstKeptEntryId: kept,
+      systemMessage,
+      isSplitTurn: false,
+      tokensBefore: 1000,
+      estimatedTokensAfter: 100,
+      createdAtMs: 1,
+    },
+    seq: 0,
+    ordinal: 0,
+  });
+  const system = (id: string, text: string): LogEntry => ({
+    id,
+    parentId: null,
+    kind: 'mcode.system',
+    payload: { text },
+    seq: 0,
+    ordinal: 0,
+  });
+  const omission = (id: string, targetIds: string[]): LogEntry => ({
+    id,
+    parentId: null,
+    kind: 'mcode.context_edit',
+    payload: { action: 'omission', targetIds, reason: 'r' },
+    seq: 0,
+    ordinal: 0,
+  });
+
+  function assertTracksSlow(prefixes: readonly LogEntry[][]): void {
+    const tracker = new WindowUsageTracker();
+    for (const prefix of prefixes) {
+      tracker.ingest(prefix);
+      const usage = tracker.usage();
+      expect(usage.tokens).toBe(estimateProjectedContextTokens(prefix).tokens);
+      expect(usage.bytes).toBe(windowManifestBytes(prefix));
+      expect(Number.isFinite(usage.tokens)).toBe(true);
+    }
+  }
+
+  it('a checkpoint keeping the previous checkpoint: the non-winner leaves the window', () => {
+    // Review medium finding 1: cp2 with firstKeptEntryId = cp1 keeps cp1's
+    // summary member in the incremental window, while the projection projects
+    // the non-winning checkpoint as EMPTY — the counters silently diverged
+    // (probe: fast={tokens:104,bytes:714} vs slow={tokens:2,bytes:144}).
+    const log: LogEntry[] = [
+      message('m1', 'x'.repeat(400)),
+      message('m2', 'y'.repeat(400)),
+      checkpoint('cp1', 'm2', 'S1'.repeat(20)),
+      checkpoint('cp2', 'cp1', 'S2'.repeat(20)),
+    ];
+    // Every prefix must match, the last one exactly: only cp2's summary is
+    // the window, cp1's member is gone.
+    assertTracksSlow(log.map((_, end) => log.slice(0, end + 1)));
+    const tracker = new WindowUsageTracker();
+    tracker.ingest(log);
+    const slow = projectContext(log);
+    const summaryMessages = slow.messages.filter((m) => m.role === 'user' && typeof m.content === 'string');
+    expect(summaryMessages).toHaveLength(1);
+    expect(tracker.usage().tokens).toBe(estimateMessageTokens(summaryMessages[0]!));
+  });
+
+  it('the frozen system prompt survives a re-expansion resync and later system entries', () => {
+    // Review medium finding 2: frozen-cp1 → re-expansion resync (cp2 keeps an
+    // entry already summarized away) → retraction of cp2 → NEW system entry.
+    // resync used to reset systemFrozen unconditionally, so the new system
+    // entry overrode systemText while the projection kept the frozen value.
+    const log: LogEntry[] = [
+      system('sys1', 's'.repeat(40)),
+      message('m0', 'w'.repeat(400)),
+      message('m1', 'x'.repeat(400)),
+      checkpoint('cp1', 'm1', 'S1'.repeat(20), 'FROZEN-PROMPT'),
+      // m0 is behind cp1: outside the tracker window -> resync on ingest.
+      checkpoint('cp2', 'm0', 'S2'.repeat(20)),
+      omission('edit1', ['cp2']),
+      // Post-resync system entry: must NOT override the frozen prompt.
+      system('sys2', 't'.repeat(40)),
+    ];
+    assertTracksSlow(log.map((_, end) => log.slice(0, end + 1)));
+    // And the final system text is the FROZEN one, on both sides.
+    expect(projectContext(log).systemMessage).toBe('FROZEN-PROMPT');
+  });
+
+  it('a frozen checkpoint also wins in the pure incremental path (no resync)', () => {
+    const log: LogEntry[] = [
+      system('sys1', 's'.repeat(40)),
+      message('m1', 'x'.repeat(400)),
+      checkpoint('cp1', 'm1', 'S1'.repeat(20), 'FROZEN-PROMPT'),
+      system('sys2', 't'.repeat(40)),
+    ];
+    assertTracksSlow(log.map((_, end) => log.slice(0, end + 1)));
+  });
+
+  it('the resync frozen rule only trusts mcode.compaction KIND, not payload shape', () => {
+    // Review round 4: the resync winner loop parsed payloads without a kind
+    // check, so audit bookkeeping carrying a coincidentally compaction-shaped
+    // payload ({summary, firstKeptEntryId, systemMessage: 'EVIL-FREEZE'})
+    // froze the tracker on a system prompt the projection never applies; the
+    // probe diverged at fast={tokens:200,bytes:856} vs slow={tokens:210,bytes:907}.
+    const fake: LogEntry = {
+      id: 'fake',
+      parentId: null,
+      kind: 'mcode.owner-input.received',
+      payload: { summary: 'x', firstKeptEntryId: 'm1', systemMessage: 'EVIL-FREEZE' },
+      seq: 0,
+      ordinal: 0,
+    };
+    const log: LogEntry[] = [
+      system('sys1', 's'.repeat(40)),
+      message('m1', 'x'.repeat(400)),
+      message('m2', 'y'.repeat(400)),
+      fake,
+      // Retracting the system source forces the resync whose winner loop used
+      // to trip over the fake payload.
+      omission('edit1', ['sys1']),
+      system('sys2', 't'.repeat(40)),
+    ];
+    assertTracksSlow(log.map((_, end) => log.slice(0, end + 1)));
+    // The projection's truth: no real checkpoint, sys1 retracted -> sys2 wins.
+    // With the bug, the tracker froze on EVIL-FREEZE after the resync and
+    // ignored sys2, so the last prefix diverged on both axes.
+    expect(projectContext(log).systemMessage).toBe('t'.repeat(40));
+  });
+
+  it('a malformed message payload counts nothing and stays finite', () => {
+    // Review low finding: a role-less `mcode.message` payload ran the
+    // estimator off its exhaustive switch -> NaN -> token trigger dead.
+    const bad: LogEntry = { id: 'bad', parentId: null, kind: 'mcode.message', payload: { broken: true }, seq: 0, ordinal: 0 };
+    const log: LogEntry[] = [message('m1', 'x'.repeat(400)), bad, message('m2', 'y'.repeat(400))];
+    assertTracksSlow(log.map((_, end) => log.slice(0, end + 1)));
+    // The projection skips it too — dead weight, identically on both sides.
+    const projected = projectContext(log);
+    expect(projected.messages).toHaveLength(2);
+    expect(projected.entries[1]!.contextMessages).toHaveLength(0);
+  });
+
+  it('memoized measurements are pruned to the live window', () => {
+    // Review low finding: token/byte memos grew O(log) forever.
+    const tracker = new WindowUsageTracker();
+    const entries: LogEntry[] = [];
+    for (let i = 0; i < 200; i += 1) entries.push(message(`m${i}`, 'x'.repeat(400)));
+    entries.push(checkpoint('cp', 'm198', 'S'.repeat(40)));
+    tracker.ingest(entries);
+    const windowMembers = projectContext(entries).entries.filter((entry) => entry.contextMessages.length > 0).length;
+    // Each live member memoizes at most one token estimate and one byte size;
+    // everything summarized away is dropped.
+    expect(tracker.memoSize).toBeLessThanOrEqual(2 * windowMembers);
+    // And it stays bounded as the session continues.
+    for (let i = 200; i < 260; i += 1) tracker.ingest([...entries, message(`n${i}`, 'y'.repeat(400))]);
+    const grown = [...entries, ...Array.from({ length: 60 }, (_, i) => message(`n${200 + i}`, 'y'.repeat(400)))];
+    tracker.ingest(grown);
+    const membersNow = projectContext(grown).entries.filter((entry) => entry.contextMessages.length > 0).length;
+    expect(tracker.memoSize).toBeLessThanOrEqual(2 * membersNow);
   });
 });
 

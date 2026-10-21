@@ -11,7 +11,7 @@
  * @module
  */
 
-import { createOmissionEntryDraft } from './entries.js';
+import { createOmissionEntryDraft, generateLogEntryId } from './entries.js';
 import type { DurableEntryDraft } from './types.js';
 
 /**
@@ -130,7 +130,10 @@ export async function runWithOverflowRecovery<T>(
         firstError instanceof Error ? firstError.message : firstError,
       )}; retry failed: ${String(retryError instanceof Error ? retryError.message : retryError)}`;
       const omissionDraft = createOmissionEntryDraft(
-        options.omissionEntryId ?? `omission-${(options.now ?? Date.now)()}`,
+        // randomUUID discipline (see `generateLogEntryId`): a
+        // `omission-${Date.now()}` id collides when two omissions are recorded
+        // within the same millisecond, and duplicate entry ids corrupt the log.
+        options.omissionEntryId ?? generateLogEntryId('omission'),
         targetIds,
         reason,
         options.now,

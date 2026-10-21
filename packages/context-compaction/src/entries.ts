@@ -75,6 +75,42 @@ export function createOmissionEntryDraft(
   return { id, parentId, kind: CONTEXT_EDIT_ENTRY_KIND, payload };
 }
 
+const MESSAGE_ROLES: ReadonlySet<string> = new Set<CompactionMessage['role']>([
+  'user',
+  'assistant',
+  'toolResult',
+  'custom',
+]);
+
+/**
+ * Structural guard for `mcode.message` payloads. A payload without a known
+ * role (or with a content shape the estimator cannot walk) is dead weight:
+ * the projection skips it and the usage tracker counts nothing for it — the
+ * alternative is `estimateMessageTokens` falling through its exhaustive
+ * switch, returning `undefined`, and poisoning the window totals into NaN on
+ * a corrupt log.
+ */
+export function isCompactionMessagePayload(payload: unknown): payload is CompactionMessage {
+  if (typeof payload !== 'object' || payload === null) return false;
+  const role = (payload as { role?: unknown }).role;
+  if (typeof role !== 'string' || !MESSAGE_ROLES.has(role)) return false;
+  const record = payload as { content?: unknown; customType?: unknown };
+  const isBlockList = (value: unknown): boolean =>
+    Array.isArray(value) &&
+    value.every((block) => typeof block === 'object' && block !== null && typeof (block as { type?: unknown }).type === 'string');
+  switch (role) {
+    case 'user':
+      return typeof record.content === 'string' || isBlockList(record.content);
+    case 'assistant':
+    case 'toolResult':
+      return isBlockList(record.content);
+    case 'custom':
+      return typeof record.customType === 'string';
+  }
+  // `role` is typed `string`, so the switch is not exhaustive to the checker.
+  return false;
+}
+
 /**
  * Read back and validate a compaction payload. `undefined` when the entry is
  * not a well-formed compaction checkpoint (the projection skips foreign or

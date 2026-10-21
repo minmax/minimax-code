@@ -82,6 +82,10 @@ export function estimateMessageTokens(message: CompactionMessage): number {
     case 'custom':
       return ceilDiv(message.text?.length ?? 0, CHARS_PER_TOKEN);
   }
+  // Unreachable for payloads that pass `isCompactionMessagePayload`. The hard
+  // 0 (instead of an implicit undefined fall-through) keeps a corrupt or
+  // future-unknown role from poisoning window totals into NaN.
+  return 0;
 }
 
 /** Total context tokens of a usage record: `totalTokens` wins, components are the fallback. */
