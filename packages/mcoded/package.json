@@ -1,0 +1,28 @@
+{
+  "name": "@mavis/mcoded",
+  "version": "0.1.0",
+  "description": "Skeleton of the resident mcoded daemon (wave Ф4 contract): unix-socket listener with launchd-style LISTEN_FDS adoption, the pi-rpc-semantics JSONL wire (prompt/steer/follow_up/events with version, cursor and request-id) over pluggable transports, the bounded event replay ring, crash-only checkpoint recovery and graceful drain shutdown. The live agent runtime plugs in through the RuntimeAdapter seam; this wave ships an echo stub.",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
+  "dependencies": {
+    "@mavis/config": "workspace:^"
+  },
+  "private": true,
+  "license": "MIT"
+}
