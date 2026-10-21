@@ -182,9 +182,12 @@ describe('recovery over the real sqlite-zstd backend', () => {
 		const third = await openSeam();
 		expect(third.port.getEntry(toolResultEntryId('tc1'))).toBeDefined();
 
-		const replay = await third.seam.finalizeTool({ toolCallId: 'tc1', outcome: prepared.outcome });
-		expect(replay.status).toBe('replayed');
-		expect(replay.commitSeq).toBe(finalized.commitSeq);
+			const replay = await third.seam.finalizeTool({ toolCallId: 'tc1', outcome: prepared.outcome });
+			expect(replay.status).toBe('replayed');
+			expect(replay.commitSeq).toBe(finalized.commitSeq);
+			// The advisory wait view is stable across the restart too: the
+			// replay rebuilds it from the durable result, not the live registry.
+			expect(replay.wait).toEqual(finalized.wait);
 		await expect(
 			third.seam.finalizeTool({ toolCallId: 'tc1', outcome: { kind: 'background', forged: true } }),
 		).rejects.toMatchObject({ code: 'TOOL_RESULT_CONFLICT' });

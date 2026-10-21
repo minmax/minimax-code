@@ -442,6 +442,29 @@ export class DurableSeam {
 					status: 'replayed',
 				};
 			}
+			// A tool call anchors at most one wait: T_complete commits the
+			// single tool result under the toolCallId ALONE, so two waitIds over
+			// one tool call would race for the same outcome slot (the loser's
+			// prepared outcome could never be finalized). Active waits are
+			// covered by the registry; a terminal wait is covered by its
+			// committed tool result below.
+			const anchored = this.waitsByToolCallId.get(draft.toolCallId);
+			if (anchored !== undefined && anchored.waitId !== draft.waitId) {
+				throw new WaitIdConflictError(
+					draft.waitId,
+					`tool call ${JSON.stringify(draft.toolCallId)} is already anchored by wait ${JSON.stringify(
+						anchored.waitId,
+					)}; a tool call anchors at most one wait`,
+				);
+			}
+			if (this.isToolFinalized(draft.toolCallId)) {
+				// The tool round is closed (its wait went terminal and left the
+				// projection): a new anchor could never receive the outcome.
+				throw new ToolResultConflictError(
+					draft.toolCallId,
+					'the tool call is already finalized and cannot anchor a new wait',
+				);
+			}
 			const record: WaitRecord = {
 				waitId: draft.waitId,
 				toolCallId: draft.toolCallId,
@@ -532,6 +555,19 @@ export class DurableSeam {
 			}
 			if (wait.state !== 'foreground') {
 				throw new WaitTerminalError(wait.waitId, wait.state, 'T_release');
+			}
+			if (this.isToolFinalized(wait.toolCallId)) {
+				// Defense in depth: a legitimately foreground wait always
+				// completes in the SAME commit as its tool result (finalizeTool),
+				// so this state can only come from a foreign or legacy log.
+				// Preparing here would write a background outcome that can never
+				// be finalized — the single result slot of the toolCallId is
+				// already taken.
+				throw new ToolResultConflictError(
+					wait.toolCallId,
+					`the tool call of foreground wait ${JSON.stringify(wait.waitId)} is already finalized; ` +
+						'its outcome was decided outside this wait',
+				);
 			}
 			const outcome: BackgroundOutcome = {
 				kind: 'background',
@@ -735,16 +771,41 @@ export class DurableSeam {
 				`the committed tool result carries a different outcome (hash ${payload.outcomeHash.slice(0, 16)}…)`,
 			);
 		}
-		const wait = payload.waitId === null ? undefined : this.waits.get(payload.waitId);
 		return {
 			toolCallId: payload.toolCallId,
 			toolResultEntryId: stored.id,
 			commitSeq: stored.seq,
 			status: 'replayed',
-			wait:
-				wait === undefined
-					? null
-					: { waitId: wait.waitId, state: wait.state, stateVersion: wait.stateVersion },
+			// Advisory wait view, rebuilt deterministically so a replay reports
+			// exactly what the original commit reported (the terminal wait has
+			// left the live registry by now).
+			wait: this.reconstructedWaitView(payload),
+		};
+	}
+
+	/**
+	 * Deterministic wait view of a committed tool result, identical to the
+	 * original finalize's return: a completed wait comes from the result
+	 * payload itself; a finalized background outcome takes the wait's version
+	 * from its prepared entry (the version the release advanced the wait to —
+	 * finalization does not change it).
+	 */
+	private reconstructedWaitView(payload: ToolResultPayload): FinalizeToolResult['wait'] {
+		if (payload.waitId === null) return null;
+		if (payload.waitTransition === 'completed' && payload.waitStateVersionAfter !== null) {
+			return { waitId: payload.waitId, state: 'completed', stateVersion: payload.waitStateVersionAfter };
+		}
+		const prepared = this.port.getEntry(waitPreparedEntryId(payload.waitId));
+		if (prepared === undefined || prepared.kind !== SEAM_ENTRY_KINDS.backgrounded) {
+			throw new SeamStorageError(
+				'STORAGE_FAILURE',
+				`finalized background outcome of wait ${JSON.stringify(payload.waitId)} has no prepared entry`,
+			);
+		}
+		return {
+			waitId: payload.waitId,
+			state: 'backgrounded',
+			stateVersion: parsePreparedPayload(prepared.payload, prepared.id).stateVersion,
 		};
 	}
 

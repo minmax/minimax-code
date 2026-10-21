@@ -14,6 +14,8 @@ import {
 	WaitIdConflictError,
 	WaitTerminalError,
 	SEAM_ENTRY_KINDS,
+	hashJson,
+	waitOpenedEntryId,
 	waitPreparedEntryId,
 	toolResultEntryId,
 } from '../../src/index.js';
@@ -67,6 +69,101 @@ describe('openForegroundWait', () => {
 		await expect(
 			seam.openForegroundWait({ waitId: 'w1', toolCallId: 'tc1', conversationId: 'elsewhere' }),
 		).rejects.toBeInstanceOf(WaitIdConflictError);
+		expect(log.batches).toHaveLength(1);
+	});
+});
+
+describe('tool call anchors at most one wait', () => {
+	it('refuses a second waitId over an already-anchored tool call', async () => {
+		await seam.openForegroundWait({ waitId: 'w1', toolCallId: 'tc1', conversationId: 'parent' });
+
+		// Two waitIds over one tool call would race for the SINGLE outcome
+		// slot of T_complete; the loser's prepared outcome could never be
+		// finalized.
+		await expect(
+			seam.openForegroundWait({ waitId: 'w2', toolCallId: 'tc1', conversationId: 'parent' }),
+		).rejects.toMatchObject({ code: 'WAIT_ID_CONFLICT' });
+
+		// Nothing was written by the refused open, and the anchor is intact.
+		expect(seam.waitByToolCallId('tc1')?.waitId).toBe('w1');
+		expect(seam.getWait('w2')).toBeUndefined();
+		expect(log.batches).toHaveLength(1);
+	});
+
+	it('refuses anchoring a wait to an already-finalized tool call', async () => {
+		await seam.openForegroundWait({ waitId: 'w1', toolCallId: 'tc1', conversationId: 'parent' });
+		await seam.finalizeTool({ toolCallId: 'tc1', outcome: { status: 'ok' } });
+		// w1 went terminal and left the projection; tc1's single result slot
+		// is taken, so a NEW wait over it could never receive an outcome.
+		await expect(
+			seam.openForegroundWait({ waitId: 'w2', toolCallId: 'tc1', conversationId: 'parent' }),
+		).rejects.toMatchObject({ code: 'TOOL_RESULT_CONFLICT' });
+		expect(log.batches).toHaveLength(2);
+	});
+
+	it('keeps both guards across a restart (durable registry, not memory)', async () => {
+		await seam.openForegroundWait({ waitId: 'w1', toolCallId: 'tc1', conversationId: 'parent' });
+		await seam.openForegroundWait({ waitId: 'w9', toolCallId: 'tc9', conversationId: 'parent' });
+		await seam.finalizeTool({ toolCallId: 'tc1', outcome: { status: 'ok' } });
+
+		const restarted = await DurableSeam.open(log);
+
+		// w1 is terminal (reconstructed only from entries) — its tool result
+		// still refuses a new anchor...
+		await expect(
+			restarted.openForegroundWait({ waitId: 'w2', toolCallId: 'tc1', conversationId: 'parent' }),
+		).rejects.toMatchObject({ code: 'TOOL_RESULT_CONFLICT' });
+		// ...and w9 is active (recovered) — the recovered registry refuses a
+		// second anchor just the same.
+		await expect(
+			restarted.openForegroundWait({ waitId: 'w2', toolCallId: 'tc9', conversationId: 'parent' }),
+		).rejects.toMatchObject({ code: 'WAIT_ID_CONFLICT' });
+	});
+
+	it('refuses to prepare a release for a foreground wait whose tool call is already finalized', async () => {
+		// This state cannot be produced through the primitives (a foreground
+		// wait always completes in the same commit as its tool result); craft
+		// it directly in the log as a foreign/legacy writer would.
+		await log.appendBatch([
+			{
+				id: waitOpenedEntryId('wx'),
+				kind: SEAM_ENTRY_KINDS.waitOpened,
+				payload: {
+					waitId: 'wx',
+					toolCallId: 'tcx',
+					conversationId: 'parent',
+					delegationId: null,
+					childConversationId: null,
+					childRunId: null,
+					cancelOnParentAbort: false,
+					state: 'foreground',
+					stateVersion: 1,
+					openedCommitSeq: 0,
+				},
+			},
+			{
+				id: toolResultEntryId('tcx'),
+				kind: SEAM_ENTRY_KINDS.toolResult,
+				payload: {
+					toolCallId: 'tcx',
+					waitId: null,
+					outcome: { status: 'decided-elsewhere' },
+					outcomeHash: hashJson({ status: 'decided-elsewhere' }),
+					waitTransition: null,
+					waitStateVersionAfter: null,
+					finalizedAtMs: 0,
+				},
+			},
+		]);
+
+		const reopened = await DurableSeam.open(log);
+		expect(reopened.getWait('wx')).toMatchObject({ state: 'foreground', stateVersion: 1 });
+
+		// Preparing would write a background outcome that can never be
+		// finalized — refused with TOOL_RESULT_CONFLICT instead.
+		await expect(reopened.prepareRelease({ waitId: 'wx', expectedVersion: 1 })).rejects.toMatchObject({
+			code: 'TOOL_RESULT_CONFLICT',
+		});
 		expect(log.batches).toHaveLength(1);
 	});
 });
@@ -171,6 +268,9 @@ describe('finalizeTool — T_complete', () => {
 		const replay = await seam.finalizeTool({ toolCallId: 'tc1', outcome: { status: 'completed', runs: 1 } });
 		expect(replay.status).toBe('replayed');
 		expect(replay.commitSeq).toBe(result.commitSeq);
+		// ...and the advisory wait view is stable between the commit and its
+		// replay, although the terminal wait has left the live registry.
+		expect(replay.wait).toEqual(result.wait);
 		// ...and a different outcome is refused — never a second tool result.
 		await expect(seam.finalizeTool({ toolCallId: 'tc1', outcome: { status: 'failed' } })).rejects.toBeInstanceOf(
 			ToolResultConflictError,
@@ -190,6 +290,13 @@ describe('finalizeTool — T_complete', () => {
 		expect(finalized.wait).toEqual({ waitId: 'w1', state: 'backgrounded', stateVersion: 2 });
 		expect(seam.getWait('w1')).toBeUndefined();
 		expect(seam.listPendingPrepared()).toHaveLength(0);
+
+		// The replay reports the same wait view as the original commit (the
+		// version comes from the prepared entry, which finalization did not
+		// change).
+		const replay = await seam.finalizeTool({ toolCallId: 'tc1', outcome: prepared.outcome });
+		expect(replay.status).toBe('replayed');
+		expect(replay.wait).toEqual(finalized.wait);
 
 		// Reproducing must be verbatim: any other outcome is a conflict.
 		await expect(seam.finalizeTool({ toolCallId: 'tc1', outcome: { kind: 'background', forged: true } })).rejects

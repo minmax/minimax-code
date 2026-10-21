@@ -44,12 +44,18 @@ Guarantees:
   duplicate `openForegroundWait` with a different tool call or conversation is
   a `WAIT_ID_CONFLICT`, a repeat of the same identity replays — including a
   wait that already went terminal, judged from its deterministic entries.
+  The anchor is exclusive in BOTH directions: a `toolCallId` anchors at most
+  one wait (a second `waitId` over an anchored tool call is a
+  `WAIT_ID_CONFLICT`), and a finalized tool call cannot anchor a new wait
+  (`TOOL_RESULT_CONFLICT`) — otherwise two waits could race for the single
+  outcome slot of `T_complete`. `prepareRelease` refuses a foreground wait
+  whose tool call is already finalized for the same reason.
 - **Crash between phases.** `backgrounded` is irreversible for a `waitId`. A
   crash after `prepareRelease` and before finalization leaves a pending
   prepared outcome (`listPendingPrepared()`); the restarted process finalizes
-  with the stored outcome verbatim — same outcome replays the original commit,
-  any other outcome is a `TOOL_RESULT_CONFLICT`. A `toolCallId` is finalized
-  exactly once, ever.
+  with the stored outcome verbatim — same outcome replays the original commit
+  (reporting the same wait view as the original commit), any other outcome is
+  a `TOOL_RESULT_CONFLICT`. A `toolCallId` is finalized exactly once, ever.
 - **Bounded projection.** The active registry (and therefore the snapshot
   riding every commit) holds only foreground waits and backgrounded-not-yet-
   finalized waits plus active deliveries. Terminal waits and settled inputs
