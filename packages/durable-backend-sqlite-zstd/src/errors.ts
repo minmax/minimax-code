@@ -20,14 +20,41 @@ export class SealedGenerationError extends SqliteZstdError {
 }
 
 /**
- * A stored batch frame did not survive decoding: header mismatch, codec
- * checksum failure, malformed JSON, or an entry index that disagrees with the
- * payload. Readers treat the batch as a torn tail and never serve it.
+ * A stored batch frame did not survive decoding: header mismatch, declared
+ * length disagreement, codec checksum failure, malformed JSON, or a payload
+ * past the JSON depth limit. Readers treat the batch as a torn tail and never
+ * serve it.
  */
 export class CorruptFrameError extends SqliteZstdError {
 	constructor(message: string, options?: { readonly cause?: unknown }) {
 		super(message, options);
 		this.name = 'CorruptFrameError';
+	}
+}
+
+/**
+ * The codec a stored frame was written with cannot run in this runtime (for
+ * example `node:zlib` lacks Zstandard support). This is an environment
+ * problem, not payload corruption: readers must surface it loudly instead of
+ * misclassifying every frame of that codec as a torn tail.
+ */
+export class CodecUnavailableError extends SqliteZstdError {
+	constructor(message: string, options?: { readonly cause?: unknown }) {
+		super(message, options);
+		this.name = 'CodecUnavailableError';
+	}
+}
+
+/**
+ * An entry id violates the `entries.entry_id` primary key: the id was already
+ * committed. The backend classifies the raw `SQLITE_CONSTRAINT` failure into
+ * this domain error so callers can react deliberately (skip, split, or report)
+ * instead of pattern-matching SQLite messages.
+ */
+export class DuplicateEntryError extends SqliteZstdError {
+	constructor(message: string, options?: { readonly cause?: unknown }) {
+		super(message, options);
+		this.name = 'DuplicateEntryError';
 	}
 }
 
@@ -45,9 +72,9 @@ export class OwnerWriteLockError extends SqliteZstdError {
 
 /**
  * Single-writer loss at write time: this handle owned the generation when it
- * was opened, but the meta owner epoch has since moved — another writer took
- * over. Terminal for this handle: it must not retry, its view of the log is
- * stale.
+ * was opened, but the meta owner epoch (or owner instance) has since moved —
+ * another writer took over. Terminal for this handle: it must not retry, its
+ * view of the log is stale.
  */
 export class OwnerLostError extends SqliteZstdError {
 	constructor(message: string, options?: { readonly cause?: unknown }) {

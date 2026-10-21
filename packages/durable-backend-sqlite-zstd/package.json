@@ -29,6 +29,9 @@
     "typescript": "^5",
     "vitest": "^2"
   },
+  "engines": {
+    "node": ">=22.15"
+  },
   "private": true,
   "license": "MIT"
 }
