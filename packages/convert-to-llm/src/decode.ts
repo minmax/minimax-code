@@ -10,9 +10,12 @@
  * `undecodable` and the wire equivalence gate would flag a wrongly dropped
  * entry.
  *
- * Images decode to reference parts (`{type:'image', mimeType}`), never to
- * binary data: the dialect renders a deterministic text placeholder and CAS
- * pages own the actual image transport.
+ * Images decode to reference parts (`{type:'image', mimeType}`) plus the
+ * payload's inline base64 when it carries one (`data`, optional): the dialect
+ * renders a deterministic text placeholder and CAS pages own the actual image
+ * transport, so the base64 never persists into a compiled record — it is read
+ * only when a residency override explicitly renders a RESIDENT page's bytes
+ * onto the wire (the Context-MMU overlay), within this one conversion call.
  */
 
 import type { JsonValue } from './types.js';
@@ -20,7 +23,7 @@ import type { JsonValue } from './types.js';
 /** One projected content part: text bytes or an image reference. */
 export type DecodedPart =
   | { readonly type: 'text'; readonly text: string }
-  | { readonly type: 'image'; readonly mimeType: string };
+  | { readonly type: 'image'; readonly mimeType: string; readonly data?: string };
 
 /** Projected tool call before dialect rendering. */
 export interface DecodedToolCall {
@@ -88,7 +91,8 @@ function decodeBlockParts(blocks: readonly JsonValue[]): DecodedPart[] {
       if (text !== undefined) parts.push({ type: 'text', text });
     } else if (type === 'image') {
       const mimeType = asString(block.mimeType) ?? 'application/octet-stream';
-      parts.push({ type: 'image', mimeType });
+      const data = asString(block.data);
+      parts.push(data === undefined ? { type: 'image', mimeType } : { type: 'image', mimeType, data });
     }
   }
   return parts;

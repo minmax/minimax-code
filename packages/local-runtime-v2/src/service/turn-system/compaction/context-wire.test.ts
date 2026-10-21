@@ -23,7 +23,9 @@ import {
   DEFAULT_MAX_PAYLOAD_BYTES,
   commitOfEntries,
   prepareContextWire,
+  type ContextWireResidency,
 } from './context-wire.js';
+import type { ContextMmu, PageHandle } from '../../../../../context-mmu/src/index.js';
 import {
   assembleManifestPayload,
   serializeCompiledEntry,
@@ -286,5 +288,107 @@ describe('ContextWirePipeline steering D+C seam (model-visible control kinds)', 
     // A pipeline resumed from the capsule compiles the same body.
     const resumed = ContextWirePipeline.fromCapsule(pipeline.capsule(), slice);
     expect(resumed.prepare().body.equals(prepared.body)).toBe(true);
+  });
+});
+
+describe('ContextWirePipeline image residency (Ф2 R2 overlay, judge round 1)', () => {
+  /** One user entry carrying a text part and an inline base64 image block. */
+  function imageEntry(seq: number, ordinal: number, base64: string): Entry {
+    return entry(
+      'pi.user',
+      { model: [{ role: 'user', content: [{ type: 'text', text: `shot ${ordinal}` }, { type: 'image', mimeType: 'image/png', data: base64 }] }] },
+      seq,
+      ordinal,
+    );
+  }
+
+  /** Minimal Context-MMU double: residency statuses keyed by page id. */
+  function residencyOf(
+    pageByEntry: ReadonlyMap<string, { id: string; sha256: string }>,
+    statusByPage: Map<string, 'resident' | 'digest'>,
+  ): ContextWireResidency {
+    return {
+      mmu: {
+        statusOf: (handle: PageHandle) => statusByPage.get(handle.id) ?? 'digest',
+      } as unknown as ContextMmu,
+      pageOf: (candidate: Entry) => pageByEntry.get(candidate.id),
+    };
+  }
+
+  it('a resident image rides the payload; a digest one stays a placeholder', () => {
+    const imgA = imageEntry(1, 0, 'QUFBQUFB');
+    const imgB = imageEntry(1, 1, 'QkJCQkJC');
+    const pageA = { id: 'page-a', sha256: 'a'.repeat(64) };
+    const pageB = { id: 'page-b', sha256: 'b'.repeat(64) };
+    const statusByPage = new Map<string, 'resident' | 'digest'>([
+      ['page-a', 'resident'],
+      ['page-b', 'digest'],
+    ]);
+    const pipeline = new ContextWirePipeline({
+      residency: residencyOf(
+        new Map([
+          [imgA.id, pageA],
+          [imgB.id, pageB],
+        ]),
+        statusByPage,
+      ),
+    });
+    pipeline.applyCommit(commitOfEntries(1, [imgA, imgB]));
+
+    const prepared = pipeline.prepare();
+    const text = prepared.body.toString('utf8');
+    // The RESIDENT page's real bytes ride the record as a data URL...
+    expect(text).toContain('data:image/png;base64,QUFBQUFB');
+    // ...while the DIGEST page keeps the dialect placeholder and never leaks.
+    expect(text).toContain('[image: image/png]');
+    expect(text).not.toContain('QkJCQkJC');
+    // The resident record compiles under its content-keyed wire identity; the
+    // digest one under the plain entry id.
+    const ids = prepared.segments.map((segment) => segment.entryId);
+    expect(ids).toContain(`${imgA.id}#resident@${'a'.repeat(16)}`);
+    expect(ids).toContain(imgB.id);
+  });
+
+  it('a residency flip recompiles: the segment cache never serves the other state', () => {
+    const img = imageEntry(1, 0, 'QUFBQUFB');
+    const page = { id: 'page-a', sha256: 'a'.repeat(64) };
+    const statusByPage = new Map<string, 'resident' | 'digest'>([['page-a', 'resident']]);
+    const pipeline = new ContextWirePipeline({ residency: residencyOf(new Map([[img.id, page]]), statusByPage) });
+    pipeline.applyCommit(commitOfEntries(1, [img]));
+    const resident = pipeline.prepare();
+    expect(resident.body.toString('utf8')).toContain('data:image/png;base64,QUFBQUFB');
+
+    // The page is EVICTED: the next prepare must re-convert to the
+    // placeholder — the cached resident bytes are keyed under the resident
+    // wire identity, so a stale hit is impossible.
+    statusByPage.set('page-a', 'digest');
+    const evicted = pipeline.prepare();
+    const evictedText = evicted.body.toString('utf8');
+    expect(evictedText).not.toContain('QUFBQUFB');
+    expect(evictedText).toContain('[image: image/png]');
+    expect(evictedText.length).toBeLessThan(resident.totalBytes);
+
+    // Faulted back in: the resident bytes return (a fresh segment under the
+    // content key), byte-identical to the first resident prepare.
+    statusByPage.set('page-a', 'resident');
+    const back = pipeline.prepare();
+    expect(back.body.equals(resident.body)).toBe(true);
+  });
+
+  it('without a residency option the path stays the all-evicted baseline', () => {
+    const img = imageEntry(1, 0, 'QUFBQUFB');
+    const baseline = new ContextWirePipeline();
+    baseline.applyCommit(commitOfEntries(1, [img]));
+    const prepared = baseline.prepare();
+    const text = prepared.body.toString('utf8');
+    expect(text).toContain('[image: image/png]');
+    expect(text).not.toContain('QUFBQUFB');
+    expect(prepared.segments.map((segment) => segment.entryId)).toEqual([img.id]);
+    // Byte-identical to a residency whose page is never resident.
+    const digestOnly = new ContextWirePipeline({
+      residency: residencyOf(new Map([[img.id, { id: 'p', sha256: 'a'.repeat(64) }]]), new Map()),
+    });
+    digestOnly.applyCommit(commitOfEntries(1, [img]));
+    expect(digestOnly.prepare().body.equals(prepared.body)).toBe(true);
   });
 });

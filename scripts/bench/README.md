@@ -31,6 +31,10 @@ FIXTURE=/path/to/messages.jsonl node scripts/bench/run-all.mjs --check scripts/b
 
 # Individual benches
 FIXTURE=/path/to/messages.jsonl node --expose-gc scripts/bench/bench-open.mjs
+FIXTURE=/path/to/images.jsonl node --conditions=development --experimental-transform-types --expose-gc scripts/bench/bench-prep.mjs
+# ^ Ф2 prep bench: loads the packages' TypeScript sources (`development`
+#   condition) and the Context MMU (`transform-types`: parameter properties) —
+#   `run-all.mjs` passes both flags to every child automatically.
 FIXTURE=/path/to/messages.jsonl node --expose-gc scripts/bench/bench-append.mjs
 FIXTURE=/path/to/messages.jsonl node --expose-gc scripts/bench/bench-replay.mjs
 node --expose-gc scripts/bench/bench-worker-commit.mjs   # worker commit path, own synthetic store
@@ -63,6 +67,7 @@ full GC and benches run in isolated child processes.
 | `REPLAY_STEPS` | `287`   | `bench-replay` (and so `run-all`); stringify steps |
 | `BATCHES`      | `200`   | `bench-worker-commit`; committed batches |
 | `ENTRY_KB`     | `64`    | `bench-worker-commit`; entry payload size |
+| `MMU_RESIDENT_BYTES` | `262144` | `bench-prep`; Context-MMU budget behind the prep bench's residency overlay (at the images corpus's 64 KiB images this keeps exactly 4 pages resident — the architecture's ≤4-resident shape; resident pages ride the measured payload as data URLs) |
 
 Every bench also reports event-loop stall metrics (`<bench>.stallP99Ms`,
 `<bench>.stallMaxMs`) sampled across the measured path.

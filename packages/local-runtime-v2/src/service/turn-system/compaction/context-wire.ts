@@ -9,6 +9,12 @@
 //                   → convert-to-llm (per-entry stage, convertEntry)
 //                   → wire-compiler  (cached Buffer segments, byte guard)
 //
+// with the Ф2 R2 overlay beside it: an optional Context-MMU residency
+// (`ContextWireOptions.residency`) decides which window entries' images ride
+// the payload with their real bytes; everything else keeps the dialect
+// placeholder. Without the overlay the path is the all-evicted baseline the
+// equivalence gates pin.
+//
 // — and exposes the two operations the turn loop needs: `applyCommit` per
 // durable commit (O(entries of the commit)) and `prepare()` per provider
 // request (O(window); warm requests reuse cached segments without
@@ -56,7 +62,12 @@ import {
   isPlacedEntryKind,
   isReminderEntryKind,
   isVisibleControlKind,
+  type ImageRendering,
 } from '../../../../../convert-to-llm/src/index.js';
+// Context MMU: type-only here (the runtime wires the instance in via
+// `ContextWireOptions.residency`) — the packages do not link until the
+// integrator registers them, same as the backend types above.
+import type { ContextMmu, PageHandle } from '../../../../../context-mmu/src/index.js';
 import {
   WireBudgetExceeded,
   compile,
@@ -93,6 +104,22 @@ function summaryWireEntry(manifest: ContextManifest): WireEntry | undefined {
   return { entryId: summaryEntryId(mark.summary), kind: 'text', role: 'user', content: mark.summary };
 }
 
+/**
+ * Context-MMU residency seam (Ф2 R2 overlay): decides which window entries'
+ * images ride the payload with their real bytes. Absent, every image converts
+ * to its dialect placeholder — the all-evicted baseline the equivalence gates
+ * pin.
+ */
+export interface ContextWireResidency {
+  /** The MMU owning the session's pages; `statusOf` decides resident vs digest. */
+  readonly mmu: ContextMmu;
+  /**
+   * The page handle of `entry`'s image content; `undefined` when the entry
+   * carries no MMU-managed image (plain text pages are always resident).
+   */
+  readonly pageOf: (entry: Entry) => PageHandle | undefined;
+}
+
 export interface ContextWireOptions {
   /**
    * Hard cap on the compiled provider payload in bytes; `prepare()` throws
@@ -103,6 +130,8 @@ export interface ContextWireOptions {
   readonly cacheCapacity?: number;
   /** Explicit segment cache (tests). Default: a private LRU. */
   readonly cache?: WireSegmentCache;
+  /** Context-MMU image residency (Ф2 R2). Default: everything evicted. */
+  readonly residency?: ContextWireResidency;
 }
 
 /** The prepared provider payload plus the facts the turn loop reports. */
@@ -128,6 +157,7 @@ export class ContextWirePipeline {
   private readonly service: ProjectionService;
   private readonly cache: WireSegmentCache;
   private readonly maxBytes: number;
+  private readonly residency: ContextWireResidency | undefined;
   /** Content pages of the current window; pruned to the manifest after each commit. */
   private readonly content = new Map<string, Entry>();
 
@@ -135,6 +165,7 @@ export class ContextWirePipeline {
     this.service = new ProjectionService();
     this.maxBytes = options?.maxBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
     this.cache = options?.cache ?? createLruSegmentCache(options?.cacheCapacity ?? 4096);
+    this.residency = options?.residency;
   }
 
   /**
@@ -183,6 +214,7 @@ export class ContextWirePipeline {
     const compiled = compileWindow([...this.content.values()], manifest, {
       maxBytes: this.maxBytes,
       cache: this.cache,
+      residency: this.residency,
     });
     return { ...compiled, manifest, manifestBytes: manifest.windowBytes };
   }
@@ -235,11 +267,23 @@ export class ContextWirePipeline {
  * overlay). A duplicate placed `inputEntryId` (a recovery artifact between
  * the admission commit and the delivery-index update) is dropped — first log
  * occurrence wins, "placed exactly once".
+ *
+ * Image residency (Ф2 R2, `options.residency`): an entry whose MMU page is
+ * RESIDENT renders its real bytes (a data URL) into the record; every other
+ * image stays the dialect placeholder. A resident record compiles under a
+ * content-keyed wire identity (`<entryId>#resident@<sha16>`, the same
+ * convention as the compaction summary record) — the segment cache keys on
+ * the wire id, so a residency flip always recompiles instead of serving the
+ * other state's cached bytes.
  */
 function compileWindow(
   windowPages: readonly Entry[],
   manifest: ContextManifest,
-  options: { readonly maxBytes: number; readonly cache: WireSegmentCache },
+  options: {
+    readonly maxBytes: number;
+    readonly cache: WireSegmentCache;
+    readonly residency?: ContextWireResidency;
+  },
 ): CompiledBody {
   const segmentIds = new Set(manifest.segments.map((segment) => segment.entryId));
 
@@ -267,7 +311,18 @@ function compileWindow(
       if (seenInputEntryIds.has(dedupId)) continue;
       seenInputEntryIds.add(dedupId);
     }
-    const record = convertEntry(page);
+    // Residency decision FIRST, then one conversion under it: a resident
+    // image page renders its bytes, everything else the placeholder.
+    const imagePage = options.residency?.pageOf(page);
+    const rendering: ImageRendering | undefined =
+      imagePage !== undefined && options.residency.mmu.statusOf(imagePage) === 'resident'
+        ? {
+            cacheState: `resident@${imagePage.sha256.slice(0, 16)}`,
+            renderImage: (part) =>
+              part.data === undefined ? undefined : `data:${part.mimeType};base64,${part.data}`,
+          }
+        : undefined;
+    const record = convertEntry(page, undefined, rendering);
     if (isReminderEntryKind(page.kind)) {
       // A dedicated reminder entry IS a tail record: strictly after the
       // stable prefix, never inside it.
@@ -278,8 +333,15 @@ function compileWindow(
       continue;
     }
     if (record !== null) {
-      prefixEntries.push(compiledEntryToWireEntry(record));
-      prefixRefs.push({ entryId: record.entryId });
+      // A resident rendering compiles under its own content-keyed wire
+      // identity — never under the plain entry id the digest placeholder
+      // uses (see the residency note above).
+      const wireRecord =
+        rendering === undefined
+          ? record
+          : { ...record, entryId: `${record.entryId}#${rendering.cacheState}` };
+      prefixEntries.push(compiledEntryToWireEntry(wireRecord));
+      prefixRefs.push({ entryId: wireRecord.entryId });
     }
     // Embedded `<system-reminder>` blocks split into tail records; the
     // prefix record keeps the residual bytes (convert-to-llm's split rule).
@@ -309,7 +371,7 @@ export function prepareContextWire(entries: readonly Entry[], options?: ContextW
   const maxBytes = options?.maxBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
   const manifest = buildProjection(entries);
   const cache = options?.cache ?? createLruSegmentCache(options?.cacheCapacity ?? 4096);
-  const compiled = compileWindow(entries, manifest, { maxBytes, cache });
+  const compiled = compileWindow(entries, manifest, { maxBytes, cache, residency: options?.residency });
   return { ...compiled, manifest, manifestBytes: manifest.windowBytes };
 }
 

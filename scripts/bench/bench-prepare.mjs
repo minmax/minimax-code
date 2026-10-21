@@ -7,7 +7,11 @@
 //                  replaces 62 of them with image entries carrying a ~1.5 MiB
 //                  base64 imitation INLINE in the durable payload; the same
 //                  bytes are published into a real CAS and wrapped in the
-//                  Context MMU (resident budget 12 MiB, LRU eviction).
+//                  Context MMU (resident budget 12 MiB, LRU eviction). The
+//                  payload assembly runs under the residency overlay: a
+//                  RESIDENT page rides the provider payload as a data URL
+//                  (content-keyed wire id), a digest page stays the dialect
+//                  placeholder — the Ф2 R2 architecture, judge round 1.
 //   (2) commits  — entries flow through `createStorageWorker` (bridge mode:
 //                  batch windows on the worker thread, `appendBatch` on this
 //                  thread via `sqliteZstdStorageBackend`) into a fresh temp
@@ -31,8 +35,9 @@
 //   (5) llm-mock — the provider is replaced by a body verification, no
 //                  network: NDJSON line boundaries, per-segment sha256,
 //                  record shape of every line, byte stability across prepares,
-//                  and zero image-base64 leak into the body (placeholders
-//                  only — the durable base64 must never reach the wire).
+//                  and zero EVICTED image-base64 leak into the body — a
+//                  resident page's bytes ride the payload by design (the Ф2
+//                  R2 overlay); an evicted page's base64 must never reach it.
 //
 // Gate (printed to stdout, drives the exit code): PASS iff prep.p95Ms
 // ≤ PREP_BUDGET_MS (50) and payload.bytes ≤ MAX_PAYLOAD_BYTES (32 MiB) and
@@ -156,9 +161,16 @@ function textFor(index) {
 function imageBase64(index) {
   const raw = Buffer.alloc(Math.floor((imageKib * 1024 * 3) / 4));
   let state = (index * 2654435761) >>> 0;
-  for (let i = 0; i < raw.length; i += 1) {
+  // All four state bytes per step, not just the low byte: a low-byte-only
+  // stream is periodic in 256 and every image repeats every other image's
+  // substrings — the residency leak check below would false-positive on a
+  // resident page carrying an evicted page's 48-char sample.
+  for (let i = 0; i < raw.length; ) {
     state = (Math.imul(state, 1103515245) + 12345) >>> 0;
-    raw[i] = state & 0xff;
+    raw[i++] = (state >>> 24) & 0xff;
+    if (i < raw.length) raw[i++] = (state >>> 16) & 0xff;
+    if (i < raw.length) raw[i++] = (state >>> 8) & 0xff;
+    if (i < raw.length) raw[i++] = state & 0xff;
   }
   return raw.toString('base64');
 }
@@ -171,7 +183,7 @@ const mmu = createMMU(cas, { maxResidentBytes: mmuResidentBytes });
 
 /** entryId of every image entry → its MMU page handle. */
 const imageHandleByEntry = new Map();
-/** First bytes of every image's base64 payload; the leak check samples. */
+/** First bytes of every image's base64 payload; the leak check samples them. */
 const imageLeakSamples = [];
 let imagesInWindow = 0;
 
@@ -268,7 +280,7 @@ try {
       mmu.admit(handle);
       await mmu.fault(handle); // CAS round-trip; pendingBytes released
       imageHandleByEntry.set(`e${index}`, handle);
-      imageLeakSamples.push(base64.slice(0, 48));
+      imageLeakSamples.push({ entryId: `e${index}`, sample: base64.slice(0, 48) });
     }
     batch.push(draftOf(index, base64));
     if (batch.length >= chunkEntries) {
@@ -308,6 +320,11 @@ try {
   for (const id of windowEntryIds) {
     if (imageHandleByEntry.has(id)) imagesInWindow += 1;
   }
+  /** Whether the image page of this entry is resident RIGHT NOW (stable from here on). */
+  const imageResident = (entryId) => {
+    const imageHandle = imageHandleByEntry.get(entryId);
+    return imageHandle !== undefined && mmu.statusOf(imageHandle) === 'resident';
+  };
 
   await worker.dispose();
   backend.close(); // release the writer marker before the measured opens
@@ -394,10 +411,21 @@ try {
     for (const page of pages) {
       const source = sourceById.get(page.entryId);
       if (source === undefined) fail(`window entry ${page.entryId} has no source content page`);
-      const record = convertEntry(source);
+      // Resident image page: its bytes ride the payload as a data URL, under
+      // a content-keyed wire identity (same convention as the runtime
+      // composition in local-runtime-v2 context-wire.ts). Digest pages take
+      // the plain placeholder conversion.
+      const rendering = imageResident(page.entryId)
+        ? {
+            cacheState: `resident@${imageHandleByEntry.get(page.entryId).sha256.slice(0, 16)}`,
+            renderImage: (part) => (part.data === undefined ? undefined : `data:${part.mimeType};base64,${part.data}`),
+          }
+        : undefined;
+      let record = convertEntry(source, undefined, rendering);
       if (record === null) continue; // audit/control entries carry no provider bytes
+      if (rendering !== undefined) record = { ...record, entryId: `${record.entryId}#${rendering.cacheState}` };
       wireEntries.push(compiledEntryToWireEntry(record));
-      wireManifest.push({ entryId: page.entryId });
+      wireManifest.push({ entryId: record.entryId });
     }
     return compile(wireManifest, wireEntries, { maxBytes: maxPayloadBytes, dialect, cache, requireHashes });
   }
@@ -439,11 +467,12 @@ try {
       offset += segment.bytes;
     }
     if (offset !== body.length) mockErrors.push(`segment bytes (${offset}) do not cover the body (${body.length})`);
-    for (const sample of imageLeakSamples) {
-      if (body.includes(sample)) {
-        mockErrors.push('image base64 leaked into the wire body');
-        break;
-      }
+    for (const { entryId, sample } of imageLeakSamples) {
+      // A RESIDENT page's base64 is SUPPOSED to be in the body (the Ф2 R2
+      // overlay); only an evicted page's bytes leaking is a defect.
+      if (imageResident(entryId) || !body.includes(sample)) continue;
+      mockErrors.push('evicted image base64 leaked into the wire body');
+      break;
     }
     return { lines: segments.length, hashesOk, placeholders, roles: [...roles].sort() };
   }
@@ -472,6 +501,10 @@ try {
   if (!byteStable) mockErrors.push('warm prepare produced different bytes than the hashed prepare');
   const mmuStats = mmu.stats();
   const residentPages = mmuStats.bytes;
+  let residentWindowImages = 0;
+  for (const id of windowEntryIds) {
+    if (imageResident(id)) residentWindowImages += 1;
+  }
   if (residentPages > mmuResidentBytes) {
     gateFailures.push(`mmu resident bytes ${residentPages} exceed the budget ${mmuResidentBytes}`);
   }
@@ -507,6 +540,7 @@ try {
   metric('mmu.residentPages', mmuStats.resident);
   metric('mmu.budgetBytes', mmuResidentBytes);
   metric('mmu.windowFaults', opened.faultsOf());
+  metric('mmu.windowResidentImages', residentWindowImages);
   metric('mmu.faultRoundTripOk', faultRoundTripOk);
   metric('mock.lines', verifiedStats.lines);
   metric('mock.hashesOk', verifiedStats.hashesOk);

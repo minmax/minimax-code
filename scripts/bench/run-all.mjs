@@ -82,7 +82,10 @@ for (const { id, script } of BENCHES) {
   // sources (dist/ is gitignored and unbuilt on a clean checkout); without
   // the condition `exports` resolve `import` → dist and the run dies with
   // ERR_MODULE_NOT_FOUND (@mavis/cas/dist/cas-ref.js via the prep bench).
-  const child = spawnSync(process.execPath, ['--conditions=development', '--expose-gc', scriptPath], {
+  // --experimental-transform-types: the prep bench now pulls the Context MMU
+  // in (the Ф2 R2 residency overlay), whose sources use parameter properties
+  // — strip-only mode rejects that syntax (same twist as bench-prepare.mjs).
+  const child = spawnSync(process.execPath, ['--conditions=development', '--experimental-transform-types', '--expose-gc', scriptPath], {
     env: process.env,
     encoding: 'utf8',
     maxBuffer: 64 * MIB,

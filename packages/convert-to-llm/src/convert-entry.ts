@@ -32,14 +32,43 @@ import {
 import type { CompiledEntry, Dialect, DurableEntry } from './types.js';
 import { MINIMAX_M3_DIALECT } from './dialect.js';
 
+/** The image part shape {@link ImageRendering}'s callback receives. */
+export type DecodedImagePart = Extract<DecodedPart, { readonly type: 'image' }>;
+
+/**
+ * Per-request rendering override for image parts — the Context-MMU residency
+ * overlay (Ф2 R2) on the conversion stage. Absent (the default), every image
+ * renders as the dialect's deterministic placeholder and the record depends
+ * only on `(entry, dialect)`. Present, a RESIDENT page renders its real bytes
+ * (a data URL) instead; a digest page keeps the placeholder by returning
+ * `undefined` from the callback.
+ *
+ * Because two renderings of the SAME entry produce different bytes,
+ * {@link ImageRendering.cacheState} MUST distinguish their cache keys — the
+ * wire path folds it into the wire identity too, so the segment cache never
+ * serves one state's bytes under the other's key.
+ */
+export interface ImageRendering {
+  /** Renders one image part; `undefined` falls back to the dialect placeholder. */
+  readonly renderImage?: (part: DecodedImagePart) => string | undefined;
+  /** Cache-state tag of this rendering (e.g. `resident@<sha16>` of the resident page). */
+  readonly cacheState?: string;
+}
+
+/** Cache key of a record under an optional rendering override. */
+function recordCacheKey(entryId: string, dialect: Dialect, images: ImageRendering | undefined): string {
+  return images?.cacheState === undefined ? compileKey(entryId, dialect) : `${compileKey(entryId, dialect)}@${images.cacheState}`;
+}
+
 /** Render decoded parts to provider text; images become deterministic placeholders. */
-function renderParts(parts: readonly DecodedPart[], dialect: Dialect): string {
+function renderParts(parts: readonly DecodedPart[], dialect: Dialect, images?: ImageRendering): string {
   const rendered: string[] = [];
   for (const part of parts) {
     if (part.type === 'text') {
       rendered.push(part.text);
     } else {
-      rendered.push(dialect.imagePlaceholder(part.mimeType));
+      const override = images?.renderImage?.(part);
+      rendered.push(override === undefined ? dialect.imagePlaceholder(part.mimeType) : override);
     }
   }
   return rendered.join(dialect.textJoin);
@@ -49,15 +78,16 @@ function renderParts(parts: readonly DecodedPart[], dialect: Dialect): string {
 function convertMessage(
   message: DecodedMessage,
   dialect: Dialect,
+  images?: ImageRendering,
 ): Pick<
   CompiledEntry,
   'role' | 'content' | 'toolCalls' | 'toolCallId' | 'toolName' | 'isError'
 > {
   switch (message.role) {
     case 'system':
-      return { role: 'system', content: renderParts(message.parts, dialect) };
+      return { role: 'system', content: renderParts(message.parts, dialect, images) };
     case 'user':
-      return { role: 'user', content: renderParts(message.parts, dialect) };
+      return { role: 'user', content: renderParts(message.parts, dialect, images) };
     case 'assistant': {
       return {
         role: 'assistant',
@@ -88,12 +118,15 @@ function convertMessage(
  * empty content, and user entries whose text is fully consumed by reminder
  * extraction (the text lives on in the tail records instead).
  *
- * Deterministic: identical `(entry, dialect)` inputs produce identical
- * records, byte for byte.
+ * Deterministic: identical `(entry, dialect, images)` inputs produce
+ * identical records, byte for byte. Reminder TAIL records are exempt from
+ * the override on purpose — a tail's bytes are its reminder block, which no
+ * image rendering can touch.
  */
 export function convertEntry(
   entry: DurableEntry,
   dialect: Dialect = MINIMAX_M3_DIALECT,
+  images?: ImageRendering,
 ): CompiledEntry | null {
   if (isAuditControlKind(entry.kind)) return null;
 
@@ -110,7 +143,7 @@ export function convertEntry(
   // cache key ambiguous. The writer contract, not the reader, owns this.
   if (message === undefined) return null;
 
-  const fields = convertMessage(message, dialect);
+  const fields = convertMessage(message, dialect, images);
 
   if (fields.role === 'user') {
     const text = fields.content;
@@ -121,7 +154,7 @@ export function convertEntry(
     // record would only confuse the provider.
     if (residual.trim().length === 0) return null;
     return buildCompiledEntry({
-      cacheKey: compileKey(entry.id, dialect),
+      cacheKey: recordCacheKey(entry.id, dialect, images),
       entryId: entry.id,
       sourceEntryIds: [entry.id],
       kind: entry.kind,
@@ -138,7 +171,7 @@ export function convertEntry(
   if (fields.role === 'system' && fields.content.trim().length === 0) return null;
 
   return buildCompiledEntry({
-    cacheKey: compileKey(entry.id, dialect),
+    cacheKey: recordCacheKey(entry.id, dialect, images),
     entryId: entry.id,
     sourceEntryIds: [entry.id],
     kind: entry.kind,
