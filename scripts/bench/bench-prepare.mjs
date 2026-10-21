@@ -40,8 +40,11 @@
 //                  R2 overlay); an evicted page's base64 must never reach it.
 //
 // Gate (printed to stdout, drives the exit code): PASS iff prep.p95Ms
-// ≤ PREP_BUDGET_MS (50) and payload.bytes ≤ MAX_PAYLOAD_BYTES (32 MiB) and
-// the mock/MMU invariants hold; FAIL otherwise, with the reason.
+// ≤ PREP_BUDGET_MS (50), payload.bytes ≤ MAX_PAYLOAD_BYTES (32 MiB),
+// rss.maxMb ≤ GATE_RSS_MB (500 — the Ф2 'RSS <= 500 MB' acceptance budget,
+// final-architecture.md:408; 0 disables the row) and the mock/MMU invariants
+// hold; FAIL otherwise, with the reason. RSS is sampled after a full GC (the
+// live set: MMU-resident bytes included), never mid-churn.
 //
 // Requires --experimental-transform-types: the context-mmu sources use
 // TypeScript parameter properties, which strip-only mode rejects.
@@ -110,6 +113,9 @@ const imageKib = numberEnv('IMAGE_KIB', 1536); // ~1.5 MiB of base64 per image
 const maxPayloadBytes = numberEnv('MAX_PAYLOAD_BYTES', 32 * 1048576);
 const prepBudgetMs = numberEnv('PREP_BUDGET_MS', 50);
 const mmuResidentBytes = numberEnv('MMU_RESIDENT_BYTES', 12 * 1048576);
+// The Ф2 'RSS <= 500 MB' acceptance budget (final-architecture.md:408) —
+// enforced on the measured path by the gate below (GATE_RSS_MB=0 disables).
+const rssBudgetMb = numberEnv('GATE_RSS_MB', 500);
 const heavyImages = process.env.HEAVY_IMAGES === '1';
 const keep = process.env.KEEP === '1';
 const chunkEntries = numberEnv('CHUNK', 200);
@@ -127,7 +133,7 @@ for (const [name, value] of [
 ]) {
   if (!Number.isInteger(value) || value < 1) fail(`${name} must be a positive integer, got "${process.env[name]}"`);
 }
-for (const [name, value] of [['MAX_PAYLOAD_BYTES', maxPayloadBytes], ['PREP_BUDGET_MS', prepBudgetMs], ['MMU_RESIDENT_BYTES', mmuResidentBytes]]) {
+for (const [name, value] of [['MAX_PAYLOAD_BYTES', maxPayloadBytes], ['PREP_BUDGET_MS', prepBudgetMs], ['MMU_RESIDENT_BYTES', mmuResidentBytes], ['GATE_RSS_MB', rssBudgetMb]]) {
   if (!Number.isFinite(value) || value < 0) fail(`${name} must be non-negative, got "${process.env[name]}"`);
 }
 if (windowSize > nEntries) fail(`WINDOW (${windowSize}) must not exceed N_ENTRIES (${nEntries})`);
@@ -489,6 +495,12 @@ try {
     const prepared = await assemble(false);
     prepSamples.push(performance.now() - iterStarted);
     lastBody = prepared.body;
+    // RSS is a LIVE-set metric (the run-all convention: readings after a full
+    // GC). Sampling mid-churn instead measured this iteration's uncollected
+    // conversion garbage — a ~10 MB resident-image payload churns ~10 MB of
+    // data-URL strings per prepare, which read as a phantom +150 MB against
+    // the 'RSS <= 500 MB' budget while the live set stayed far below it.
+    gc();
     sampleRss();
   }
   gc();
@@ -536,6 +548,7 @@ try {
   metric('payload.sha256', bodySha256);
   metric('head.openMs', headOpenMs);
   metric('rss.maxMb', Number(rssMaxMb.toFixed(1)));
+  metric('rss.budgetMb', rssBudgetMb);
   metric('mmu.residentBytes', residentPages);
   metric('mmu.residentPages', mmuStats.resident);
   metric('mmu.budgetBytes', mmuResidentBytes);
@@ -552,12 +565,13 @@ try {
   const reasons = [...gateFailures];
   if (prepP95Ms > prepBudgetMs) reasons.push(`prep.p95Ms=${prepP95Ms.toFixed(2)} > ${prepBudgetMs}`);
   if (payloadBytes > maxPayloadBytes) reasons.push(`payload.bytes=${payloadBytes} > ${maxPayloadBytes}`);
+  if (rssBudgetMb > 0 && rssMaxMb > rssBudgetMb) reasons.push(`rss.maxMb=${rssMaxMb.toFixed(1)} > ${rssBudgetMb}`);
   if (mockErrors.length > 0) reasons.push(`llm-mock failed: ${mockErrors.join('; ')}`);
   if (reasons.length > 0) {
     console.log(`gate=FAIL reason="${reasons.join('; ')}"`);
     process.exitCode = 1;
   } else {
-    console.log(`gate=PASS (prep.p95Ms=${prepP95Ms.toFixed(2)} <= ${prepBudgetMs}; payload.bytes=${payloadBytes} <= ${maxPayloadBytes})`);
+    console.log(`gate=PASS (prep.p95Ms=${prepP95Ms.toFixed(2)} <= ${prepBudgetMs}; payload.bytes=${payloadBytes} <= ${maxPayloadBytes}; rss.maxMb=${rssMaxMb.toFixed(1)} <= ${rssBudgetMb})`);
   }
 } finally {
   await worker.dispose().catch(() => {});
