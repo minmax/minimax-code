@@ -133,6 +133,10 @@ jobs:
         run: |
           FIXTURE="$(ls "$RUNNER_TEMP"/bench-fixtures/images-*.jsonl)" \
             node scripts/bench/run-all.mjs --check scripts/bench/thresholds.images.json
+      - name: Corpus equivalence gate (Ф2 — compiler bytes = full replay + stringify, 100% of heads)
+        run: |
+          FIXTURE="$(ls "$RUNNER_TEMP"/bench-fixtures/messages-*.jsonl)" \
+            node scripts/bench/equivalence-corpus.mjs
       - name: Upload bench gate evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

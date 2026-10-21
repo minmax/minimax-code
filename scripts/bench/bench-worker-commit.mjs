@@ -16,6 +16,15 @@
 // with one twist: it imports the TypeScript package sources through Node's
 // type stripping plus an in-process resolve hook mapping `.js` -> `.ts`.
 //
+// CORPUS: synthetic-admission. Entries are generated filler payloads into a
+// fresh mkdtemp store; no session fixture is read. `enqueue` measures
+// ADMISSION — handing the frozen entry to the worker — which does not read
+// the existing store, so its cost is independent of history size by
+// construction. These numbers are the admission profile of the commit path,
+// NOT a measurement of how the path scales with history; reports must not
+// present them as fixture runs. The output states this explicitly via the
+// `worker.corpus=synthetic-admission` metric line.
+//
 // Usage: node scripts/bench/bench-worker-commit.mjs   (env BATCHES=200, ENTRY_KB=64)
 import { registerHooks } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -134,6 +143,10 @@ async function runMode(mode, makeWorker) {
 }
 
 // Bridge variant: the backend handle is created HERE.
+// The corpus label is part of the machine-readable output: the entries are
+// synthetic and enqueue is admission-only, so no consumer can mistake these
+// metrics for a history-dependence measurement on a session fixture.
+console.log('worker.corpus=synthetic-admission');
 await runMode('bridge', async (dataDir) => {
   const backend = openSqliteZstdBackend(dataDir);
   return createStorageWorker(sqliteZstdStorageBackend(backend), {

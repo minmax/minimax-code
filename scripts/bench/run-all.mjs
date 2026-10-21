@@ -20,8 +20,26 @@ const BENCHES = [
   { id: 'append', script: 'bench-append.mjs' },
   { id: 'replay', script: 'bench-replay.mjs' },
   // Builds its own synthetic storage (no fixture dependency): the worker
-  // commit path — enqueue p99, commit p95, event-loop stalls.
+  // commit path — enqueue p99, commit p95, event-loop stalls. The corpus is
+  // synthetic-admission (enqueue hands over frozen entries without reading
+  // the store, so it is history-size independent by construction); it gates
+  // the Ф1 "append <= 1 ms p99 (enqueue frozen entry)" budget via
+  // offthread.enqueueP99Ms and must not be read as a history-dependence
+  // measurement.
   { id: 'worker', script: 'bench-worker-commit.mjs' },
+  // Ф2 context path: the LAZY open (resume capsule + retained window slice
+  // through ProjectionService.fromCapsule) — the log is never materialized;
+  // gates the "open/resume <= 1 s at any size" budget (resume.totalMs) and
+  // enforces the RSS budget on the lazy path (resume.rssDeltaMb), where
+  // thresholds.json's comment says it belongs. bench-open.mjs above keeps
+  // measuring the LEGACY materialization for contrast.
+  { id: 'resume', script: 'bench-open-resume.mjs' },
+  // Ф2 context path: prep — capsule → window manifest → wire-compiler body.
+  // prep.p95Ms gates "prep <= 50 ms p95 at any history length";
+  // prep.warmP95Ms gates the <= 5 ms warm goal (cache hits, no re-hashing);
+  // prep.payloadBytes is the PROVIDER PAYLOAD byte truth (dialect-normalized
+  // wire segments), gated at <= 32 MB (messages) / <= 12 MB (images).
+  { id: 'prep', script: 'bench-prep.mjs' },
 ];
 
 const checkIndex = process.argv.indexOf('--check');
@@ -73,7 +91,7 @@ const markdownTable = (rows) => ['| metric | value |', '| --- | --- |', ...rows.
 const fence = '`'.repeat(3);
 
 const lines = [];
-lines.push('# Session-path benches: open / append / replay');
+lines.push('# Session-path benches: open / append / replay / resume / prep');
 lines.push('');
 lines.push(`- fixture: \`${fixture}\` (${(fileSize / MIB).toFixed(1)} MB)`);
 lines.push(`- node: \`${process.version}\`, ITERS: \`${process.env.ITERS ?? '20'}\`, REPLAY_STEPS: \`${process.env.REPLAY_STEPS ?? '287'}\``);
@@ -119,6 +137,11 @@ lines.push(
     ['append.degradationX', pick('append', 'degradationX')],
     ['replay.p50Ms', pick('replay', 'p50Ms')],
     ['replay.p95Ms', pick('replay', 'p95Ms')],
+    ['resume.totalMs', pick('resume', 'totalMs')],
+    ['resume.rssDeltaMb', pick('resume', 'rssDeltaMb')],
+    ['prep.p95Ms', pick('prep', 'p95Ms')],
+    ['prep.warmP95Ms', pick('prep', 'warmP95Ms')],
+    ['prep.payloadBytes', pick('prep', 'payloadBytes')],
   ]),
 );
 

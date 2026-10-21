@@ -1,11 +1,15 @@
 {
-  "comment": "Acceptance thresholds of the Ф1 perf gates (final-architecture.md §363-384). Keys are exact `<bench>.<metric>` names as printed by the bench scripts; values are MAXIMA. run-all.mjs --check fails when any metric exceeds its maximum. The `offthread.*` rows gate the durable path (commit work on the worker thread, Ф1 'not on the main thread'); `bridge.stallP99Ms` is the explicit stall budget under which the bridge fallback stays acceptable.",
+  "comment": "Acceptance thresholds of the Ф1 perf gates (final-architecture.md §363-384). Keys are exact `<bench>.<metric>` names as printed by the bench scripts; values are MAXIMA. run-all.mjs --check fails when any metric exceeds its maximum — and also when a key has no matching metric, so a threshold cannot silently pass. The Ф1 'append <= 1 ms p99 (enqueue frozen entry)' budget is gated on `offthread.enqueueP99Ms`: bench-worker-commit.mjs measures the real enqueue into the storage worker, while bench-append.mjs is a legacy-path simulation (read+parse+clone+raw write, no enqueue) whose numbers (append.legacyWriteP99Ms, append.totalMsMean, append.totalLastMs, append.degradationX, append.trendMsPerIter) are informational and deliberately unthresholded. The `offthread.*` rows gate the durable path (commit work on the worker thread, Ф1 'not on the main thread'); `bridge.stallP99Ms` is the explicit stall budget under which the bridge fallback stays acceptable. The Ф2 rows: `resume.totalMs` gates 'открытие/resume ≤1 с' on the LAZY open (capsule + retained window slice, bench-open-resume.mjs), `resume.rssDeltaMb` enforces the 'RSS ≤ 500 МБ' budget on that lazy path (bench-open MATERIALIZES the corpus and is exempted by design); `prep.p95Ms` gates 'prep ≤50 мс p95' (manifest→compile at any history length), `prep.warmP95Ms` the '≤5 мс тёплый' goal (100% cache hits, no re-hashing), and `prep.payloadBytes` the 'payload ≤32 МБ всегда' gate measured over the PROVIDER payload bytes (dialect-normalized wire segments from the wire compiler — the byte truth that goes to the provider, not the raw manifest).",
   "open.totalMs": 1000,
   "open.rssDeltaMb": 500,
-  "append.appendP99Ms": 1,
   "append.stallP99Ms": 5,
   "offthread.enqueueP99Ms": 1,
   "offthread.commitP95Ms": 5,
   "offthread.stallP99Ms": 5,
-  "bridge.stallP99Ms": 5
+  "bridge.stallP99Ms": 5,
+  "resume.totalMs": 1000,
+  "resume.rssDeltaMb": 500,
+  "prep.p95Ms": 50,
+  "prep.warmP95Ms": 5,
+  "prep.payloadBytes": 33554432
 }
