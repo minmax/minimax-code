@@ -34,8 +34,11 @@ const { body, totalBytes, segments } = compile(
   record onto the frozen-entry shape, `compiledRecordDialect()` compiles
   records into segments BYTE-IDENTICAL to `serializeCompiledEntry` (+ the
   trailing newline), and `compiledEntrySegment(record)` returns those bytes
-  directly. The bridge test (`test/unit/bridge.test.ts`) pins the
-  durable-entry → convert-to-llm → wire-segment equality.
+  directly. The identity is unconditional: stored tool-call arguments strings
+  travel through the bridge verbatim (no parse/stringify round trip), so even
+  non-canonical or non-JSON stored text compiles to the pinned bytes. The
+  bridge test (`test/unit/bridge.test.ts`) pins the durable-entry →
+  convert-to-llm → wire-segment equality.
 - Budget guard — `totalBytes > opts.maxBytes` aborts with `WireBudgetExceeded`
   carrying `totalBytes`, `maxBytes`, and the exact per-entry `breakdown`. The
   guard is arithmetic over segment lengths (no serialization work), so an

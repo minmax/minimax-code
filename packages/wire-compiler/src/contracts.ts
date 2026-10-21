@@ -60,9 +60,13 @@ function kindOfRole(role: ProviderRole): Entry['kind'] {
  * byte-identical record bodies from the mapped fields.
  *
  * Assistant tool-call deltas travel as `toolCall` content blocks appended
- * after the text block; the dialect re-projects them to `tool_calls` with
- * their `arguments` re-encoded by `JSON.stringify` — byte-stable, because
- * convert-to-llm itself encodes arguments with `JSON.stringify`.
+ * after the text block; the dialect re-projects them to `tool_calls` with the
+ * arguments string passed through VERBATIM. No `JSON.parse`/`JSON.stringify`
+ * round trip: `decode.ts`'s `encodeArguments` already hands the record the
+ * stored string as-is (any textual form — non-canonical spacing, even non-JSON
+ * text — is a legal frozen payload), and `serializeCompiledEntry` embeds that
+ * same string unchanged, so re-encoding here would fork one frozen entry into
+ * two different wire byte streams depending on the compilation path.
  */
 export function compiledEntryToWireEntry(record: CompiledEntry): Entry {
   const blocks: ContentBlock[] = [];
@@ -70,7 +74,7 @@ export function compiledEntryToWireEntry(record: CompiledEntry): Entry {
     blocks.push({ type: 'text', text: record.content });
   }
   for (const call of record.toolCalls ?? []) {
-    blocks.push({ type: 'toolCall', id: call.id, name: call.function.name, arguments: JSON.parse(call.function.arguments) as JsonValue });
+    blocks.push({ type: 'toolCall', id: call.id, name: call.function.name, arguments: call.function.arguments });
   }
   return {
     entryId: record.entryId,
@@ -109,11 +113,23 @@ export function compiledRecordDialect(): WireDialect {
         ? entry.content.filter((block) => block.type === 'toolCall')
         : [];
       if (toolCalls.length > 0) {
-        body.tool_calls = toolCalls.map((block) => ({
-          id: block.id,
-          type: 'function',
-          function: { name: block.name, arguments: JSON.stringify(block.arguments) },
-        }));
+        body.tool_calls = toolCalls.map((block) => {
+          // Verbatim pass-through of the stored arguments string — the pinned
+          // byte-identity with `serializeCompiledEntry` holds for ANY string
+          // content only if it is embedded unchanged. A non-string block is a
+          // hand-built shape outside the mapped-record contract, where the
+          // guarantee has no pinned reference: rejected instead of guessed.
+          if (typeof block.arguments !== 'string') {
+            throw new WireCompilerError(
+              `compiled-record dialect: toolCall block of entry ${JSON.stringify(entry.entryId)} carries non-string arguments (mapped records always carry the stored string)`,
+            );
+          }
+          return {
+            id: block.id,
+            type: 'function',
+            function: { name: block.name, arguments: block.arguments },
+          };
+        });
       }
       if (entry.toolCallId !== undefined) body.tool_call_id = entry.toolCallId;
       if (entry.toolName !== undefined) body.name = entry.toolName;

@@ -1120,6 +1120,10 @@ importers:
         version: 2.1.9(@types/node@20.19.43)
 
   packages/wire-compiler:
+    dependencies:
+      '@mavis/cas':
+        specifier: workspace:*
+        version: link:../cas
     devDependencies:
       '@types/node':
         specifier: ^20

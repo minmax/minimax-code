@@ -11,6 +11,13 @@
 
 import { createHash } from 'node:crypto';
 
+// The `cas://sha256/<digest>#<size>` reference format is single-sourced in
+// `@mavis/cas/cas-ref` ("do not restate the pattern or the builder anywhere
+// else"); the wire body's image placeholders build their deterministic
+// references through the canonical builder, so a wire-compiled link always
+// parses in the spill tools and the v2 importer.
+import { casSpillRef } from '@mavis/cas/cas-ref';
+
 import { WireCompilerError } from './errors.js';
 import type { ContentBlock, Entry, JsonValue, ToolDefinition, WireDialect } from './types.js';
 
@@ -33,7 +40,7 @@ export function imagePlaceholderLink(blob: string): string {
 function inlineImageLink(base64: string): string {
   const bytes = Buffer.from(base64, 'base64');
   const sha256 = createHash('sha256').update(bytes).digest('hex');
-  return `cas://sha256/${sha256}#${bytes.length}`;
+  return casSpillRef(sha256, bytes.length);
 }
 
 /**

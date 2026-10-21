@@ -20,5 +20,8 @@
     "vitest": "^2"
   },
   "private": true,
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@mavis/cas": "workspace:*"
+  }
 }

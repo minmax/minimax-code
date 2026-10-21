@@ -90,6 +90,69 @@ describe('bridge: durable entry → convert-to-llm → wire-compiler segment', (
     });
   });
 
+  it('keeps stored argument strings byte-identical, however non-canonical', () => {
+    // decode.ts `encodeArguments` passes stored JSON strings through verbatim,
+    // so a frozen entry may carry arguments in any textual form (here: spaces
+    // after separators). The compiler segment must reproduce those bytes
+    // exactly — a parse/stringify round trip would re-encode them and fork
+    // the wire body of one frozen entry into two byte streams.
+    const durable = entry('a-args', 'pi.assistant', {
+      model: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'go' },
+            { type: 'toolCall', id: 'c1', name: 't', arguments: '{"a": 1, "b": "two"}' },
+          ],
+        },
+      ],
+    });
+    const record = convertEntry(durable);
+    expect(record).not.toBeNull();
+    expect(record!.toolCalls?.[0]?.function.arguments).toBe('{"a": 1, "b": "two"}');
+
+    const wireEntry = compiledEntryToWireEntry(record!);
+    const { body } = compile([{ entryId: wireEntry.entryId }], [wireEntry], {
+      maxBytes: 1 << 20,
+      dialect: compiledRecordDialect(),
+      cache: createLruSegmentCache(8),
+    });
+
+    expect(body.equals(compiledEntrySegment(record!))).toBe(true);
+    // The stored bytes survive verbatim inside the encoded line.
+    expect(body.toString('utf8')).toContain('"arguments":"{\\"a\\": 1, \\"b\\": \\"two\\"}"');
+  });
+
+  it('passes non-JSON argument strings through verbatim without throwing', () => {
+    // The same pass-through makes stored garbage-JSON legal: it is not the
+    // bridge's place to validate stored payload text, and serializeCompiledEntry
+    // would carry it as-is too. A raw JSON.parse here used to escape as a bare
+    // SyntaxError; with verbatim pass-through no parsing happens at all.
+    const durable = entry('a-args-bad', 'pi.assistant', {
+      model: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'go' },
+            { type: 'toolCall', id: 'c2', name: 't', arguments: 'not json at all' },
+          ],
+        },
+      ],
+    });
+    const record = convertEntry(durable);
+    expect(record).not.toBeNull();
+
+    const wireEntry = compiledEntryToWireEntry(record!);
+    const { body } = compile([{ entryId: wireEntry.entryId }], [wireEntry], {
+      maxBytes: 1 << 20,
+      dialect: compiledRecordDialect(),
+      cache: createLruSegmentCache(8),
+    });
+
+    expect(body.equals(compiledEntrySegment(record!))).toBe(true);
+    expect(body.toString('utf8')).toContain('"arguments":"not json at all"');
+  });
+
   it('the pinned serialization matches the OpenAI record shape with fixed key order', () => {
     const records = corpus()
       .map((durable) => convertEntry(durable))
