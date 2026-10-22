@@ -19,6 +19,7 @@ import {
   LocalBrowserNavigateToolDef,
   LocalBrowserPasteToolDef,
   LocalBrowserPressKeyToolDef,
+  LocalBrowserRunScriptToolDef,
   LocalBrowserScreenshotToolDef,
   LocalBrowserScrollToolDef,
   LocalBrowserToolDef,
@@ -236,6 +237,10 @@ function buildDetailedBrowserRuntimeTools(
       tool: createBrowserRuntimeTool(LocalBrowserPasteToolDef, 'paste', adapter, options),
     },
     {
+      action: 'run_script',
+      tool: createBrowserRuntimeTool(LocalBrowserRunScriptToolDef, 'run_script', adapter, options),
+    },
+    {
       action: 'verify_text',
       tool: createBrowserRuntimeTool(
         LocalBrowserVerifyTextToolDef,
@@ -424,9 +429,11 @@ async function executeBrowserAction(
         const result =
           action === 'screenshot' && preprocessScreenshot
             ? await preprocessScreenshot(rawResult, ctx, operationSignal)
-            : rawResult;
+            : action === 'run_script' && preprocessScreenshot
+              ? await preprocessRunScriptScreenshots(rawResult, ctx, operationSignal, preprocessScreenshot)
+              : rawResult;
         const postActionVisual =
-          action === 'screenshot'
+          action === 'screenshot' || action === 'run_script'
             ? undefined
             : await capturePostActionVisual(
                 action,
@@ -520,14 +527,18 @@ function browserToolResult(
 ): ToolResult {
   const screenshot = screenshotContent(result);
   const postActionScreenshot = screenshotContent(postActionVisual?.result);
+  const runScriptImages =
+    action === 'run_script' ? runScriptScreenshotContent(result) : [];
   let sanitized =
     action === 'screenshot'
       ? summarizeScreenshotResult(result, screenshot !== undefined)
-      : exposure === 'compact' && action !== 'inspect' && action !== 'query'
-        ? summarizeCompactActionResult(action, result)
-        : exposure === 'compact'
-          ? sanitizeBrowserResult(result, COMPACT_PRIVATE_RESULT_KEYS)
-          : sanitizeBrowserResult(result);
+      : action === 'run_script'
+        ? summarizeRunScriptResult(result, runScriptImages.length > 0)
+        : exposure === 'compact' && action !== 'inspect' && action !== 'query'
+          ? summarizeCompactActionResult(action, result)
+          : exposure === 'compact'
+            ? sanitizeBrowserResult(result, COMPACT_PRIVATE_RESULT_KEYS)
+            : sanitizeBrowserResult(result);
   if (exposure === 'compact') sanitized = appendBrowserReadingGuidance(action, sanitized);
   sanitized = appendBrowserSafetyGuidance(action, sanitized, interactiveTakeover);
   if (postActionVisual && (postActionScreenshot || isDeduplicatedVisual(postActionVisual.result))) {
@@ -554,8 +565,8 @@ function browserToolResult(
   const content: ToolResultContent[] = [{ type: 'text', text }];
   if (screenshot) content.push(screenshot);
   if (postActionScreenshot) content.push(postActionScreenshot);
-
   const isError = resultTooLarge || (isRecord(sanitized) && sanitized.success === false);
+  if (!isError) content.push(...runScriptImages);
   return {
     tool_name: toolName,
     text,
@@ -1433,6 +1444,79 @@ function screenshotContent(result: unknown): ToolResultContent | undefined {
     data: result.data,
     mimeType: `image/${format}`,
   };
+}
+
+/** Fields of a run_script result that survive into the tool envelope. */
+const RUN_SCRIPT_RESULT_KEYS = [
+  'success',
+  'code',
+  'durationMs',
+  'filename',
+  'value',
+  'valueTruncated',
+  'logs',
+  'logsTruncated',
+  'error',
+  'pageEvaluate',
+  'input',
+  'pageErrors',
+  'screenshotsSkipped',
+  'recovery',
+] as const;
+
+function summarizeRunScriptResult(result: unknown, hasImages: boolean): unknown {
+  if (!isRecord(result)) return sanitizeBrowserResult(result);
+  const out: Record<string, unknown> = {};
+  for (const key of RUN_SCRIPT_RESULT_KEYS) {
+    if (result[key] !== undefined) out[key] = sanitizeBrowserResult(result[key]);
+  }
+  if (Array.isArray(result.screenshots)) {
+    out.screenshots = result.screenshots
+      .filter(isRecord)
+      .map((shot, index) => ({
+        image: index + 1,
+        ...(typeof shot.label === 'string' ? { label: shot.label } : {}),
+        ...(typeof shot.reason === 'string' ? { reason: shot.reason } : {}),
+        ...(typeof shot.width === 'number' ? { width: shot.width } : {}),
+        ...(typeof shot.height === 'number' ? { height: shot.height } : {}),
+        attached: hasImages && typeof shot.data === 'string' && shot.data.length > 0,
+      }));
+  }
+  return out;
+}
+
+function runScriptScreenshotContent(result: unknown): ToolResultContent[] {
+  if (!isRecord(result) || !Array.isArray(result.screenshots)) return [];
+  return result.screenshots.flatMap((shot) => {
+    const content = screenshotContent(shot);
+    return content ? [content] : [];
+  });
+}
+
+async function preprocessRunScriptScreenshots(
+  result: unknown,
+  ctx: LocalRuntimeToolContext,
+  signal: AbortSignal | undefined,
+  preprocessScreenshot: LocalBrowserScreenshotPreprocessor,
+): Promise<unknown> {
+  if (!isRecord(result) || !Array.isArray(result.screenshots)) return result;
+  const screenshots: unknown[] = [];
+  for (const shot of result.screenshots) {
+    if (!isRecord(shot)) {
+      screenshots.push(shot);
+      continue;
+    }
+    try {
+      const processed = await preprocessScreenshot(shot, ctx, signal, {
+        purpose: 'post-action',
+        action: 'run_script',
+      });
+      screenshots.push(isRecord(processed) ? { ...shot, ...processed } : shot);
+    } catch {
+      screenshots.push({ ...shot, data: undefined, dropped: 'preprocess_failed' });
+    }
+  }
+  return { ...result, screenshots };
 }
 
 function sanitizeBrowserResult(value: unknown, omittedKeys?: ReadonlySet<string>): unknown {

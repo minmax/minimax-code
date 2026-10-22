@@ -13,6 +13,22 @@ This directory vendors `pi-mono` as source so MiniMax can patch, validate, and s
 
 No upstream source files are changed in the baseline import.
 
+### 2026-10-06 — opt-in fallback for unexpected provider tool calls
+
+- Reason: a conversational host can intentionally advertise no tools, but a provider may still emit a structured tool call. The normal missing-tool result starts another model hop and can leave the host without a final assistant response.
+- Affected package: `packages/agent` (`@earendil-works/pi-agent-core`), agent options, loop config, and successful assistant-response finalization.
+- Change type: generic, upstreamable opt-in host seam. When `unexpectedToolCallFallback` is present, a successful response that contains tool calls removes those calls, preserves prior text, and appends the fallback exactly once before ending normally. Provider responses with `stopReason: "error"` or `"aborted"` remain untouched so retry and error reporting preserve the real failure. Omitting the option retains upstream behavior.
+- Upstream PR: not opened.
+- Validation: focused `packages/agent/test/agent-loop.test.ts` regressions cover text-plus-tool guidance, deduplication, and unchanged error/aborted responses; the distribution BYOK mock-provider test proves no unoffered tool executes and no second model request occurs. `pnpm test:release-tools` and `pnpm check:source` validate the vendored patch record and public inventory.
+
+### 2026-10-01 — keep Anthropic classifier refusal details
+
+- Reason: Claude safety-classifier refusals arrive as HTTP 200 with `stop_reason: "refusal"` (see [Refusals and fallback](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback)). They were mapped to `error` and surfaced as `An unknown error occurred`, which dropped `stop_details.category` / `explanation`, hid the refusal from downstream classification, and let BYOK retry it as an unknown failure.
+- Affected package: `packages/ai` (`@earendil-works/pi-ai`), Anthropic-compatible stream.
+- Change type: generic, upstreamable. `stopReason` stays `error`; `errorMessage` becomes `Model declined the request (stop_reason: refusal[; category: …])[: explanation]` for refusals both before and during output, omitting a null `category` / `explanation`. Hosts detect `stop_reason: refusal` and do not parse the explanation.
+- Upstream PR: not opened.
+- Validation: host-side non-retry and refusal classification are covered by the `@mavis/shared` classifier and `@mavis/agent-core` retry tests. Vendored upstream suites remain outside this distribution's verification; no live Claude service was called.
+
 ### 2026-09-23 — preserve Bash execution facts and bounded output
 
 - Affected package: `packages/coding-agent` (`@earendil-works/pi-coding-agent`), Bash execution, child-process observation, and output accumulation.
@@ -36,6 +52,14 @@ No upstream source files are changed in the baseline import.
 - Change type: generic, upstreamable performance fix. Pass jsdiff's `maxEditLength` (2000 edits) and `timeout` (5 s) to `diffLines` and `createTwoFilesPatch`. `maxEditLength` is the primary bound because it is deterministic and therefore testable; `timeout` only backstops slow machines. Replacing a line costs 2 edits, so the bound admits a full rewrite of any file up to 1000 lines and only gives up past that. When a bound trips, `details.diff` carries a one-line notice so every renderer still has something to show, `details.patch` is omitted, and the new `details.diffOmitted` names the reason. The unified patch is skipped once the display diff was abandoned rather than repeating a second Myers run that aborts on the same bound. The file is written before any diff runs, so a dropped diff never changes what lands on disk.
 - Upstream PR: not opened.
 - Validation: `packages/agent-tools/src/desktop/edit-diff-bounds.test.ts` (registered in the `capability` suite) covers an ordinary edit, a large block replacement that stays under the bound, a full rewrite at the bound that keeps its diff, and a whole-file rewrite that keeps the write while dropping the diff; `pnpm verify --profile platform` on macOS. Measured end to end through `createEditTool`, three runs each on the same machine: a 20 000-line whole-file rewrite took 167 620 / 173 523 / 167 547 ms unbounded and 200 / 192 / 193 ms bounded, with peak heap dropping from 47–60 MB to 14–15 MB; a 501-line rewrite takes 53 / 49 / 47 ms and a 1000-line rewrite 177 / 173 / 177 ms, both keeping their diff.
+
+### 2026-09-19 — omit empty tools for OpenAI-compatible checkpoint requests
+
+- Reason: checkpoint requests retain tool-call history but omit tool definitions. The OpenAI Completions provider unconditionally added `tools: []` for that history, which can cause a backend to reject compaction with HTTP 400 (public issue MiniMax-AI/minimax-code#194).
+- Affected package: `packages/ai` (`@earendil-works/pi-ai`), `src/providers/openai-completions.ts` and its existing empty-tools regression fixture.
+- Change type: generic, upstreamable compatibility fix. Omit `tools` when no nonempty tool definitions are supplied, regardless of tool-call history or cache compatibility. Nonempty tool definitions are unchanged. Remove the obsolete history-based empty-array workaround; no compatibility settings or recovery requests are added.
+- Validation: the distribution-owned `packages/local-runtime-v2/test/integration/compaction-openai-transport.integration.test.ts` exercises `compactContext` through checkpoint generation and the real SDK against a local HTTP fixture that rejects empty tools. Regressions cover absent/empty definitions, tool history, Anthropic cache compatibility, ordinary requests, and preserved nonempty definitions. Run with `pnpm exec vitest run --config vitest.oss.config.mjs packages/local-runtime-v2/test/integration/compaction-openai-transport.integration.test.ts` and the full `pnpm verify` profile. Offline fixtures do not establish live LiteLLM/vLLM, OpenAI, or Anthropic proxy acceptance.
+- Upstream PR: not created.
 
 ### 2026-09-19 — preserve the system role for Mistral Chat Completions
 

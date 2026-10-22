@@ -1,0 +1,24 @@
+{
+  "name": "@mavis/input-delivery",
+  "version": "0.1.0",
+  "description": "Input delivery status: the committed-state projection of owner-input lines (saving -> saved/queued -> admitted -> answered | withdrawn/unanswered/failed) with one row per input, quick actions as data and a bounded active index.",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
+  "private": true,
+  "license": "MIT"
+}

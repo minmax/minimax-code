@@ -164,7 +164,7 @@ export class EventBridge {
   private awaitingMessageId: boolean = false;
   /** Wall-clock ms when the first thinking_delta of the current msg arrived. */
   private thinkingStartMs: number | undefined;
-  /** First nonempty text/thinking/tool token; excludes first-token wait from throughput. */
+  /** First thinking_start or nonempty text/thinking/tool token; excludes first-token wait from throughput. */
   private firstTokenMs: number | undefined;
   /** Wall-clock ms when thinking ended (first non-thinking delta or message_end). */
   private thinkingEndMs: number | undefined;
@@ -280,15 +280,17 @@ export class EventBridge {
    * tracing, daemon SSE consumers) can see Pi's full producer-side
    * lifecycle without affecting the canonical wire format. Callers can
    * still safely forward every event without coordination.
+   * `observedAtMs` uses the bridge clock and is captured before caller-side
+   * queues or response hooks; omitted timestamps are measured during processing.
    */
-  async processEvent(event: AgentEvent): Promise<BridgedEvents> {
+  async processEvent(event: AgentEvent, observedAtMs?: number): Promise<BridgedEvents> {
     switch (event.type) {
       case 'message_start':
         return this.onMessageStart(event);
       case 'message_update':
-        return this.onMessageUpdate(event);
+        return this.onMessageUpdate(event, observedAtMs);
       case 'message_end':
-        return this.onMessageEnd(event);
+        return this.onMessageEnd(event, observedAtMs);
       case 'tool_execution_start':
         return this.onToolStart(event);
       case 'tool_execution_end':
@@ -378,7 +380,19 @@ export class EventBridge {
     return { events: [], requestAssistantMessageId: true };
   }
 
-  private onMessageUpdate(event: Extract<AgentEvent, { type: 'message_update' }>): BridgedEvents {
+  private onMessageUpdate(
+    event: Extract<AgentEvent, { type: 'message_update' }>,
+    observedAtMs?: number,
+  ): BridgedEvents {
+    // Output usage includes thinking tokens even when their text is hidden.
+    // Keep the timing boundary aligned with that usage, before queue delays.
+    if (
+      this.activeAssistantMessageId &&
+      this.firstTokenMs === undefined &&
+      event.assistantMessageEvent.type === 'thinking_start'
+    ) {
+      this.firstTokenMs = observedAtMs ?? this.now();
+    }
     const update = extractDeltaUpdate(event.assistantMessageEvent);
     if (!update) return { events: [] };
     if (!this.activeAssistantMessageId) {
@@ -407,7 +421,7 @@ export class EventBridge {
         ((update.kind === 'toolcall_start' || update.kind === 'toolcall_delta') &&
           update.toolName !== undefined))
     ) {
-      this.firstTokenMs = this.now();
+      this.firstTokenMs = observedAtMs ?? this.now();
     }
     if (
       update.kind === 'toolcall_start' ||
@@ -526,6 +540,7 @@ export class EventBridge {
 
   private async onMessageEnd(
     event: Extract<AgentEvent, { type: 'message_end' }>,
+    observedAtMs?: number,
   ): Promise<BridgedEvents> {
     const role = (event.message as { role?: unknown }).role;
     if (role !== 'assistant') return { events: [] };
@@ -600,7 +615,7 @@ export class EventBridge {
         : undefined;
     const decodeDurationMs =
       this.ctx.includeDetailedUsage === true && this.firstTokenMs !== undefined
-        ? Math.max(0, this.now() - this.firstTokenMs)
+        ? Math.max(0, (observedAtMs ?? this.now()) - this.firstTokenMs)
         : undefined;
     const usage: TokenUsage = {
       ...(extractAssistantUsage(event.message, this.contextWindow) ?? {

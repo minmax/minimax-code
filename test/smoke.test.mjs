@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, chmodSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, readFileSync, existsSync, writeFileSync, chmodSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -300,6 +300,172 @@ test("internal environment overrides are rejected", (t) => {
     );
     assert.equal(result.error, undefined);
   }
+});
+
+/**
+ * Profile selection resolves the data directory from the profile name under
+ * $HOME. The shared `fixture` pins MINIMAX_DATA_DIR, which by design overrides
+ * the profile, so this one varies HOME instead and leaves the data-dir override
+ * unset.
+ */
+function profileFixture(t, environment = process.env) {
+  const home = mkdtempSync(path.join(tmpdir(), "minimax-code-profile-"));
+  const audit = path.join(home, "network-attempts.log");
+  t.after(() => {
+    try {
+      assert.equal(
+        existsSync(audit),
+        false,
+        existsSync(audit) ? readFileSync(audit, "utf8") : "Unexpected outbound network attempt",
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+  const env = {
+    ...withoutProxyEnvironment(environment),
+    HOME: home,
+    USERPROFILE: home,
+    MCODE_TEST_NETWORK_AUDIT: audit,
+    MCODE_TEST_MANAGED_OFFLINE: "1",
+    MCODE_TEST_PROCESS_PROBE: "1",
+    NODE_OPTIONS: `--import=${new URL("./network-deny.mjs", import.meta.url).href}`,
+  };
+  delete env.MINIMAX_DATA_DIR;
+  delete env.MAVIS_DATA_DIR;
+  delete env.MINIMAX_PROFILE;
+  return { home, env: { ...env, cwd: home } };
+}
+
+test("--profile selects an isolated account and refuses an unsafe name", (t) => {
+  const { home, env } = profileFixture(t);
+
+  // The default profile keeps the unsuffixed directory, so existing installs
+  // are unaffected.
+  const currentDefault = spawnSync(process.execPath, [cli, "profile", "current"], {
+    env,
+    encoding: "utf8",
+    timeout: 15000,
+  });
+  assert.equal(currentDefault.status, 0, currentDefault.stderr);
+  assert.match(currentDefault.stdout, /Current profile: default/);
+  assert.ok(
+    currentDefault.stdout.includes(path.join(home, ".minimax")),
+    currentDefault.stdout,
+  );
+
+  for (const flag of [["--profile", "work"], ["--profile=work"]]) {
+    const result = spawnSync(process.execPath, [cli, ...flag, "profile", "current"], {
+      env,
+      encoding: "utf8",
+      timeout: 15000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Current profile: work/);
+    assert.ok(result.stdout.includes(path.join(home, ".minimax-work")), result.stdout);
+  }
+
+  const listed = spawnSync(process.execPath, [cli, "profile", "list", "--json"], {
+    env,
+    encoding: "utf8",
+    timeout: 15000,
+  });
+  assert.equal(listed.status, 0, listed.stderr);
+  assert.deepEqual(
+    JSON.parse(listed.stdout).map((profile) => profile.name),
+    ["default"],
+  );
+});
+
+test("an unsafe profile name is refused without leaving $HOME", (t) => {
+  const { home, env } = profileFixture(t);
+  const outside = path.join(tmpdir(), `minimax-code-profile-escape-${process.pid}`);
+  for (const name of ["../../etc", "..", "has space"]) {
+    const result = spawnSync(
+      process.execPath,
+      [cli, "--profile", name, "profile", "current"],
+      { env, encoding: "utf8", timeout: 15000 },
+    );
+    assert.notEqual(result.status, 0, `"${name}" unexpectedly succeeded`);
+    assert.match(result.stderr, /Invalid profile name/);
+  }
+  assert.equal(existsSync(outside), false);
+  assert.deepEqual(
+    readdirSync(home).filter((entry) => entry.startsWith(".minimax-") && entry !== ".minimax"),
+    [],
+  );
+});
+
+test("the reserved name default selects the default profile, not a second account", (t) => {
+  const { home, env } = profileFixture(t);
+  for (const args of [["--profile", "default"], ["--profile=default"]]) {
+    const result = spawnSync(process.execPath, [cli, ...args, "profile", "current"], {
+      env,
+      encoding: "utf8",
+      timeout: 15000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Current profile: default/);
+    assert.ok(result.stdout.includes(path.join(home, ".minimax")), result.stdout);
+  }
+  // A hidden `~/.minimax-default` would be a second account the user never asked
+  // for, holding its own token and invisible to `profile list`.
+  assert.equal(existsSync(path.join(home, ".minimax-default")), false);
+});
+
+test("the profile flag outranks the environment", (t) => {
+  const { home, env } = profileFixture(t);
+  const result = spawnSync(process.execPath, [cli, "--profile", "from-flag", "profile", "current"], {
+    env: { ...env, MINIMAX_PROFILE: "from-env" },
+    encoding: "utf8",
+    timeout: 15000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Current profile: from-flag/);
+  assert.ok(result.stdout.includes(path.join(home, ".minimax-from-flag")), result.stdout);
+});
+
+test("text after -- is not read as a profile selector", (t) => {
+  const { home, env } = profileFixture(t);
+  const result = spawnSync(
+    process.execPath,
+    [cli, "exec", "--", "--profile", "hijacked"],
+    { env, encoding: "utf8", timeout: 15000 },
+  );
+  assert.notEqual(result.status, 0, "exec with two positionals should be rejected");
+  assert.equal(existsSync(path.join(home, ".minimax-hijacked")), false);
+});
+
+test("removing a profile requires confirmation and refuses the default", (t) => {
+  const { home, env } = profileFixture(t);
+  const workDir = path.join(home, ".minimax-work");
+  mkdirSync(workDir, { recursive: true });
+  writeFileSync(path.join(workDir, "marker.txt"), "keep me");
+
+  const unconfirmed = spawnSync(
+    process.execPath,
+    [cli, "profile", "remove", "work"],
+    { env, encoding: "utf8", timeout: 15000 },
+  );
+  assert.notEqual(unconfirmed.status, 0);
+  assert.match(unconfirmed.stderr, /without --yes/);
+  assert.equal(existsSync(workDir), true);
+
+  const refusedDefault = spawnSync(
+    process.execPath,
+    [cli, "profile", "remove", "default", "--yes"],
+    { env, encoding: "utf8", timeout: 15000 },
+  );
+  assert.notEqual(refusedDefault.status, 0);
+  assert.match(refusedDefault.stderr, /Refusing to remove the default profile/);
+
+  const removed = spawnSync(
+    process.execPath,
+    [cli, "profile", "remove", "work", "--yes"],
+    { env, encoding: "utf8", timeout: 15000 },
+  );
+  assert.equal(removed.status, 0, removed.stderr);
+  assert.equal(existsSync(workDir), false);
 });
 
 test("local plugin browsing remains available with managed services offline", (t) => {

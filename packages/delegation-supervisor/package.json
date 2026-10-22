@@ -1,0 +1,25 @@
+{
+  "name": "@mavis/delegation-supervisor",
+  "version": "0.1.0",
+  "description": "Stable durable ownership of delegated child conversations: atomic T_spawn, completion delivery with durable deduplication, stop cascades with operation-id dedup, and cancelOnParentAbort supervision that survives automatic detach.",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
+  "private": true,
+  "license": "MIT"
+}

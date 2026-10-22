@@ -7,7 +7,13 @@ import type {
   Context,
   Model,
 } from "@earendil-works/pi-ai";
-import { LLM_ERROR_CODES } from "@mavis/shared/llm-error-classifier";
+import {
+  LLM_ERROR_CODES,
+  classifyLLMRequestRejectionMessage,
+  isLLMDeterministicRequestRejection,
+  isLLMImageLimitMessage,
+  normalizeLLMError,
+} from "@mavis/shared/llm-error-classifier";
 import {
   DEFAULT_LLM_RETRY_POLICY,
   LLM_RETRY_REQUEST_SETTLED_OBSERVER,
@@ -253,7 +259,7 @@ describe("withLLMRetry", () => {
         callId: "call-1",
         status: "waiting",
         retryAttempt: 1,
-        maxRetries: 5,
+        maxRetries: DEFAULT_LLM_RETRY_POLICY.maxRetries,
         requestAttempt: 2,
         delayMs: 500,
         error: { reason: "rate_limited" },
@@ -262,7 +268,7 @@ describe("withLLMRetry", () => {
         callId: "call-1",
         status: "recovered",
         retryAttempt: 1,
-        maxRetries: 5,
+        maxRetries: DEFAULT_LLM_RETRY_POLICY.maxRetries,
         requestAttempt: 2,
       },
     ]);
@@ -510,7 +516,7 @@ describe("withLLMRetry", () => {
     expect(attempts).toBe(2);
   });
 
-  it("uses five retries by default and emits exhausted after the sixth request", async () => {
+  it("uses one hundred retries by default and emits exhausted after the 101st request", async () => {
     let attempts = 0;
     const observed: LLMRetryEvent[] = [];
     const settled: LLMCallSettledEvent[] = [];
@@ -531,19 +537,21 @@ describe("withLLMRetry", () => {
     const result = await wrapped(fakeModel(), CONTEXT, {});
     await collectEvents(result);
 
-    expect(DEFAULT_LLM_RETRY_POLICY.maxRetries).toBe(5);
-    expect(attempts).toBe(6);
-    expect(sleep.mock.calls.map(([delayMs]) => delayMs)).toEqual([
-      500, 1_000, 2_000, 4_000, 8_000,
-    ]);
+    expect(DEFAULT_LLM_RETRY_POLICY.maxRetries).toBe(100);
+    expect(attempts).toBe(101);
+    const delays = sleep.mock.calls.map(([delayMs]) => delayMs);
+    expect(delays).toHaveLength(100);
+    expect(delays.slice(0, 4)).toEqual([500, 1_000, 2_000, 4_000]);
+    // random is pinned to 0, so every capped attempt sleeps half the cap.
+    expect(new Set(delays.slice(6))).toEqual(new Set([15_000]));
     expect(observed.filter((event) => event.status === "waiting")).toHaveLength(
-      5,
+      100,
     );
     expect(observed.at(-1)).toMatchObject({
       status: "exhausted",
-      retryAttempt: 5,
-      maxRetries: 5,
-      requestAttempt: 6,
+      retryAttempt: 100,
+      maxRetries: 100,
+      requestAttempt: 101,
       error: { reason: "overloaded" },
     });
     await result.result();
@@ -552,12 +560,12 @@ describe("withLLMRetry", () => {
         final: { outcome: "error", errorKind: "overloaded" },
         retryTriggered: true,
         retryReason: "overloaded",
-        requestAttempts: 6,
+        requestAttempts: 101,
       },
     ]);
   });
 
-  it("limits BYOK errors to five retries regardless of error classification", async () => {
+  it("limits BYOK errors to the default retry budget regardless of error classification", async () => {
     let attempts = 0;
     const inner = (async () => {
       attempts += 1;
@@ -571,7 +579,79 @@ describe("withLLMRetry", () => {
     const result = await wrapped(fakeModel("minimax_api"), CONTEXT, {});
     await collectEvents(result);
 
-    expect(attempts).toBe(6);
+    expect(attempts).toBe(DEFAULT_LLM_RETRY_POLICY.maxRetries + 1);
+  });
+
+  // #425: a request the provider deterministically rejects (too many images,
+  // invalid_request_error) fails the same way on every resend, so the BYOK
+  // retry-all budget only delays the real reason by ~20 seconds.
+  it.each([
+    ["custom_provider:work", "400 Upstream [invalid_request_error] Too many images in request: 31 > 30"],
+    ["minimax_api", "400 Upstream [invalid_request_error] Too many images in request: 31 > 30"],
+    ["custom_provider:work", '400 {"type":"invalid_request_error","message":"messages: text content blocks must be non-empty"}'],
+    ["fake-provider", "400 Too many images in request: 31 > 30"],
+  ])("does not retry a deterministic request rejection from %s: %s", async (provider, message) => {
+    let attempts = 0;
+    const sleep = vi.fn(async () => {});
+    const inner = (async () => {
+      attempts += 1;
+      return errorStream(message);
+    }) as StreamFn;
+    const wrapped = withLLMRetry(inner, retryOptions({ sleep }));
+
+    const events = await collectEvents(await wrapped(fakeModel(provider), CONTEXT, {}));
+
+    expect(attempts).toBe(1);
+    expect(sleep).not.toHaveBeenCalled();
+    const error = events.find((event) => event.type === "error");
+    expect(error?.type === "error" ? error.error.errorMessage : undefined).toBe(message);
+  });
+
+  // A request that is too large (HTTP 413, request_too_large, the local
+  // pre-send body check, or a context-window overflow) is rejected again on
+  // every resend; the BYOK retry-all budget used to send it six times.
+  it.each([
+    ["minimax_api", "413 Request Entity Too Large"],
+    ["minimax_api", '413 {"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum allowed number of bytes."}}'],
+    ["custom_provider:work", "413 Payload Too Large"],
+    ["custom_provider:work", "413 status code (no body)"],
+    ["minimax_api", "Request body too large: 70000000 bytes exceeds client limit 67108864 bytes."],
+    ["minimax_api", "400 invalid params, context window exceeds limit (2013)"],
+    ["custom_provider:work", '400 {"error":{"message":"prompt is too long: 600000 tokens > 512000 maximum"}}'],
+    ["minimax", "413 Request Entity Too Large"],
+    ["minimax", "Request body too large: 70000000 bytes exceeds client limit 67108864 bytes."],
+  ])("sends an oversized request from %s only once: %s", async (provider, message) => {
+    let attempts = 0;
+    const sleep = vi.fn(async () => {});
+    const inner = (async () => {
+      attempts += 1;
+      return errorStream(message);
+    }) as StreamFn;
+    const wrapped = withLLMRetry(inner, retryOptions({ sleep }));
+
+    const events = await collectEvents(await wrapped(fakeModel(provider), CONTEXT, {}));
+
+    expect(attempts).toBe(1);
+    expect(sleep).not.toHaveBeenCalled();
+    const error = events.find((event) => event.type === "error");
+    expect(error?.type === "error" ? error.error.errorMessage : undefined).toBe(message);
+  });
+
+  it.each([
+    "[Error] 400 Bad Request",
+    "503 Service Unavailable: too many images queued, try again",
+    "429 rate limited while processing images",
+  ])("keeps the BYOK retry-all budget for transient or unclassified errors: %s", async (message) => {
+    let attempts = 0;
+    const inner = (async () => {
+      attempts += 1;
+      return errorStream(message);
+    }) as StreamFn;
+    const wrapped = withLLMRetry(inner, retryOptions({ sleep: vi.fn(async () => {}) }));
+
+    await collectEvents(await wrapped(fakeModel("custom_provider:work"), CONTEXT, {}));
+
+    expect(attempts).toBe(DEFAULT_LLM_RETRY_POLICY.maxRetries + 1);
   });
 
   it("keeps the exhausted attempt open when returning its terminal failure stream", async () => {
@@ -739,6 +819,95 @@ describe("withLLMRetry", () => {
     expect(events.at(-1)?.type).toBe("error");
     expect(observed).toEqual([]);
   });
+
+  it.each(["throw", "stream"] as const)(
+    "recovers a TLS record failure from %s before output",
+    async (failureKind) => {
+      let attempts = 0;
+      const observed: LLMRetryEvent[] = [];
+      const inner = (async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          if (failureKind === "throw") {
+            throw Object.assign(new Error("TLS record failure"), {
+              code: "ERR_SSL_BAD_RECORD_MAC_ALERT",
+            });
+          }
+          return errorStream("net::ERR_SSL_BAD_RECORD_MAC_ALERT");
+        }
+        return successStream("recovered");
+      }) as StreamFn;
+      const wrapped = withLLMRetry(
+        inner,
+        retryOptions({ observer: (event: LLMRetryEvent) => observed.push(event) }),
+      );
+
+      const result = await wrapped(fakeModel("minimax"), CONTEXT, {});
+      const events = await collectEvents(result);
+
+      expect(attempts).toBe(2);
+      expect(observed.map((event) => event.status)).toEqual(["waiting", "recovered"]);
+      expect(observed[0]?.error?.reason).toBe("network");
+      expect(events.some((event) => event.type === "error")).toBe(false);
+      await expect(result.result()).resolves.toMatchObject({
+        stopReason: "stop",
+        content: [{ type: "text", text: "recovered" }],
+      });
+    },
+  );
+
+  it("does not retry a TLS record failure after visible output", async () => {
+    let attempts = 0;
+    const observed: LLMRetryEvent[] = [];
+    const inner = (async () => {
+      attempts += 1;
+      return errorStream("net::ERR_SSL_BAD_RECORD_MAC_ALERT", "partial");
+    }) as StreamFn;
+    const wrapped = withLLMRetry(
+      inner,
+      retryOptions({ observer: (event: LLMRetryEvent) => observed.push(event) }),
+    );
+
+    const result = await wrapped(fakeModel(), CONTEXT, {});
+    const events = await collectEvents(result);
+
+    expect(attempts).toBe(1);
+    expect(events.at(-1)?.type).toBe("error");
+    expect(observed).toEqual([]);
+  });
+
+  it.each(["fake-provider", "custom_provider:work"])(
+    "treats a model safety refusal from %s as a terminal content_filter without retrying",
+    async (provider) => {
+      let attempts = 0;
+      const observed: LLMRetryEvent[] = [];
+      const settled: LLMCallSettledEvent[] = [];
+      const inner = (async () => {
+        attempts += 1;
+        return errorStream(
+          'Model declined the request (stop_reason: refusal; category: cyber): could enable cyber harm, see 500 {"x":1}',
+        );
+      }) as StreamFn;
+      const wrapped = withLLMRetry(
+        inner,
+        retryOptions({
+          observer: (event: LLMRetryEvent) => observed.push(event),
+          onCallSettled: (event: LLMCallSettledEvent) => settled.push(event),
+        }),
+      );
+
+      const result = await wrapped(fakeModel(provider), CONTEXT, {});
+      const events = await collectEvents(result);
+
+      expect(attempts).toBe(1);
+      expect(observed).toEqual([]);
+      expect(events.at(-1)?.type).toBe("error");
+      expect((await result.result()).errorMessage).toContain("stop_reason: refusal");
+      expect(settled).toMatchObject([
+        { retryTriggered: false, final: { outcome: "error", errorKind: "content_filter" } },
+      ]);
+    },
+  );
 
   it("commits BYOK streaming after visible output in every host composition", async () => {
     let attempts = 0;
@@ -991,5 +1160,93 @@ describe("withLLMRetry", () => {
       "waiting",
       "cancelled",
     ]);
+  });
+});
+
+describe("deterministic request rejection classification", () => {
+  const rejection = (errorMessage: string, statusCode?: number) =>
+    isLLMDeterministicRequestRejection(normalizeLLMError({ errorMessage, statusCode }));
+
+  it("recognises provider image-count limits in common phrasings", () => {
+    for (const message of [
+      "Upstream [invalid_request_error] Too many images in request: 31 > 30",
+      "A maximum of 8 images may be provided in one request.",
+      "Number of images exceeds the limit of 20",
+      "You can only include at most 100 images",
+    ]) {
+      expect(isLLMImageLimitMessage(message), message).toBe(true);
+      expect(classifyLLMRequestRejectionMessage(message), message).toBe("image_limit");
+    }
+    expect(isLLMImageLimitMessage("image too large")).toBe(false);
+  });
+
+  it("treats image limits and HTTP 400 invalid_request_error as terminal", () => {
+    expect(rejection("400 Upstream [invalid_request_error] Too many images in request: 31 > 30")).toBe(true);
+    expect(rejection("Too many images in request: 31 > 30")).toBe(true);
+    expect(rejection("Too many images", 413)).toBe(true);
+    expect(rejection('400 {"type":"invalid_request_error","message":"bad"}')).toBe(true);
+    expect(classifyLLMRequestRejectionMessage('400 {"type":"invalid_request_error"}')).toBe("invalid_request");
+  });
+
+  it("classifies the BYOK-attributed form the retry loop actually sees", () => {
+    // local-runtime-v2 wraps BYOK failures before withLLMRetry inspects them.
+    const byok = (detail: string) =>
+      `BYOK upstream error: ${JSON.stringify({
+        errorCode: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
+        message: `BYOK provider custom_provider:fixture upstream error: ${detail}`,
+        errorSource: "byok_upstream",
+        errorDetail: detail,
+        errorProviderId: "custom_provider:fixture",
+      })}`;
+    expect(rejection(byok("400 Upstream [invalid_request_error] Too many images in request: 31 > 30"))).toBe(true);
+    expect(rejection(byok('400 {"type":"invalid_request_error","message":"bad"}'))).toBe(true);
+    expect(rejection(byok("400 Bad Request"))).toBe(false);
+    expect(rejection(byok("503 Service Unavailable"))).toBe(false);
+  });
+
+  it("keeps transient, unclassified or ambiguous errors retryable", () => {
+    expect(rejection("400 Bad Request")).toBe(false);
+    expect(rejection("invalid_request_error: overloaded")).toBe(false);
+    expect(rejection("Too many images", 503)).toBe(false);
+    expect(rejection("Too many images", 429)).toBe(false);
+    expect(rejection("invalid_request_error", 500)).toBe(false);
+    expect(rejection("401 invalid api key")).toBe(false);
+    expect(classifyLLMRequestRejectionMessage("invalid_request_error without a status")).toBeUndefined();
+  });
+
+  it("treats HTTP 413, byte-limit and context-overflow rejections as deterministic", () => {
+    const oversized = rejection;
+    expect(oversized("413 Request Entity Too Large")).toBe(true);
+    expect(oversized("anything", 413)).toBe(true);
+    expect(oversized('{"type":"error","error":{"type":"request_too_large","message":"too big"}}')).toBe(true);
+    expect(oversized("Request body too large: 9 bytes exceeds client limit 8 bytes.")).toBe(true);
+    expect(oversized("400 invalid params, context window exceeds limit (2013)")).toBe(true);
+    expect(oversized("prompt is too long: 213462 tokens > 200000 maximum")).toBe(true);
+    expect(rejection("413 Payload Too Large")).toBe(true);
+  });
+
+  it("does not treat transient or unrelated size-like errors as deterministic", () => {
+    const oversized = rejection;
+    // The bare MiniMax 2013 code is a generic invalid-params code.
+    expect(oversized("400 invalid params (2013)")).toBe(false);
+    expect(oversized("400 Bad Request")).toBe(false);
+    expect(oversized("prompt is too long", 503)).toBe(false);
+    expect(oversized("429 rate limited: request too large for TPM")).toBe(false);
+    expect(oversized("Request body too large: timeout while uploading")).toBe(false);
+    expect(oversized("401 invalid api key")).toBe(false);
+  });
+
+  it("classifies the BYOK-attributed form of an oversized request", () => {
+    const byok = (detail: string) =>
+      `BYOK upstream error: ${JSON.stringify({
+        errorCode: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
+        message: `BYOK provider custom_provider:fixture upstream error: ${detail}`,
+        errorSource: "byok_upstream",
+        errorDetail: detail,
+        errorProviderId: "custom_provider:fixture",
+      })}`;
+    expect(rejection(byok("413 Payload Too Large"))).toBe(true);
+    expect(rejection(byok("400 invalid params, context window exceeds limit (2013)"))).toBe(true);
+    expect(rejection(byok("503 Service Unavailable"))).toBe(false);
   });
 });

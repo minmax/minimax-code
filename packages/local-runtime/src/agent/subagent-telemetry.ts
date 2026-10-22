@@ -90,6 +90,7 @@ export function memberCountBucket(value: number | undefined): '1' | '2' | '3+' |
 export function inferNameResolutionSource(requestedName: string, canonicalName?: string): string {
   const requested = requestedName.trim();
   if (requested.toLowerCase().startsWith('agent:')) return 'explicit_agent';
+  if (requested.includes(':')) return 'plugin';
   if (resolveCanonicalSubagentRole(requested)) return 'canonical_name';
   if (requested.toLowerCase() === 'mavis' || requested.toLowerCase() === 'main') {
     return 'stable_name';

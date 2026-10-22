@@ -70,6 +70,9 @@ export async function buildLocalTurnToolSourcesForHost(
     dataDir: runtimeConfig.dataDir,
     workspaceRoot: input.session.workspaceDir,
     agentName: input.resourceAgentName,
+    // Same task-Session signal the memory scope above uses: it decides whether
+    // this Turn's bash keeps the recoverable-delete `rm` shim.
+    sessionKind: input.session.sessionKind,
     ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),
     ...(input.expectedAgentInstanceId
       ? { expectedAgentInstanceId: input.expectedAgentInstanceId }

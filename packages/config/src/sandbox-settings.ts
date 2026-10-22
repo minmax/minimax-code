@@ -5,6 +5,18 @@ export type SandboxFilesystemModeName =
   | 'delete_guard'
   | 'full_access';
 
+/**
+ * Every filesystem level the config accepts, ordered from most restricted to
+ * unrestricted. Exported so the config validator and the surfaces that offer a
+ * choice cannot drift into accepting or advertising a mode the parser rejects.
+ */
+export const SANDBOX_FILESYSTEM_MODE_NAMES = [
+  'read_only',
+  'workspace_write',
+  'delete_guard',
+  'full_access',
+] as const satisfies readonly SandboxFilesystemModeName[];
+
 export interface SandboxSettingsSnapshot {
   enabled: boolean;
   filesystemMode: SandboxFilesystemModeName;

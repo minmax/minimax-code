@@ -2,6 +2,7 @@ import { isIP } from 'node:net';
 import {
   getDefaultSandboxSettings,
   normalizeSandboxSettings,
+  SANDBOX_FILESYSTEM_MODE_NAMES,
   type SandboxFilesystemModeName,
 } from './sandbox-settings.js';
 
@@ -10,6 +11,9 @@ export type SandboxFilesystemPolicy =
   | { mode: 'workspace_write' }
   | { mode: 'delete_guard' }
   | { mode: 'full_access' };
+
+/** One of the four filesystem levels `parseSandboxConfig` accepts. */
+export type SandboxFilesystemMode = SandboxFilesystemModeName;
 
 export type SandboxNetworkPolicy = { mode: 'deny' } | { mode: 'allow_all' };
 
@@ -48,7 +52,7 @@ export function getSandboxConfigDefaults(platform: NodeJS.Platform): SandboxConf
 
 export const SANDBOX_CONFIG_DEFAULTS = getSandboxConfigDefaults(process.platform);
 
-const FILESYSTEM_MODES = new Set(['read_only', 'workspace_write', 'delete_guard', 'full_access']);
+const FILESYSTEM_MODES: ReadonlySet<string> = new Set(SANDBOX_FILESYSTEM_MODE_NAMES);
 const NETWORK_MODES = new Set(['deny', 'allow_all']);
 
 export function parseSandboxConfig(

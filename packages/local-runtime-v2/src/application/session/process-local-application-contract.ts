@@ -8,6 +8,7 @@ import type {
   AskQuestionnaireRequest,
 } from "@mavis/shared/questionnaire";
 import type { LocalSkillService } from "@mavis/local-runtime";
+import type { SandboxFilesystemMode } from "@mavis/config";
 import type { LocalMcpPublicFacade } from "../../service/mcp/index.js";
 import type {
   ListInstalledPluginsInput as ListInstalledPluginsReq,
@@ -235,6 +236,21 @@ export interface LocalRuntimeApplication {
     setPermissionMode(input: {
       mode: "default" | "acceptEdits" | "bypassPermissions" | "auto" | "off";
     }): Promise<unknown>;
+    /** Destructive-delete guard toggle; resolves the effective, fail-closed value. */
+    getDangerousCommandGateEnabled(): Promise<boolean>;
+    setDangerousCommandGateEnabled(input: {
+      enabled: boolean;
+    }): Promise<boolean>;
+    /**
+     * Sandbox filesystem level. Resolves `undefined` when the host runs no
+     * sandbox service: the layer is independent of the permission mode, and a
+     * host that enforces nothing must not report a level.
+     */
+    getSandboxFilesystemMode(): Promise<SandboxFilesystemMode | undefined>;
+    /** Re-initializes the sandbox backend and persists the new level. */
+    setSandboxFilesystemMode(input: {
+      mode: SandboxFilesystemMode;
+    }): Promise<SandboxFilesystemMode>;
   };
   readonly models?: {
     list(input?: { sessionId?: string }): Promise<readonly unknown[]>;

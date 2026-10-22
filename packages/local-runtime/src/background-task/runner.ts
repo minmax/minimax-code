@@ -45,7 +45,11 @@ async function startAdmittedBackgroundLocalTask(
 ): Promise<LocalTaskBackgroundStartResult> {
   const taskInput = normalizeLocalTaskInput(input.taskInput);
   requireTaskConversation(input.host);
-  const target = await resolveLocalTaskAgentTarget(input.host, taskInput.agent_name);
+  const target = await resolveLocalTaskAgentTarget(
+    input.host,
+    taskInput.agent_name,
+    input.toolCtx.pluginAgents,
+  );
   throwIfShuttingDown(shutdownSignal);
   if (!target) {
     return {
@@ -78,7 +82,8 @@ async function startAdmittedBackgroundLocalTask(
   let childSession: LocalSessionRecord | undefined;
   try {
     childSession = await input.host.agentRoutes.createSession({
-      agentName,
+      agentName: target.pluginAgent ? 'worker' : agentName,
+      ...(target.pluginAgent ? { taskPluginAgent: target.pluginAgent } : {}),
       workspaceDir: input.parentSession.workspaceDir || input.host.resolveDefaultWorkspaceDir(),
       sessionType: 'branch',
       sessionKind: 'task',

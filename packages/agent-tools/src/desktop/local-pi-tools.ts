@@ -16,7 +16,7 @@ import {
 } from '@earendil-works/pi-coding-agent/tools';
 import { getShellConfig } from '@earendil-works/pi-coding-agent/shell';
 import type { AgentTool, AgentToolResult } from '@earendil-works/pi-agent-core';
-import { access } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import { isAbsolute, resolve as resolvePath } from 'node:path';
 import { homedir, release } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -84,6 +84,8 @@ import {
   limitDesktopPrefixLines,
   withDesktopOutputContinuation,
 } from './output-limit.js';
+import type { ToolOutputSpill } from '../truncation/spill.js';
+import { fileSpillFromHook } from '../truncation/cas-spill.js';
 
 export function getLocalBashEnvironment(): {
   readonly platform: NodeJS.Platform;
@@ -379,6 +381,7 @@ export class LocalBashTool implements ToolImpl<
     envPolicy: BashEnvPolicy,
     private readonly hostTrashRuntime?: LocalHostTrashRuntime,
     private readonly sandboxOperationsFactory?: LocalSandboxBashOperationsFactory,
+    private readonly toolOutputSpill?: ToolOutputSpill,
   ) {
     this.envPolicy = envPolicy;
     // Env sanitizer (design: bash-tool-optimization.md §2.2). Layer A boundary
@@ -550,10 +553,22 @@ export class LocalBashTool implements ToolImpl<
         }),
         timing,
       );
-      return applyDesktopTextLimit(
+      const managedSpillReference = await this.spillFullOutput(result, managedFullOutputPath);
+      const managedLimited = applyDesktopTextLimit(
         result,
-        limitDesktopBashOutput(result.text, managedFullOutputPath, result.details, managed.taskId),
+        limitDesktopBashOutput(
+          result.text,
+          managedFullOutputPath,
+          result.details,
+          managed.taskId,
+          managedSpillReference,
+        ),
       );
+      if (!managedSpillReference) return managedLimited;
+      return {
+        ...managedLimited,
+        details: { ...managedLimited.details, spill_reference: managedSpillReference },
+      };
     }
     let result: ToolResult;
     try {
@@ -598,13 +613,54 @@ export class LocalBashTool implements ToolImpl<
       typeof result.details?.fullOutputPath === 'string'
         ? result.details.fullOutputPath
         : undefined;
-    const limited = limitDesktopBashOutput(result.text, fullOutputPath, result.details);
-    result = applyDesktopTextLimit(result, limited);
+    const spillReference = await this.spillFullOutput(result, fullOutputPath);
+    result = applyDesktopTextLimit(
+      result,
+      limitDesktopBashOutput(result.text, fullOutputPath, result.details, undefined, spillReference),
+    );
+    if (spillReference) {
+      result = { ...result, details: { ...result.details, spill_reference: spillReference } };
+    }
     result.details = this.consumeEnvSanitizationHint({
       ...(result.details ?? {}),
       ...(this.lastEnvRemoved.length > 0 ? { envSanitized: this.lastEnvRemoved } : {}),
     });
     return result;
+  }
+
+  /**
+   * Delegate the persisted full output to the optional spill hook. Only runs
+   * when the output was actually truncated — at the pi preview cap or the
+   * desktop cap — so untruncated output is never persisted twice. Best-effort:
+   * any failure keeps the persisted file as the full-output reference.
+   *
+   * A hook with a file-native `spillFile` (the CAS spill, via the store's
+   * `putFile`) ingests the already-persisted file directly, so the full
+   * payload is never read back into memory; plain string hooks keep the
+   * readFile fallback.
+   */
+  private async spillFullOutput(
+    result: ToolResult,
+    fullOutputPath: string | undefined,
+  ): Promise<string | undefined> {
+    if (!this.toolOutputSpill || !fullOutputPath) return undefined;
+    const truncated =
+      (result.details as { truncation?: { truncated?: boolean } } | undefined)?.truncation
+        ?.truncated === true;
+    if (
+      !truncated &&
+      Buffer.byteLength(result.text, 'utf8') <= DESKTOP_BASH_MAX_BYTES
+    ) {
+      return undefined;
+    }
+    try {
+      const spillFile = fileSpillFromHook(this.toolOutputSpill);
+      if (spillFile) return await spillFile(fullOutputPath);
+      const payload = await readFile(fullOutputPath, 'utf8');
+      return await this.toolOutputSpill.spill(payload);
+    } catch {
+      return undefined;
+    }
   }
 
   private consumeEnvSanitizationHint(
@@ -639,12 +695,16 @@ function limitDesktopBashOutput(
   fullOutputPath?: string,
   details?: Record<string, unknown>,
   taskId?: string,
+  spillReference?: string,
 ) {
+  // A spill reference (CAS or other sink) replaces the persisted file path as
+  // the model-visible way back to the complete output.
+  const fullOutputReference = spillReference ?? fullOutputPath;
   const output = details?.output as { rawBytes?: number; persistenceError?: string } | undefined;
   let previewText = text;
   if (!taskId) {
     if ((details?.truncation as { truncated?: boolean } | undefined)?.truncated) {
-      previewText += `\n\n[desktop bash output truncated: original_bytes=${output?.rawBytes}; original head+tail shown.${fullOutputPath ? ` Full output: ${fullOutputPath}` : ''}]`;
+      previewText += `\n\n[desktop bash output truncated: original_bytes=${output?.rawBytes}; original head+tail shown.${fullOutputReference ? ` Full output: ${fullOutputReference}` : ''}]`;
     }
     if (output?.persistenceError) {
       previewText += `\n\n[Output persistence failed; complete output is unavailable: ${output.persistenceError}]`;
@@ -653,8 +713,8 @@ function limitDesktopBashOutput(
   const limited = limitDesktopHeadTailLines(previewText, {
     maxBytes: DESKTOP_BASH_MAX_BYTES,
     notice: ({ originalBytes }) =>
-      fullOutputPath
-        ? `[desktop bash output truncated: original_bytes=${originalBytes}; head+tail shown; boundary lines may be UTF-8 byte-truncated; Full output: ${fullOutputPath}]`
+      fullOutputReference
+        ? `[desktop bash output truncated: original_bytes=${originalBytes}; head+tail shown; boundary lines may be UTF-8 byte-truncated; Full output: ${fullOutputReference}]`
         : `[desktop bash output truncated: original_bytes=${originalBytes}; head+tail shown; boundary lines may be UTF-8 byte-truncated.]`,
   });
   if (
@@ -678,11 +738,11 @@ function limitDesktopBashOutput(
           preserve_args: ['task_id'],
           instruction: `Read task ${taskId} with task_output; continue with its next_offset (UTF-8 log file bytes). Check output persistence status before treating the log as complete.`,
         }
-      : fullOutputPath
+      : fullOutputReference
         ? {
             tool: 'read',
             preserve_args: ['path'],
-            instruction: `Read the full output at ${fullOutputPath}; continue long reads with the returned next_offset.`,
+            instruction: `Read the full output at ${fullOutputReference}; continue long reads with the returned next_offset.`,
           }
         : {
             tool: 'bash',

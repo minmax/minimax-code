@@ -38,6 +38,7 @@ describe("TuiChromeFlow agent status sequence", () => {
       isStarted: () => true,
       isStopped: () => false,
       setTerminalTitle: vi.fn(),
+      setProgramStatus: vi.fn(),
       connection: () => ({ phase: "live", generation: 1 }),
       liveRunId: () => undefined,
       runProjection: () => ({
@@ -101,6 +102,7 @@ describe("TuiChromeFlow agent status sequence", () => {
       isStarted: () => true,
       isStopped: () => false,
       setTerminalTitle: vi.fn(),
+      setProgramStatus: vi.fn(),
       connection: () => ({ phase: "live", generation: 1 }),
       liveRunId: () => undefined,
       runProjection: () => ({
@@ -158,6 +160,7 @@ describe("TuiChromeFlow agent status sequence", () => {
       isStarted: () => true,
       isStopped: () => false,
       setTerminalTitle: vi.fn(),
+      setProgramStatus: vi.fn(),
       connection: () => ({ phase: "live", generation: 1 }),
       liveRunId: () => undefined,
       runProjection: () => ({
@@ -212,8 +215,10 @@ describe("TuiChromeFlow agent status sequence", () => {
   it("increments only when the semantic tuple changes and resets on session switch", () => {
     let interaction: TuiAgentInteractionReadback | undefined;
     let agentCounts = { active: 0, total: 0 };
+    let backgroundTasks = 0;
     const shells: TuiShellState[] = [];
     const setTerminalTitle = vi.fn();
+    const setProgramStatus = vi.fn();
     const shellSink = {
       setState: (state: TuiShellState) => shells.push(state),
     };
@@ -224,6 +229,7 @@ describe("TuiChromeFlow agent status sequence", () => {
       isStarted: () => true,
       isStopped: () => false,
       setTerminalTitle,
+      setProgramStatus,
       connection: () => ({ phase: "live", generation: 1 }),
       liveRunId: (snapshot) => snapshot.activeTurnId,
       runProjection: () => ({
@@ -238,6 +244,7 @@ describe("TuiChromeFlow agent status sequence", () => {
         interaction?.kind === "questionnaire" || interaction?.kind === "plan",
       agentInteraction: () => interaction,
       agentCounts: () => agentCounts,
+      backgroundTaskCount: () => backgroundTasks,
       attachmentCount: () => 0,
       expandedDraft: () => "",
       selectedModel: () => undefined,
@@ -262,6 +269,7 @@ describe("TuiChromeFlow agent status sequence", () => {
       agentStatus: "ready",
       agentActiveCount: 0,
       agentTotalCount: 0,
+      agentBackgroundCount: 0,
     });
 
     agentCounts = { active: 2, total: 3 };
@@ -271,6 +279,13 @@ describe("TuiChromeFlow agent status sequence", () => {
       agentActiveCount: 2,
       agentTotalCount: 3,
     });
+
+    backgroundTasks = 1;
+    flow.update(snapshot("session-1"));
+    expect(shells.at(-1)).toMatchObject({ agentSeq: "2", agentBackgroundCount: 1 });
+    backgroundTasks = 0;
+    flow.update(snapshot("session-1"));
+    expect(shells.at(-1)).toMatchObject({ agentSeq: "3", agentBackgroundCount: 0 });
 
     interaction = {
       kind: "permission",
@@ -284,8 +299,9 @@ describe("TuiChromeFlow agent status sequence", () => {
     };
     flow.update(interactingSnapshot);
     expect(setTerminalTitle).toHaveBeenLastCalledWith("Needs approval | workspace (session-) | MCode");
+    expect(setProgramStatus).toHaveBeenLastCalledWith("perm");
     expect(shells.at(-1)).toMatchObject({
-      agentSeq: "2",
+      agentSeq: "4",
       agentStatus: "perm",
       agentRequestId: "permission-1",
     });
@@ -294,8 +310,9 @@ describe("TuiChromeFlow agent status sequence", () => {
     flow.update(interactingSnapshot);
     flow.update(interactingSnapshot);
     expect(setTerminalTitle).toHaveBeenLastCalledWith("Working | workspace (session-) | MCode");
+    expect(setProgramStatus).toHaveBeenLastCalledWith("run");
     expect(shells.at(-1)).toMatchObject({
-      agentSeq: "3",
+      agentSeq: "5",
       agentStatus: "run",
       agentRunId: "turn-1",
     });
@@ -362,5 +379,49 @@ describe("TuiChromeFlow agent status sequence", () => {
     });
     expect(shells.at(-1)).toMatchObject({ agentStatus: "ready" });
     expect(shells.at(-1)?.agentRunId).toBeUndefined();
+    expect(setProgramStatus).toHaveBeenLastCalledWith("ready");
+
+    flow.update({
+      ...snapshot("session-3"),
+      account: { status: "needs-login", authMode: "managed-login" } as TuiChatSnapshot["account"],
+    });
+    expect(setProgramStatus).toHaveBeenLastCalledWith("auth");
+    // The machine line keeps its fatal-error contract; human-facing outputs say why.
+    expect(shells.at(-1)).toMatchObject({ agentStatus: "error" });
+    expect(shells.at(-1)?.agentRunId).toBeUndefined();
+    expect(setTerminalTitle).toHaveBeenLastCalledWith("Needs login | workspace (session-) | MCode");
+    const authenticated = {
+      ...snapshot("session-3"),
+      account: {
+        status: "ready",
+        authMode: "managed-login",
+        managedTokenPresent: true,
+      } as TuiChatSnapshot["account"],
+    };
+    flow.update(authenticated);
+    expect(setProgramStatus).toHaveBeenLastCalledWith("ready");
+    expect(shells.at(-1)).toMatchObject({ agentStatus: "ready" });
+    expect(setTerminalTitle).toHaveBeenLastCalledWith("Ready | workspace (session-) | MCode");
+    flow.update({ ...authenticated, status: "running", activeTurnId: "after-login" });
+    expect(setProgramStatus).toHaveBeenLastCalledWith("run");
+    flow.update({
+      ...authenticated,
+      lastSettledTurn: { sessionId: "session-3", turnId: "after-login", status: "succeeded" },
+    });
+    expect(setProgramStatus).toHaveBeenLastCalledWith("done");
+    flow.update(authenticated);
+    expect(setProgramStatus).toHaveBeenLastCalledWith("done");
+
+    flow.update({ ...snapshot("fatal-session"), status: "error", errorRetryable: false });
+    expect(setProgramStatus).toHaveBeenLastCalledWith("error");
+    flow.update(snapshot("fatal-session"));
+    expect(setProgramStatus).toHaveBeenLastCalledWith("error");
+    // A fatal error is not downgraded to a recoverable login wait.
+    flow.update({
+      ...snapshot("fatal-session"),
+      account: { status: "needs-login", authMode: "managed-login" } as TuiChatSnapshot["account"],
+    });
+    expect(setProgramStatus).toHaveBeenLastCalledWith("error");
+    expect(setTerminalTitle).toHaveBeenLastCalledWith("Error | workspace (fatal-se) | MCode");
   });
 });

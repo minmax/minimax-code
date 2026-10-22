@@ -549,6 +549,100 @@ describe("v1 runtime compatibility seams", () => {
     expect(services.peripherals).not.toHaveProperty("models");
     expect(services.peripherals).not.toHaveProperty("modelProviders");
   });
+
+  it("reads the destructive-delete guard fail-closed through the configuration capability", async () => {
+    // Absent and malformed config alike keep the guard on: the safety net may
+    // only be disarmed by an explicit `false`, never by a missing field.
+    for (const permission of [
+      undefined,
+      {},
+      { dangerousCommandGateEnabled: undefined },
+      { dangerousCommandGateEnabled: true },
+    ] as const) {
+      const services = createCompatibility().createServiceCompatibility(
+        createdHost({ configGetter: () => ({ permission }) }),
+        { dataDir: "/tmp/runtime" } as CreateLocalRuntimeHostOptions,
+      );
+
+      await expect(
+        services.peripherals.configuration.getDangerousCommandGateEnabled(),
+      ).resolves.toBe(true);
+    }
+
+    const disabled = createCompatibility().createServiceCompatibility(
+      createdHost({
+        configGetter: () => ({
+          permission: { dangerousCommandGateEnabled: false },
+        }),
+      }),
+      { dataDir: "/tmp/runtime" } as CreateLocalRuntimeHostOptions,
+    );
+    await expect(
+      disabled.peripherals.configuration.getDangerousCommandGateEnabled(),
+    ).resolves.toBe(false);
+  });
+
+  it("writes the destructive-delete guard through the host config updater", async () => {
+    const setProcessLocalDangerousCommandGateEnabled = vi.fn(
+      async (enabled: boolean) => enabled,
+    );
+    const services = createCompatibility().createServiceCompatibility(
+      createdHost({ setProcessLocalDangerousCommandGateEnabled }),
+      { dataDir: "/tmp/runtime" } as CreateLocalRuntimeHostOptions,
+    );
+
+    await expect(
+      services.peripherals.configuration.setDangerousCommandGateEnabled({
+        enabled: false,
+      }),
+    ).resolves.toBe(false);
+    expect(setProcessLocalDangerousCommandGateEnabled).toHaveBeenCalledWith(false);
+  });
+
+  it("reports an unmanaged sandbox when the host enforces none", async () => {
+    // A host without a sandbox service applies no filesystem level at all, so
+    // naming one here would describe a policy nothing is enforcing.
+    const services = createCompatibility().createServiceCompatibility(
+      createdHost({ getProcessLocalSandboxFilesystemMode: () => undefined }),
+      { dataDir: "/tmp/runtime" } as CreateLocalRuntimeHostOptions,
+    );
+
+    await expect(
+      services.peripherals.configuration.getSandboxFilesystemMode(),
+    ).resolves.toBeUndefined();
+  });
+
+  it("reads the sandbox level from the host sandbox control", async () => {
+    const services = createCompatibility().createServiceCompatibility(
+      createdHost({ getProcessLocalSandboxFilesystemMode: () => "delete_guard" }),
+      { dataDir: "/tmp/runtime" } as CreateLocalRuntimeHostOptions,
+    );
+
+    await expect(
+      services.peripherals.configuration.getSandboxFilesystemMode(),
+    ).resolves.toBe("delete_guard");
+  });
+
+  it("switches the sandbox level through the host, not a config write", async () => {
+    // The host owns the apply path because only the sandbox service can
+    // re-initialize the platform backend for the new level.
+    const setProcessLocalSandboxFilesystemMode = vi.fn(
+      async (mode: string) => mode,
+    );
+    const services = createCompatibility().createServiceCompatibility(
+      createdHost({ setProcessLocalSandboxFilesystemMode }),
+      { dataDir: "/tmp/runtime" } as CreateLocalRuntimeHostOptions,
+    );
+
+    await expect(
+      services.peripherals.configuration.setSandboxFilesystemMode({
+        mode: "workspace_write",
+      }),
+    ).resolves.toBe("workspace_write");
+    expect(setProcessLocalSandboxFilesystemMode).toHaveBeenCalledWith(
+      "workspace_write",
+    );
+  });
 });
 
 describe("v1 runtime compatibility adapters and cleanup", () => {

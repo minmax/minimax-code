@@ -28,6 +28,7 @@ import {
 } from '../../commands/catalog.js';
 import { resolveTuiComposerInputIntent } from '../../commands/input-intent.js';
 import { formatTuiTerminalTitle } from '../../platform/terminal-title.js';
+import type { TuiProgramStatus } from '../../platform/terminal-program-status.js';
 
 type PresentationSink<K extends keyof TuiVisiblePresentation> = {
   setState(state: TuiVisiblePresentation[K]): void;
@@ -52,6 +53,7 @@ export class TuiChromeFlow {
       readonly isStarted: () => boolean;
       readonly isStopped: () => boolean;
       readonly setTerminalTitle: (title: string | undefined) => void;
+      readonly setProgramStatus: (status: TuiProgramStatus) => void;
       readonly terminalTitle?: readonly string[] | null;
       readonly connection: () => Pick<TuiState['connection'], 'phase' | 'generation' | 'lastError'>;
       /** Multi-Session state kernel, including the background parent Turn. */
@@ -63,6 +65,7 @@ export class TuiChromeFlow {
       readonly activeQuestionnaire: () => boolean;
       readonly agentInteraction: () => TuiAgentInteractionReadback | undefined;
       readonly agentCounts?: () => { readonly active: number; readonly total: number };
+      readonly backgroundTaskCount?: () => number;
       readonly attachmentCount: () => number;
       readonly expandedDraft: () => string;
       readonly inputCommands?: () => readonly TuiCommand[];
@@ -74,6 +77,8 @@ export class TuiChromeFlow {
       readonly sideConversation?: () => TuiSideConversationSnapshot | undefined;
       /** Multi-Session state kernel, including the background parent Turn. */
       readonly sessionState?: () => Pick<TuiState, 'sessions'>;
+      /** Earliest observed start of a Turn, kept across Session projection switches. */
+      readonly turnStartedAtMs?: (turnId: string) => number | undefined;
       readonly welcome: PresentationSink<'shell'>;
       readonly status: PresentationSink<'shell'>;
       readonly activity: PresentationSink<'activity'>;
@@ -198,8 +203,10 @@ export class TuiChromeFlow {
         const sideConversation = this.resolveSideConversationPresentation(snapshot);
         return sideConversation ? { sideConversation } : {};
       })(),
+      ...(this.options.turnStartedAtMs ? { turnStartedAtMs: this.options.turnStartedAtMs } : {}),
     });
     const agentCounts = this.options.agentCounts?.();
+    const backgroundTasks = this.options.backgroundTaskCount?.();
     const automationStatus = this.automationStatus.reconcile({
       snapshot,
       connection,
@@ -211,15 +218,22 @@ export class TuiChromeFlow {
       compacting: this.compacting,
       retrying: this.isLlmRetrying(),
       ...(agentCounts ? { agentCounts } : {}),
+      ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
     });
     if (this.options.isStarted()) {
+      // Title and program status present the same projection; only login gets
+      // a more specific human-facing state than the machine `[V]` error.
+      const programStatus: TuiProgramStatus = automationStatus.loginRequired
+        ? 'auth'
+        : automationStatus.status;
+      this.options.setProgramStatus(programStatus);
       this.options.setTerminalTitle(
         formatTuiTerminalTitle(
           {
             title: snapshot.session?.title,
             sessionId: snapshot.session?.sessionId,
             workspace: this.options.workspace,
-            status: automationStatus.status,
+            status: programStatus,
           },
           this.options.terminalTitle,
         ),
@@ -234,6 +248,7 @@ export class TuiChromeFlow {
       ...(automationStatus.requestId ? { agentRequestId: automationStatus.requestId } : {}),
       agentActiveCount: automationStatus.activeAgents,
       agentTotalCount: automationStatus.totalAgents,
+      agentBackgroundCount: automationStatus.backgroundTasks,
     };
     // The welcome header remains visible above the conversation transcript.
     this.options.welcome.setState(shell);

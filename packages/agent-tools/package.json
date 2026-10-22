@@ -25,6 +25,10 @@
       "types": "./src/shared/read-contract.ts",
       "import": "./dist/shared/read-contract.js"
     },
+    "./truncation/cas-spill": {
+      "types": "./src/truncation/cas-spill.ts",
+      "import": "./dist/truncation/cas-spill.js"
+    },
     "./plugin-hooks": {
       "types": "./src/plugin-hooks/index.ts",
       "import": "./dist/plugin-hooks/index.js"
@@ -38,9 +42,10 @@
     "@earendil-works/pi-agent-core": "workspace:*",
     "@earendil-works/pi-coding-agent": "workspace:*",
     "@mavis/agent-core": "workspace:^",
-    "@mavis/plugin-hooks": "workspace:^",
     "@mavis/background-task": "workspace:^",
+    "@mavis/cas": "workspace:*",
     "@mavis/context-manager": "workspace:^",
+    "@mavis/plugin-hooks": "workspace:^",
     "@mavis/protocol": "workspace:^",
     "@mavis/shared": "workspace:^",
     "@mavis/system-reminder": "workspace:^",
@@ -48,8 +53,8 @@
     "@sinclair/typebox": "^0.34.0",
     "@vscode/ripgrep": "1.18.0",
     "diff": "8.0.4",
-    "jszip": "^3.10.1",
     "js-yaml": "^4",
+    "jszip": "^3.10.1",
     "minimatch": "10.2.6",
     "shell-quote": "^1.8.1",
     "tar": "^7.5.22",

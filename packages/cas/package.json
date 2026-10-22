@@ -1,0 +1,35 @@
+{
+  "name": "@mavis/cas",
+  "version": "0.1.0",
+  "description": "Content-addressed blob store with atomic tmp-file publication for the hybrid agent foundation.",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "import": "./dist/index.js"
+    },
+    "./cas-ref": {
+      "types": "./src/cas-ref.ts",
+      "development": "./src/cas-ref.ts",
+      "import": "./dist/cas-ref.js"
+    },
+    "./store-errors": {
+      "types": "./src/store-errors.ts",
+      "development": "./src/store-errors.ts",
+      "import": "./dist/store-errors.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
+  "private": true,
+  "license": "MIT"
+}

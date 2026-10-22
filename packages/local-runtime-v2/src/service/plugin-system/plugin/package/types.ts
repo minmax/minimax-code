@@ -29,7 +29,7 @@ type PluginManifestKind =
 
 export interface PluginReaderDiagnostic {
   readonly code: string;
-  readonly capability?: 'MCP' | 'SKILL' | 'APP' | 'HOOK';
+  readonly capability?: 'MCP' | 'SKILL' | 'APP' | 'HOOK' | 'AGENT';
   readonly name?: string;
 }
 
@@ -57,6 +57,23 @@ export interface PluginSkill {
   readonly content: string;
   readonly skillFilePath: string;
   readonly skillRoot: string;
+}
+
+/** A subagent declared by a local plugin's `agents/` directory. */
+export interface PluginAgentDefinition {
+  readonly name: string;
+  readonly scopedName: string;
+  readonly description: string;
+  readonly content: string;
+  readonly sourcePath: string;
+  /** Body after the frontmatter delimiter — the delegate's system prompt. */
+  readonly systemPrompt: string;
+  readonly model?: string;
+  readonly effort?: string;
+  readonly tools?: readonly string[];
+  readonly disallowedTools?: readonly string[];
+  readonly mcpServers?: readonly string[];
+  readonly skills?: readonly string[];
 }
 
 export type PluginHostBindingSurface = 'interactive';
@@ -129,6 +146,7 @@ export interface ReadPluginPackage {
   readonly apps: readonly PluginAppReference[];
   readonly mcpServers: readonly PluginMcpServer[];
   readonly skills: readonly PluginSkill[];
+  readonly agents?: readonly PluginAgentDefinition[];
   readonly hostBindings?: readonly PluginHostBinding[];
   readonly hooks?: readonly PluginHookCommandHandler[];
   readonly miniapp?: MiniAppContribution;

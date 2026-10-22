@@ -82,7 +82,22 @@ mcode login --region global
 
 Complete sign-in in your browser, then open `mcode` and use `/status` to check your account and `/provider` to choose a model. Run `mcode logout` to sign out.
 
-Token Plan requires an account with available credits. Builds from this repository and the published npm CLI `@minimax-ai/code@0.4.12` default to `~/.minimax` for user data (or `~/.minimax-<profile>` when a profile is selected). `MINIMAX_DATA_DIR` or `MAVIS_DATA_DIR` can override the data directory. The installer's `~/.minimax-code` installation directory is separate from this choice. See [Accounts and data](docs/installation.md#accounts-and-data) before locating or removing configuration and sessions.
+Token Plan requires an account with available credits. Builds from this repository and the published npm CLI `@minimax-ai/code@0.6.9` default to `~/.minimax` for user data (or `~/.minimax-<profile>` when a profile is selected). `MINIMAX_DATA_DIR` or `MAVIS_DATA_DIR` can override the data directory. The installer's `~/.minimax-code` installation directory is separate from this choice. See [Run two accounts](#run-two-accounts) to keep two accounts side by side, and [Accounts and data](docs/installation.md#accounts-and-data) before locating or removing configuration and sessions.
+
+#### Run two accounts
+
+A named profile owns a separate data directory, so its tokens, sessions, `config.yaml`, MCP configuration, plugins, and skills stay out of your other account. With no selector, `mcode` uses the `default` profile.
+
+```bash
+mcode login                      # personal account -> ~/.minimax
+mcode login --profile work       # work account     -> ~/.minimax-work
+mcode                            # personal
+mcode --profile work             # work
+mcode profile list               # see both
+mcode profile remove work --yes  # forget the work profile
+```
+
+`--profile` is accepted on the root command and on every subcommand, so `mcode --profile work exec` and `mcode login --profile work` select the same profile. `MINIMAX_PROFILE=work` selects a profile for a whole shell or process tree and loses to the flag. Profile names are 1-64 characters of letters, numbers, dots, underscores, and hyphens, starting and ending with a letter or number; any other name is refused with an error rather than corrected. `default` is reserved and means the same as omitting the flag. See [Profiles](docs/installation.md#profiles) for the naming rules, the isolated state, and every `mcode profile` subcommand.
 
 <details>
 <summary>Use your own API key (BYOK)</summary>
@@ -145,6 +160,28 @@ Use `mcode init .` to generate or update project guidance in `AGENTS.md`. Descri
 | Interactive TUI | `mcode [prompt]` | Explore code, continue a conversation, and review changes or permissions. |
 | Headless | `mcode exec [prompt]` | Shell scripts, CI, batch work, and evaluations. |
 | ACP | `mcode acp` | Editors and clients supporting Agent Client Protocol. |
+
+### Lightweight conversations
+
+For simple conversation or general knowledge questions, start a new Session with
+`--mode lightweight`:
+
+```bash
+mcode --mode lightweight "Explain how DNS caching works."
+mcode exec --mode lightweight "Summarize the CAP theorem."
+```
+
+Lightweight mode sends a small conversational system prompt and no tool schemas. It omits workspace
+instructions, Skills, memory blocks, MCP schemas, and the full environment block from provider
+context, so it cannot inspect or change local files. Start a new standard Session for coding or tool use with
+`mcode --mode standard` or `mcode exec --mode standard`; omitting `--mode` is identical to standard
+mode.
+
+The mode is fixed when a root Session is created. `--mode lightweight` therefore cannot be combined
+with `--session` or `--continue`. Child/sub-agent Sessions do not inherit it, `/compact` continues to
+use the standard compaction context, and ACP and desktop Sessions remain standard. Reopening a
+lightweight Session keeps its mode and shows `Lightweight` in the TUI status line; opening a standard
+Session from a lightweight launch remains standard and shows no indicator.
 
 ### Continue your work
 
@@ -253,7 +290,7 @@ From the source directory, use `pnpm mcode` in place of `mcode` in the examples 
 node /absolute/path/to/minimax-code/dist/cli.js
 ```
 
-This repository targets the **0.4.12 source preview**. Installing the published package and building this checkout are separate paths. Matching versions do not prove identical build provenance; see the [version and evidence baseline](docs/open-source-status.md#version-and-evidence-baseline).
+This repository targets the **0.6.3 source preview**. Installing the published package and building this checkout are separate paths. Matching versions do not prove identical build provenance; see the [version and evidence baseline](docs/open-source-status.md#version-and-evidence-baseline).
 
 ## Documentation and contributing
 

@@ -11,6 +11,15 @@ import type { TuiComposerDraft } from '../../features/composer/draft.js';
 import type { TuiWorkspaceRoots } from '../../features/composer/workspace-roots.js';
 import { TuiLoginRegionPicker } from '../../features/auth/login-region-picker.js';
 import { TuiPermissionModePicker } from '../../features/interaction/permission-mode-picker.js';
+import { TuiDeleteGuardPicker } from '../../features/interaction/delete-guard-picker.js';
+import { formatTuiDeleteGuardLabel } from '../../../application/permission-mode.js';
+import { TuiSandboxPicker } from '../../features/interaction/sandbox-picker.js';
+import {
+  describeTuiSandboxMode,
+  formatTuiSandboxModeLabel,
+  parseTuiSandboxFilesystemModeArgument,
+  type TuiSandboxFilesystemMode,
+} from '../../../application/sandbox-mode.js';
 import { TuiSettingsPicker } from '../../features/settings/picker.js';
 import { TuiHotkeysPicker } from '../../features/settings/hotkeys-picker.js';
 import { submittedEditorContent, submittedEditorTransport, type Editor } from '../../widgets/editor/editor.js';
@@ -30,6 +39,7 @@ import type { TuiUpdateFlow } from './update-flow.js';
 import type { TuiGoalFlow } from './goal-flow.js';
 import type { TuiPlanModeFlow } from '../interaction/plan-mode-flow.js';
 import type { TuiPermissionModeFlow } from '../interaction/permission-mode-flow.js';
+import type { TuiSandboxPolicyFlow } from '../interaction/sandbox-policy-flow.js';
 import type { MavisRegion } from '@mavis/config';
 import type { McodeAuthPort } from '../../../auth/application.js';
 import { markTuiAuthorizationUrl } from '../../../auth/authorization-url.js';
@@ -78,6 +88,7 @@ export interface TuiCommandFlowOptions {
   readonly goalFlow?: Pick<TuiGoalFlow, 'execute' | 'resumeBlocked'>;
   readonly planModeFlow?: TuiPlanModeFlow;
   readonly permissionModeFlow?: TuiPermissionModeFlow;
+  readonly sandboxPolicyFlow?: TuiSandboxPolicyFlow;
   readonly auth?: McodeAuthPort;
   readonly openExternalTarget?: TuiExternalTargetOpener;
   readonly interactionFlow: TuiInteractionFlow;
@@ -165,6 +176,8 @@ export class TuiCommandFlow {
   private loginRegionPicker: TuiLoginRegionPicker | undefined;
   private pendingLoginContinuation: 'checkin' | undefined;
   private permissionModePicker: TuiPermissionModePicker | undefined;
+  private deleteGuardPicker: TuiDeleteGuardPicker | undefined;
+  private sandboxPicker: TuiSandboxPicker | undefined;
   private settingsPicker: TuiSettingsPicker | undefined;
   private hotkeysPicker: TuiHotkeysPicker | undefined;
   private submissionCounter = 0;
@@ -1267,6 +1280,52 @@ export class TuiCommandFlow {
         }
         await this.options.permissionModeFlow.set(mode);
       },
+      'delete-guard': async ({ args }) => {
+        if (!this.options.permissionModeFlow) {
+          this.options.append('Delete guard is unavailable in this host.', 'warning');
+          return;
+        }
+        const action = args.trim().toLocaleLowerCase();
+        if (!action) {
+          this.showDeleteGuardPicker();
+          return;
+        }
+        const flow = this.options.permissionModeFlow;
+        if (action === 'status') {
+          this.options.append(formatDeleteGuardStatus(flow.snapshot().deleteGuardEnabled));
+          return;
+        }
+        if (action !== 'on' && action !== 'off') {
+          this.options.append('Usage: /delete-guard [status | on | off]', 'warning');
+          return 'retained';
+        }
+        await flow.setDeleteGuardEnabled(action === 'on');
+      },
+      sandbox: async ({ args }) => {
+        if (!this.options.sandboxPolicyFlow) {
+          this.options.append('Sandbox is unavailable in this host.', 'warning');
+          return;
+        }
+        const flow = this.options.sandboxPolicyFlow;
+        const action = args.trim();
+        if (!action) {
+          this.showSandboxPicker();
+          return;
+        }
+        if (action.toLocaleLowerCase() === 'status') {
+          this.options.append(formatSandboxStatus(flow.snapshot().mode));
+          return;
+        }
+        const mode = parseTuiSandboxFilesystemModeArgument(action);
+        if (!mode) {
+          this.options.append(
+            'Usage: /sandbox [status | read_only | workspace_write | delete_guard | full_access]',
+            'warning',
+          );
+          return 'retained';
+        }
+        await flow.set(mode);
+      },
       login: () => {
         this.pendingLoginContinuation = undefined;
         this.showLoginRegionPicker();
@@ -1597,6 +1656,70 @@ export class TuiCommandFlow {
     this.options.surface.show(picker);
   }
 
+  private showDeleteGuardPicker(): void {
+    const flow = this.options.permissionModeFlow;
+    if (!flow) {
+      this.options.append('Delete guard is unavailable in this host.', 'warning');
+      return;
+    }
+    if (flow.snapshot().deleteGuardEnabled === undefined) {
+      this.options.append(formatDeleteGuardStatus(undefined));
+      return;
+    }
+    if (this.deleteGuardPicker) {
+      this.options.surface.close(this.deleteGuardPicker);
+      this.deleteGuardPicker = undefined;
+    }
+    const picker = new TuiDeleteGuardPicker(
+      () => flow.snapshot().deleteGuardEnabled,
+      (enabled) => {
+        if (this.deleteGuardPicker !== picker) return;
+        this.options.surface.close(picker);
+        this.deleteGuardPicker = undefined;
+        void flow.setDeleteGuardEnabled(enabled);
+      },
+      () => {
+        this.options.surface.close(picker);
+        if (this.deleteGuardPicker === picker) this.deleteGuardPicker = undefined;
+      },
+      this.options.onChanged,
+    );
+    this.deleteGuardPicker = picker;
+    this.options.surface.show(picker);
+  }
+
+  private showSandboxPicker(): void {
+    const flow = this.options.sandboxPolicyFlow;
+    if (!flow) {
+      this.options.append('Sandbox is unavailable in this host.', 'warning');
+      return;
+    }
+    if (flow.snapshot().mode === undefined) {
+      this.options.append(formatSandboxStatus(undefined));
+      return;
+    }
+    if (this.sandboxPicker) {
+      this.options.surface.close(this.sandboxPicker);
+      this.sandboxPicker = undefined;
+    }
+    const picker = new TuiSandboxPicker(
+      () => flow.snapshot().mode,
+      (mode) => {
+        if (this.sandboxPicker !== picker) return;
+        this.options.surface.close(picker);
+        this.sandboxPicker = undefined;
+        void flow.set(mode);
+      },
+      () => {
+        this.options.surface.close(picker);
+        if (this.sandboxPicker === picker) this.sandboxPicker = undefined;
+      },
+      this.options.onChanged,
+    );
+    this.sandboxPicker = picker;
+    this.options.surface.show(picker);
+  }
+
   private showSettingsPicker(): void {
     if (this.settingsPicker) {
       this.options.surface.close(this.settingsPicker);
@@ -1895,4 +2018,29 @@ function isBareSlashCommand(input: string): boolean {
 function isAvailableWhileStopping(input: string, catalog: TuiCommandCatalog): boolean {
   const command = catalog.resolve(input)?.name;
   return command === 'help' || command === 'quit' || command === 'stop';
+}
+
+/**
+ * `undefined` is reported as "managed by host" rather than as an enabled or
+ * disabled guard: the TUI must never claim a protection the runtime may not
+ * actually be enforcing.
+ */
+function formatDeleteGuardStatus(enabled: boolean | undefined): string {
+  if (enabled === undefined) return 'Delete guard is managed by host.';
+  const label = formatTuiDeleteGuardLabel(enabled);
+  const detail =
+    enabled
+      ? 'Deletes move to trash and can be restored.'
+      : 'Deletes are permanent and cannot be undone.';
+  return `Delete guard: ${label}. ${detail}`;
+}
+
+/**
+ * `undefined` is reported as "managed by host" rather than as a level: the
+ * sandbox is enforced outside permission checks, so naming a level the host is
+ * not applying would misdescribe what actually runs.
+ */
+function formatSandboxStatus(mode: TuiSandboxFilesystemMode | undefined): string {
+  if (mode === undefined) return 'Sandbox is managed by host.';
+  return `Sandbox: ${formatTuiSandboxModeLabel(mode)}. ${describeTuiSandboxMode(mode)}`;
 }

@@ -87,6 +87,7 @@ export {
 } from './agent-host/preparation/config/session-model-selection.js';
 export {
   AgentHostTurnCapabilityLifecycle,
+  type AgentHostTurnAgentCapability,
   type AgentHostTurnCapabilityPreparation,
   type AgentHostTurnCapabilityProvider,
   type AgentHostTurnCapabilityView,
@@ -117,6 +118,7 @@ export type {
   LocalAgentProfileSource,
 } from './agent-host/preparation/contracts.js';
 export { resolveAgentPromptSurface } from './agent-host/preparation/agent-prompt-surface.js';
+export type { SystemPromptOverrides } from './agent-host/preparation/index.js';
 export {
   configureLocalPluginHookEnabledResolver,
   configureLocalPluginHookObservability,

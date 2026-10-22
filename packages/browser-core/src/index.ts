@@ -79,3 +79,12 @@ export type {
   BrowserTransportEventListener as CoreBrowserTransportEventListener,
   CdpTransport,
 } from './browser-transport.js';
+export * from './browser-script-runner.js';
+export {
+  BROWSER_SCRIPT_BOOTSTRAP_SOURCE,
+  BROWSER_SCRIPT_LOG_ENTRY_MAX_CHARS,
+  BROWSER_SCRIPT_LOG_MAX_BYTES,
+  BROWSER_SCRIPT_LOG_MAX_ENTRIES,
+  BROWSER_SCRIPT_RUNTIME_FILENAME,
+  browserScriptWorkerSource,
+} from './browser-script-templates.js';

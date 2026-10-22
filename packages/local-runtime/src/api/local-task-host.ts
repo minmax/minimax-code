@@ -18,6 +18,8 @@ export interface LocalTaskRunnerHost extends SubagentTelemetryHost {
   readonly agentRoutes: {
     createSession(input: {
       agentName?: string;
+      /** Plugin-declared subagent backing this Task Session. */
+      taskPluginAgent?: import('@mavis/conversation-contract').ConversationTaskPluginAgent;
       workspaceDir: string;
       sessionType?: 'root' | 'branch';
       sessionKind?: 'task';

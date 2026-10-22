@@ -1,0 +1,27 @@
+{
+  "name": "@mavis/wire-compiler",
+  "version": "0.1.0",
+  "description": "Context-as-Bytes wire compiler: per-entry deterministic Buffer segments (LRU-cached by entryId/dialect/normalizerVersion) concatenated into the request body, with a byte budget guard.",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
+  "private": true,
+  "license": "MIT",
+  "dependencies": {
+    "@mavis/cas": "workspace:*"
+  }
+}

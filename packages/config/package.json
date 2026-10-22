@@ -14,6 +14,11 @@
       "import": "./dist/data-dir.js",
       "default": "./dist/data-dir.js"
     },
+    "./auth-profile": {
+      "types": "./src/auth-profile.ts",
+      "import": "./dist/auth-profile.js",
+      "default": "./dist/auth-profile.js"
+    },
     "./cu-backend": {
       "types": "./src/cu-backend.ts",
       "import": "./dist/cu-backend.js",

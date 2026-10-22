@@ -1,0 +1,24 @@
+{
+  "name": "@mavis/convert-to-llm",
+  "version": "0.1.0",
+  "description": "Per-entry AgentMessage to provider-format conversion for the wire compiler: deterministic CompiledEntry per (entryId, dialect, normalizerVersion), audit/control exclusion, placed-entry dedup, system-reminder tail entries, immediate-send batching.",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
+  "private": true,
+  "license": "MIT"
+}

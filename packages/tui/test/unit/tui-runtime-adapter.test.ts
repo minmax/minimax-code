@@ -1,7 +1,78 @@
 import { describe, expect, it, vi } from "vitest";
 import { TuiRuntimeAdapter } from "../../src/runtime/adapter.js";
+import { LIGHTWEIGHT_SESSION_PURPOSE } from "@mavis/protocol/local";
 
 describe("TuiRuntimeAdapter process-local facades", () => {
+  it("marks only newly created root Sessions as lightweight", async () => {
+    const createSession = vi.fn(async () => ({ sessionId: "created" }));
+    const adapter = new TuiRuntimeAdapter(
+      {
+        listModels: vi.fn(async () => []),
+        createSession,
+      } as never,
+      { contextMode: "lightweight" },
+    );
+
+    await adapter.createSession({ workspaceDir: "/workspace" });
+    await adapter.createSession({
+      workspaceDir: "/workspace",
+      parentSessionId: "parent",
+      purpose: "local-task:child",
+    });
+
+    expect(createSession).toHaveBeenNthCalledWith(1, {
+      name: "mavis",
+      workspaceDir: "/workspace",
+      purpose: LIGHTWEIGHT_SESSION_PURPOSE,
+    });
+    expect(createSession).toHaveBeenNthCalledWith(2, {
+      name: "mavis",
+      workspaceDir: "/workspace",
+      parentSessionId: "parent",
+      purpose: "local-task:child",
+    });
+  });
+
+  it("leaves the standard Session creation request byte-for-byte unchanged", async () => {
+    const createSession = vi.fn(async () => ({ sessionId: "created" }));
+    const adapter = new TuiRuntimeAdapter({
+      listModels: vi.fn(async () => []),
+      createSession,
+    } as never);
+
+    await adapter.createSession({ workspaceDir: "/workspace", title: "hello" });
+
+    expect(JSON.stringify(createSession.mock.calls[0]?.[0])).toBe(
+      '{"name":"mavis","workspaceDir":"/workspace","title":"hello"}',
+    );
+  });
+
+  it("preserves the persisted mode when reopening Sessions regardless of launch mode", async () => {
+    const reopenedLightweight = new TuiRuntimeAdapter({
+      getSession: vi.fn(async () => ({
+        session: {
+          sessionId: "lightweight",
+          purpose: LIGHTWEIGHT_SESSION_PURPOSE,
+        },
+      })),
+    } as never);
+    const reopenedStandardFromLightweightLaunch = new TuiRuntimeAdapter(
+      {
+        getSession: vi.fn(async () => ({
+          session: { sessionId: "standard" },
+        })),
+      } as never,
+      { contextMode: "lightweight" },
+    );
+
+    await expect(reopenedLightweight.getSession("lightweight")).resolves.toMatchObject({
+      purpose: LIGHTWEIGHT_SESSION_PURPOSE,
+    });
+    await expect(
+      reopenedStandardFromLightweightLaunch.getSession("standard"),
+    ).resolves.not.toHaveProperty("purpose");
+  });
+
   it("projects active and recent terminal Runtime background work for the current Session", async () => {
     const listBackgroundTasks = vi.fn(
       async (input: { statuses?: readonly string[] }) =>
@@ -40,6 +111,7 @@ describe("TuiRuntimeAdapter process-local facades", () => {
                 status: "running" as const,
                 ownerSessionId: "session-1",
                 description: "pnpm test",
+                metadata: { command: "pnpm test", executionMode: "managed_foreground" },
                 createdAt: 100,
                 updatedAt: 200,
                 startedAt: 110,
@@ -80,9 +152,11 @@ describe("TuiRuntimeAdapter process-local facades", () => {
         status: "running",
         ownerSessionId: "session-1",
         description: "pnpm test",
+        command: "pnpm test",
         createdAtMs: 100,
         updatedAtMs: 200,
         startedAtMs: 110,
+        foreground: true,
       },
     ]);
     expect(listBackgroundTasks).toHaveBeenNthCalledWith(1, {

@@ -35,8 +35,12 @@ export interface TuiCommandContext {
  * auth, and process controls stay unavailable even when typed directly.
  * `/parent` stays available as the explicit "switch back to the main
  * conversation" command; it mirrors the Ctrl+/ toggle, not a close.
+ * `/retry` stays available because it only resends the side Session's own
+ * failed message, and a failed side response tells the user to run it.
+ * `/doctor` and `/feedback` stay available so a failed side response can be
+ * diagnosed and reported where it happened; neither mutates either Session.
  */
-export const SIDE_MODE_READ_ONLY_COMMANDS = new Set([
+export const SIDE_MODE_COMMANDS = new Set([
   'help',
   'changelog',
   'context',
@@ -46,6 +50,9 @@ export const SIDE_MODE_READ_ONLY_COMMANDS = new Set([
   'transcript',
   'copy',
   'parent',
+  'retry',
+  'doctor',
+  'feedback',
 ]);
 
 export interface TuiCommand {
@@ -247,6 +254,10 @@ const COMMAND_SOURCES: readonly TuiCommandSource[] = [
     description: 'Resend the last message after a failed response',
     category: 'Session',
     discoverability: 'contextual',
+    // A response that is still running (for example a hung provider request)
+    // has not failed yet: tell the user to stop it rather than claiming there
+    // is nothing to retry (#425).
+    runAvailability: 'idle',
     visibleWhen: (context) => context.canRetry && !context.hasLiveRun,
     unavailableReason: 'There is no failed response to retry in this Session.',
   },
@@ -301,6 +312,30 @@ const COMMAND_SOURCES: readonly TuiCommandSource[] = [
       ['full', 'Use Full Access mode'],
     ]),
     shortcut: 'Alt+M',
+  },
+  {
+    name: 'delete-guard',
+    description: 'Choose whether agent deletes stay recoverable',
+    category: 'Runtime',
+    argumentHint: '[status | on | off]',
+    getArgumentCompletions: argumentCompleter([
+      ['status', 'Show the current delete guard'],
+      ['on', 'Keep deletes recoverable (trash)'],
+      ['off', 'Let deletes run permanently'],
+    ]),
+  },
+  {
+    name: 'sandbox',
+    description: 'Choose what the sandbox may write and delete',
+    category: 'Runtime',
+    argumentHint: '[status | read_only | workspace_write | delete_guard | full_access]',
+    getArgumentCompletions: argumentCompleter([
+      ['status', 'Show the current sandbox level'],
+      ['read_only', 'Refuse every write and delete'],
+      ['workspace_write', 'Write and delete inside the workspace surface'],
+      ['delete_guard', 'Write anywhere, delete inside the workspace surface'],
+      ['full_access', 'Drop every filesystem restriction'],
+    ]),
   },
   {
     name: 'login',
@@ -747,13 +782,13 @@ export function resolveTuiCommandVisibility(
   });
 }
 
-/** Side mode restricts the surface to the read-only whitelist at every layer. */
+/** Side mode restricts the surface to the side-mode whitelist at every layer. */
 export function isTuiCommandAllowedInSideMode(
   command: TuiCommand,
   context: TuiCommandContext,
 ): boolean {
   if (!context.sideMode) return true;
-  return SIDE_MODE_READ_ONLY_COMMANDS.has(command.name.toLocaleLowerCase());
+  return SIDE_MODE_COMMANDS.has(command.name.toLocaleLowerCase());
 }
 
 /** Mirrors Codex's side-conversation copy so a rejected command explains the exit path. */

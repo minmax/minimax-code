@@ -50,7 +50,11 @@ export async function runForegroundLocalTask(input: {
   if (input.signal?.aborted) throw new Error('Operation aborted');
   const taskInput = normalizeLocalTaskInput(input.taskInput);
   const conversation = requireTaskConversation(input.host);
-  const target = await resolveLocalTaskAgentTarget(input.host, taskInput.agent_name);
+  const target = await resolveLocalTaskAgentTarget(
+    input.host,
+    taskInput.agent_name,
+    input.toolCtx.pluginAgents,
+  );
   if (!target) {
     // No runnable target, so there is nothing to track: the failure carries no
     // task handle because no task row was ever created.
@@ -82,7 +86,10 @@ export async function runForegroundLocalTask(input: {
   let childSession: LocalSessionRecord | undefined;
   try {
     childSession = await input.host.agentRoutes.createSession({
-      agentName,
+      // Upstream runs plugin-declared delegates under the builtin `worker`
+      // role; the declaration itself rides into the binding capture.
+      agentName: target.pluginAgent ? 'worker' : agentName,
+      ...(target.pluginAgent ? { taskPluginAgent: target.pluginAgent } : {}),
       workspaceDir: input.parentSession.workspaceDir || input.host.resolveDefaultWorkspaceDir(),
       sessionType: 'branch',
       sessionKind: 'task',

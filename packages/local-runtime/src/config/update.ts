@@ -1,7 +1,13 @@
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import { dirname, join } from 'node:path';
-import { getConfig, getConfigPath, MINIMAX_API_MODEL_CATALOG, resetConfig } from '@mavis/config';
+import {
+  getConfig,
+  getConfigPath,
+  minimaxApiModels,
+  resetConfig,
+  SANDBOX_FILESYSTEM_MODE_NAMES,
+} from '@mavis/config';
 import yaml from 'js-yaml';
 import lockfile from 'proper-lockfile';
 
@@ -25,6 +31,7 @@ const LOCAL_CONFIG_MUTABLE_FIELDS = new Set([
   'thinking',
   'memory',
   'review',
+  'worktreeRefreshBeforeCreate',
   'agents',
 ]);
 
@@ -46,6 +53,13 @@ const LOCAL_PERMISSION_MODES = new Set([
   'auto',
   'off',
 ]);
+
+// Fail-closed set for the sandbox mode write: a value the config parser would
+// reject must never reach `sandbox.filesystem.policy.mode`, or the next load
+// would throw and take the whole configuration down with it.
+const LOCAL_SANDBOX_FILESYSTEM_MODES: ReadonlySet<string> = new Set(
+  SANDBOX_FILESYSTEM_MODE_NAMES,
+);
 
 const LOCAL_CONFIG_WRITE_ERROR_MESSAGE = 'Local runtime failed to update config file';
 const LOCAL_CONFIG_FILE_MODE = 0o600;
@@ -128,12 +142,6 @@ export async function compareAndSetLocalModelContext(
   ) {
     throw new LocalConfigValidationError('Invalid MiniMax model context target');
   }
-  if (
-    input.providerId === 'minimax_api' &&
-    !MINIMAX_API_MODEL_CATALOG[modelId]?.contextWindowOptions?.includes(input.contextLimit)
-  ) {
-    throw new LocalConfigValidationError('Invalid MiniMax API context limit');
-  }
   const configPath = getConfigPath();
   let release: (() => Promise<void>) | undefined;
   try {
@@ -147,11 +155,17 @@ export async function compareAndSetLocalModelContext(
     const raw = readLocalRawConfig(configPath);
     resetConfig();
     const currentConfig = getConfig() as LocalRuntimeConfig;
-    const currentContext =
+    const model =
       input.providerId === 'minimax'
-        ? currentConfig.provider?.minimax?.models?.[modelId]?.limit?.context
-        : currentMinimaxApiContext(currentConfig, modelId);
-    if (currentContext !== input.expectedContextLimit) {
+        ? currentConfig.provider?.minimax?.models?.[modelId]
+        : minimaxApiModels(currentConfig)[modelId];
+    if (
+      input.providerId === 'minimax_api' &&
+      !model?.contextWindowOptions?.includes(input.contextLimit)
+    ) {
+      throw new LocalConfigValidationError('Invalid MiniMax API context limit');
+    }
+    if (model?.limit?.context !== input.expectedContextLimit) {
       return { updated: false, config: currentConfig };
     }
     if (!(await beforeCommit(currentConfig))) {
@@ -184,14 +198,6 @@ export async function compareAndSetLocalModelContext(
   } finally {
     await release?.().catch(() => undefined);
   }
-}
-
-function currentMinimaxApiContext(config: LocalRuntimeConfig, modelId: string): number | undefined {
-  const model = MINIMAX_API_MODEL_CATALOG[modelId];
-  const override = config.minimax_api?.modelContextLimits?.[modelId];
-  return override !== undefined && model?.contextWindowOptions?.includes(override)
-    ? override
-    : model?.limit?.context;
 }
 
 // ── BYOK dedicated write path ──────────────────────────────────────────────
@@ -337,7 +343,7 @@ function applyLocalConfigUpdate(raw: Record<string, unknown>, body: Record<strin
       return;
     }
     if (Object.prototype.hasOwnProperty.call(body, 'put')) {
-      if (field === 'review.mode') {
+      if (field === 'review.mode' || field === 'worktreeRefreshBeforeCreate') {
         throw new LocalConfigValidationError(`Unsupported config update operation for ${field}`);
       }
       const [target, key] = resolvePath(raw, field);
@@ -375,7 +381,21 @@ function applyLocalConfigSet(raw: Record<string, unknown>, field: string, value:
 }
 
 function assertMutableConfigField(field: string): void {
-  if (field === 'permission.policyOwner' || field === 'permission.storageWriteVersion') return;
+  if (
+    field === 'permission.policyOwner' ||
+    field === 'permission.storageWriteVersion' ||
+    field === 'permission.dangerousCommandGateEnabled' ||
+    // The sandbox is a whole configuration tree, and most of it (deny lists,
+    // network policy, local access) has no safe single-field edit. Only the
+    // master switch and the filesystem level are user-facing, so they are
+    // named individually instead of opening the `sandbox` root: a root entry
+    // would also admit `sandbox.filesystem.denyWrite` and friends through the
+    // generic `put` operation.
+    field === 'sandbox.enabled' ||
+    field === 'sandbox.filesystem.policy.mode'
+  ) {
+    return;
+  }
   const parts = field.split('.');
   const [root, ...children] = parts;
   if (
@@ -411,9 +431,33 @@ function validateLocalConfigValue(field: string, value: unknown): unknown {
       `Invalid permission.storageWriteVersion "${String(value)}"`,
     );
   }
+  if (field === 'permission.dangerousCommandGateEnabled') {
+    if (typeof value === 'boolean') return value;
+    throw new LocalConfigValidationError(
+      `Invalid permission.dangerousCommandGateEnabled "${String(value)}"`,
+    );
+  }
+  if (field === 'sandbox.enabled') {
+    if (typeof value === 'boolean') return value;
+    throw new LocalConfigValidationError(`Invalid sandbox.enabled "${String(value)}"`);
+  }
+  // Persisting the level is enough for the sandbox service to pick it up on its
+  // next apply; the live backend is re-initialized by the sandbox service
+  // itself (`LocalSandboxService.applyConfig`), which the host routes its own
+  // sandbox writes through rather than through this generic updater.
+  if (field === 'sandbox.filesystem.policy.mode') {
+    if (typeof value === 'string' && LOCAL_SANDBOX_FILESYSTEM_MODES.has(value)) return value;
+    throw new LocalConfigValidationError(
+      `Invalid sandbox.filesystem.policy.mode "${String(value)}"`,
+    );
+  }
   if (field === 'permissionMode') {
     if (typeof value === 'string' && LOCAL_PERMISSION_MODES.has(value)) return value;
     throw new LocalConfigValidationError(`Invalid permissionMode "${String(value)}"`);
+  }
+  if (field === 'worktreeRefreshBeforeCreate') {
+    if (typeof value === 'boolean') return value;
+    throw new LocalConfigValidationError('Invalid worktreeRefreshBeforeCreate');
   }
   if (field === 'review.mode') {
     return validateReviewMode(value);

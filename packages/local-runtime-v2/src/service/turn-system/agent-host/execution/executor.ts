@@ -17,6 +17,7 @@ import {
 } from '@mavis/agent-core/pi-turn-runner';
 import { type RuntimeTool, type ToolExecutionContext } from '@mavis/agent-core/tools';
 import { prepareBashTurnTools } from '../assembly/local-turn-tool-catalog.js';
+import { createPluginAgentsRegistry } from '../assembly/plugin-agents-registry.js';
 import { buildCompletedTerminalStatusEvent } from '@mavis/agent-core/event-bridge';
 import {
   beginLocalPluginHookTurn,
@@ -49,6 +50,10 @@ import { AgentEventAssociationError } from '../local-agent-host.js';
 import { inputReviewRunnerOptions } from '../runner/policy/input-review-runner-options.js';
 import { createLocalCuScreenshotPruner } from '../runner/local-cu-screenshot-pruner.js';
 import { applyProcessLocalToolResultPolicy } from '../runner/policy/process-local-tool-result-policy.js';
+import {
+  checkpointBeforeLlmCallHook,
+  withCheckpointPolicy,
+} from './turn-checkpoint-policy.js';
 import type {
   LocalContextUsagePromptRange,
   LocalRuntimeTurnExecutorOptions,
@@ -60,9 +65,12 @@ import type {
 import {
   joinPrompt,
   joinUserPrompt,
+  isLightweightRootSession,
+  LIGHTWEIGHT_TOOL_CALL_FALLBACK,
   readPreparedContextUsagePromptRanges,
   readPreparedSystemPrompt,
   renderAgentRuntimeReminders,
+  resolveProviderContextMode,
 } from './prompt.js';
 import {
   createAgentHostPluginHookTranscript,
@@ -355,6 +363,9 @@ export class LocalRuntimeTurnExecutor<
             toolResolution: prepared.toolResolution,
             pendingToolResultTailClaims,
             hostBeforeLlmCallHooks: prepared.beforeLlmCallHooks,
+            ...(this.options.checkpointBarrier
+              ? { checkpointBarrier: this.options.checkpointBarrier }
+              : {}),
             readTaskOutputTaskIds,
             terminalTaskOutputReadIds,
             toolsDisabled: this.options.disableTools === true,
@@ -365,6 +376,9 @@ export class LocalRuntimeTurnExecutor<
           input.request.provenance.sourceContext?.executionDiagnostics === true,
         ),
         caller: prepared.caller,
+        ...(prepared.unexpectedToolCallFallback
+          ? { unexpectedToolCallFallback: prepared.unexpectedToolCallFallback }
+          : {}),
         getSteeringMessages: async (context) => {
           for (;;) {
             // Subscribe before draining so an append racing the wait cannot be missed.
@@ -470,6 +484,7 @@ export class LocalRuntimeTurnExecutor<
         : { maxSerializedInputBytes: maxRequestBodyBytes }),
     };
     const baseSystemPrompt = readPreparedSystemPrompt(input.preparation.agentConfig);
+    const lightweightMode = isLightweightRootSession(input.session);
     const preparedExecution = await this.options.executionPreparation.prepare({
       execution: input,
       eventWriter,
@@ -480,15 +495,28 @@ export class LocalRuntimeTurnExecutor<
       validateRoutedTurnTools(input.assembly.tools),
       this.options.cliProductPolicy === true,
     );
+    // SE-SW-002: every tool effect of the turn runs under the checkpoint
+    // barrier when one is composed — flush before the effect, one execution,
+    // interrupted calls recorded as unknown and never re-run implicitly.
+    const policyTools = withCheckpointPolicy(admittedTools, {
+      ...(this.options.checkpointBarrier ? { barrier: this.options.checkpointBarrier } : {}),
+      signal: input.lease.signal,
+      ...(this.options.checkpointAllowAfterUnknownOutcome
+        ? { allowAfterUnknownOutcome: true }
+        : {}),
+    });
     const canConsumeBackgroundBashOutput = admittedTools.some(
       (tool) =>
         tool.def.name === 'task_output' && (tool.source === undefined || tool.source === 'builtin'),
     );
-    const tools = prepareBashTurnTools(admittedTools, canConsumeBackgroundBashOutput);
+    const standardTools = prepareBashTurnTools(policyTools, canConsumeBackgroundBashOutput);
     const toolContext = {
       ...toolResolution.context,
       ...(input.pluginHooks?.length
         ? { pluginSubagentLifecycle: createPluginSubagentLifecycle(input) }
+        : {}),
+      ...(input.desktopCapabilities?.agents?.length
+        ? { pluginAgents: createPluginAgentsRegistry(input.desktopCapabilities) }
         : {}),
       // Use admitted tools, including frozen selectors and final routing. A
       // configured/MCP namesake cannot read the native background task store.
@@ -496,12 +524,24 @@ export class LocalRuntimeTurnExecutor<
       canConsumeBackgroundBashOutput,
     } as TContext;
     const caller = preparedExecution.caller;
-    const systemPrompt = joinPrompt(input.assembly.systemPromptPrefix, baseSystemPrompt);
-    const contextUsagePromptRanges = readPreparedContextUsagePromptRanges(
+    const standardSystemPrompt = joinPrompt(input.assembly.systemPromptPrefix, baseSystemPrompt);
+    const standardContextUsagePromptRanges = readPreparedContextUsagePromptRanges(
       input.preparation.agentConfig,
       input.assembly.systemPromptPrefix,
       baseSystemPrompt,
     );
+    const providerContext = resolveProviderContextMode(input.session, {
+      systemPrompt: standardSystemPrompt,
+      tools: standardTools,
+      ...(standardContextUsagePromptRanges === undefined
+        ? {}
+        : { contextUsagePromptRanges: standardContextUsagePromptRanges }),
+    });
+    const {
+      systemPrompt,
+      tools,
+      contextUsagePromptRanges,
+    } = providerContext;
     input.onContextUsagePromptRangesResolved?.(contextUsagePromptRanges);
     const userPromptPrefix = joinUserPrompt(
       input.assembly.userPromptPrefix,
@@ -589,6 +629,11 @@ export class LocalRuntimeTurnExecutor<
       toolContext,
       beforeLlmCallHooks,
       caller,
+      ...(lightweightMode
+        ? {
+            unexpectedToolCallFallback: LIGHTWEIGHT_TOOL_CALL_FALLBACK,
+          }
+        : {}),
       ...(contextUsagePromptRanges !== undefined
         ? {
             contextUsagePromptRanges,
@@ -780,6 +825,7 @@ interface PreparedRunnerInput<TContext extends ToolExecutionContext> {
   readonly toolContext: TContext;
   readonly beforeLlmCallHooks: readonly PiBeforeLlmCallHook[];
   readonly caller: RunTurnCaller;
+  readonly unexpectedToolCallFallback?: string;
   readonly contextUsagePromptRanges?: readonly LocalContextUsagePromptRange[];
   readonly contextUsageRequiresProviderAnchor?: boolean;
   readonly readTaskOutputTaskIds: Set<string>;
@@ -825,6 +871,7 @@ function mergeHooks<TAgent extends AgentExecutionSnapshot, TContext extends Tool
     toolResolution,
     pendingToolResultTailClaims,
     hostBeforeLlmCallHooks,
+    checkpointBarrier,
     readTaskOutputTaskIds,
     terminalTaskOutputReadIds,
     toolsDisabled,
@@ -846,7 +893,11 @@ function mergeHooks<TAgent extends AgentExecutionSnapshot, TContext extends Tool
   return {
     ...input.assembly.hooks,
     ...toolHooks,
+    // SE-SW-002: first position, so durability is confirmed before any other
+    // before-LLM decision and the provider request is never issued on a
+    // barrier failure.
     beforeLlmCallHook: [
+      ...(checkpointBarrier ? [checkpointBeforeLlmCallHook(checkpointBarrier)] : []),
       ...(input.assembly.hooks.beforeLlmCallHook ?? []),
       ...hostBeforeLlmCallHooks,
     ],

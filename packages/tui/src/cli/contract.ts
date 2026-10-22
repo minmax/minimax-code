@@ -1,10 +1,21 @@
 import { InvalidArgumentError, Option, type Command } from 'commander';
+import { assertValidProfileName } from '@mavis/config';
 import { parseHeadlessModelOverride } from '../headless/model-selection.js';
 import type { TuiMode } from '../tui/engine/public.js';
 import { parseTuiStartupEnvironment } from './environment.js';
 import type { TuiBuildEnvironment } from '../auth/environment.js';
+import type { McodeContextMode } from '@mavis/protocol/local';
+import {
+  applySystemPromptCliOptions,
+  resolveSystemPromptOverrides,
+  type RawSystemPromptOptions,
+  type SystemPromptOverrides,
+} from './system-prompt-options.js';
 
 const RETIRED_TOP_LEVEL_COMMAND_NAMES = new Set(['git', 'changes', 'projects']);
+
+const PROFILE_OPTION_DESCRIPTION =
+  'use a named profile with its own account, sessions, and settings';
 
 export interface TuiInteractiveLaunchRequest {
   readonly initialPrompt?: string;
@@ -15,17 +26,38 @@ export interface TuiInteractiveLaunchRequest {
   readonly workspaceDir?: string;
   readonly resumeDraftAfterLogin?: boolean;
   readonly tuiMode?: TuiMode;
+  readonly contextMode?: McodeContextMode;
   readonly lane?: string;
+  readonly systemPromptOverrides?: SystemPromptOverrides;
 }
 
-export interface RawTuiInteractiveOptions {
+export interface RawTuiInteractiveOptions extends RawSystemPromptOptions {
   readonly model?: string;
   readonly session?: string | boolean;
   readonly continue?: boolean;
   readonly resume?: string;
   readonly tuiMode?: TuiMode;
+  readonly mode?: string;
   readonly lane?: string;
+  readonly profile?: string;
   readonly env?: TuiBuildEnvironment;
+}
+
+/**
+ * Add `--profile <name>` to a command.
+ *
+ * Commander does not inherit parent options, and the root program runs with
+ * `enablePositionalOptions()`, so every subcommand needs its own copy for
+ * `mcode exec --profile work` to parse. The value is validated here rather than
+ * at use time: a profile name becomes a home-directory segment, so rejecting
+ * `../../etc` before any action runs is a security boundary, not input tidying.
+ */
+export function applyProfileCliOption(command: Command): Command {
+  return command.addOption(createProfileOption());
+}
+
+function createProfileOption(): Option {
+  return new Option('--profile <name>', PROFILE_OPTION_DESCRIPTION).argParser(parseProfileOption);
 }
 
 export function applyInteractiveCliContract(
@@ -36,6 +68,7 @@ export function applyInteractiveCliContract(
     .argument('[prompt]', 'task to execute in the interactive TUI')
     .addOption(new Option('-m, --model <provider/model>', 'select the model for this Session only'))
     .addOption(new Option('--lane <lane>', 'managed backend lane for test or staging builds'))
+    .addOption(createProfileOption())
     .addOption(
       new Option('--session [id]', 'open a Session by id, or browse Sessions when id is omitted'),
     )
@@ -45,9 +78,13 @@ export function applyInteractiveCliContract(
         parseTuiMode,
       ),
     )
-    .addOption(new Option('--resume <id>').hideHelp())
-    .allowExcessArguments(false)
-    .showHelpAfterError();
+    .addOption(
+      new Option('--mode <mode>', 'Context mode: standard (default) or lightweight').argParser(
+        parseContextMode,
+      ),
+    )
+    .addOption(new Option('--resume <id>').hideHelp());
+  applySystemPromptCliOptions(configured).allowExcessArguments(false).showHelpAfterError();
   if (options.allowStartupEnvironmentSelection) {
     configured.addOption(
       new Option(
@@ -78,6 +115,12 @@ export function resolveInteractiveLaunchRequest(
   if (requestedModes > 1) {
     throw new Error('--session, --continue, and --resume cannot be combined');
   }
+  if (
+    commandOptions.mode === 'lightweight' &&
+    (explicitSessionId || compatibilitySessionId || showSessionPicker || commandOptions.continue)
+  ) {
+    throw new Error('--mode lightweight requires a new Session');
+  }
   const sessionId = explicitSessionId || compatibilitySessionId;
   const model = commandOptions.model?.trim();
   if (commandOptions.model !== undefined) {
@@ -88,6 +131,7 @@ export function resolveInteractiveLaunchRequest(
       );
     }
   }
+  const systemPromptOverrides = resolveSystemPromptOverrides(commandOptions);
   return {
     ...(prompt ? { initialPrompt: prompt } : {}),
     ...(model ? { model } : {}),
@@ -95,12 +139,14 @@ export function resolveInteractiveLaunchRequest(
     ...(showSessionPicker ? { showSessionPicker: true } : {}),
     ...(commandOptions.continue ? { continueLatestSession: true } : {}),
     ...(commandOptions.tuiMode ? { tuiMode: commandOptions.tuiMode } : {}),
+    ...(commandOptions.mode === 'lightweight' ? { contextMode: 'lightweight' as const } : {}),
     ...(commandOptions.lane ? { lane: commandOptions.lane } : {}),
+    ...(systemPromptOverrides ? { systemPromptOverrides } : {}),
   };
 }
 
 export function applyExecCliContract(command: Command): Command {
-  return command
+  const configured = command
     .argument('[prompt]', 'task to execute')
     .addOption(new Option('--input <source>', 'read explicit input; only "-" is supported'))
     .addOption(new Option('--input-format <format>', 'input format: text or json').default('text'))
@@ -112,6 +158,11 @@ export function applyExecCliContract(command: Command): Command {
     )
     .addOption(new Option('--model <provider/model>', 'override the model for this Run only'))
     .addOption(new Option('--effort <level>', 'override the reasoning effort for this Run only'))
+    .addOption(
+      new Option('--mode <mode>', 'Context mode: standard (default) or lightweight').argParser(
+        parseContextMode,
+      ),
+    )
     .addOption(
       new Option('--prompt-mode <mode>', 'Prompt mode: tui, coding, or work')
         .choices(['tui', 'coding', 'work'])
@@ -146,10 +197,11 @@ export function applyExecCliContract(command: Command): Command {
     .addOption(
       new Option('-o, --output-last-message <path>', 'write the final agent message to a file'),
     );
+  return applySystemPromptCliOptions(configured);
 }
 
 export function applyExecReviewCliContract(command: Command): Command {
-  return command
+  const configured = command
     .addOption(new Option('--cwd <path>', 'workspace directory'))
     .addOption(new Option('--model <provider/model>', 'override the model for this Run only'))
     .addOption(new Option('--effort <level>', 'override the reasoning effort for this Run only'))
@@ -167,9 +219,8 @@ export function applyExecReviewCliContract(command: Command): Command {
     .addOption(new Option('--output-format <format>', 'output format: text, json, or stream-json'))
     .addOption(
       new Option('-o, --output-last-message <path>', 'write the final review result to a file'),
-    )
-    .allowExcessArguments(false)
-    .showHelpAfterError();
+    );
+  return applySystemPromptCliOptions(configured).allowExcessArguments(false).showHelpAfterError();
 }
 
 function parseTuiMode(value: string): TuiMode {
@@ -177,9 +228,22 @@ function parseTuiMode(value: string): TuiMode {
   throw new InvalidArgumentError('TUI mode must be regular or fullscreen');
 }
 
+function parseContextMode(value: string): McodeContextMode {
+  if (value === 'standard' || value === 'lightweight') return value;
+  throw new InvalidArgumentError('mode must be standard or lightweight');
+}
+
 function parseStartupEnvironmentOption(value: string): TuiBuildEnvironment {
   try {
     return parseTuiStartupEnvironment(value);
+  } catch (error) {
+    throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function parseProfileOption(value: string): string {
+  try {
+    return assertValidProfileName(value);
   } catch (error) {
     throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
   }

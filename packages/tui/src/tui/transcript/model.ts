@@ -140,8 +140,6 @@ export interface TranscriptInspectionReport {
 
 export interface TranscriptCell {
   id: string;
-  /** Retained output identity when an optimistic cell is admitted under a new store id. */
-  scrollbackId?: string;
   kind: TranscriptCellKind;
   status: TranscriptCellStatus;
   content: string;
@@ -151,6 +149,8 @@ export interface TranscriptCell {
   updatedAtMs: number;
   ephemeral?: boolean;
   turnId?: string;
+  /** Requesting Turn, distinct from the Turn that consumes the user's reply. */
+  questionnaireRequester?: { readonly sessionId: string; readonly turnId: string };
   sourceMessageId?: string;
   title?: string;
   detail?: string;
@@ -178,8 +178,6 @@ export interface TranscriptToolPayloadBudget {
 
 export interface CreateTranscriptCellInput {
   id: string;
-  /** Retained output identity when an optimistic cell is admitted under a new store id. */
-  scrollbackId?: string;
   kind: TranscriptCellKind;
   status: TranscriptCellStatus;
   content: string;

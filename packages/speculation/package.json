@@ -1,0 +1,25 @@
+{
+	"name": "@mavis/speculation",
+	"version": "0.1.0",
+	"description": "Speculative pipeline skeleton (F5 groundwork): tool classification into speculatable-read-only/effectful/interactive, ask-preserving permission pre-decisions, a bounded speculation budget (parallel calls, tokens, steering-change cancellation) and speculated/confirmed/wasted metrics. No speculative execution ships in this package yet.",
+	"type": "module",
+	"types": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"development": "./src/index.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run --config vitest.config.ts"
+	},
+	"devDependencies": {
+		"@types/node": "^20",
+		"typescript": "^5",
+		"vitest": "^2"
+	},
+	"private": true,
+	"license": "MIT"
+}

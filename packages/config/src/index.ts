@@ -29,9 +29,9 @@ export {
   isManagedRuntime,
   getRuntimePresetKey,
   DEFAULT_MODEL_PRESETS,
-  MINIMAX_API_MODEL_CATALOG,
   isProposalEligibleAgent,
 } from './config.js';
+export { minimaxApiModels } from './byok-config.js';
 export {
   GOAL_CONFIG_DEFAULTS,
   GOAL_CONFIG_LIMITS,
@@ -78,6 +78,36 @@ export {
   resolveDataDir,
 } from './data-dir.js';
 export type { DataDirMigrationLogger, ResolveDataDirOptions } from './data-dir.js';
+export {
+  DEFAULT_PROFILE_NAME,
+  InvalidProfileNameError,
+  LEGACY_PROFILE_ENV_VAR,
+  PROFILE_ENV_VAR,
+  assertValidProfileName,
+  isValidProfileName,
+  listProfiles,
+  normalizeProfileSelector,
+  readProfileEnv,
+  resolveProfileDataDirPaths,
+} from './auth-profile.js';
+export type { DataDirProfilePaths, DiscoveredProfile } from './auth-profile.js';
+export {
+  DEFAULT_SESSIONS_GENERATION,
+  DURABLE_CAS_DIR_BASENAME,
+  DURABLE_ROOT_BASENAME,
+  DURABLE_RUNTIME_DB_BASENAME,
+  DURABLE_SESSIONS_DB_BASENAME,
+  DURABLE_SOCKET_BASENAME,
+  LEGACY_ROOT,
+  LegacyWriteError,
+  assertNoLegacyWrite,
+  ensureDurableLayout,
+  resolveCasDirPath,
+  resolveDurableRoot,
+  resolveMcodedSocketPath,
+  resolveRuntimeDbPath,
+  resolveSessionsDbPath,
+} from './durable-paths.js';
 export {
   isLegacyManagedMinimaxProvider,
   isManagedProviderBaseUrl,
@@ -160,10 +190,12 @@ export {
 } from './sandbox-config.js';
 export type {
   SandboxConfig,
+  SandboxFilesystemMode,
   SandboxFilesystemPolicy,
   SandboxLocalAccess,
   SandboxNetworkPolicy,
 } from './sandbox-config.js';
+export { SANDBOX_FILESYSTEM_MODE_NAMES } from './sandbox-settings.js';
 export {
   AGENT_BUILTIN_MCP_TOOL_IDS,
   AGENT_BUILTIN_SKILL_IDS,

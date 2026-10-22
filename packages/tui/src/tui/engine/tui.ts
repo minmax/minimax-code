@@ -19,23 +19,6 @@ import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth
 /**
  * Component interface - all components must implement this
  */
-export interface ScrollbackLayout {
-	/**
-	 * Stable row identities in the last rendered document (never inferred from text).
-	 * With blocks supplied, anchors without blockId identify prelude rows only;
-	 * they cannot establish continuity when every transcript block is replaced.
-	 */
-	readonly anchors: readonly { readonly id: string; readonly row: number; readonly blockId?: string }[];
-	/** Source blocks still present, including blocks whose current view has no rows. */
-	readonly blocks?: ReadonlySet<string>;
-	/** Test current source membership to distinguish projection eviction from deletion. */
-	containsBlock?(id: string): boolean;
-	/** First footer row. Rows before this belong to the transcript. */
-	readonly bodyEnd: number;
-	/** Layout-owned leading spaces, excluded when matching emitted row content. */
-	readonly horizontalPadding?: number;
-}
-
 export interface Component {
 	/**
 	 * Render the component to lines for the given viewport width
@@ -47,13 +30,18 @@ export interface Component {
 	/**
 	 * Opt into preserving native scrolling when only background content shrinks.
 	 * Return a key for the last rendered transient layout (menus, editor, banners).
-	 * Anchored document layouts additionally preserve their emitted history across
-	 * transient changes; unclassified layouts require an unchanged historical prefix.
+	 * A changed or missing key restores exposed document rows instead of padding.
 	 */
 	getViewportLayoutKey?(): string | undefined;
 
-	/** Opt into immutable native history with an editable, anchored viewport. */
-	getScrollbackLayout?(): ScrollbackLayout | undefined;
+	/**
+	 * Regular mode only: report and reset how many leading rows the component dropped
+	 * since the renderer last asked. Each dropped row must equal the leading row of the
+	 * previous output and already be in native scrollback. The renderer rebases its state
+	 * instead of rewriting history, which bounds the retained document. If the remaining
+	 * history does not line up, its ordinary history comparison reconstructs the session.
+	 */
+	takeDiscardedRows?(): number;
 
 	/**
 	 * Optional handler for keyboard input when component has focus
@@ -367,8 +355,6 @@ export abstract class TuiBase extends Container implements TUI {
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	public onDebug?: () => void;
-	/** Observes physical geometry even when rendering is deferred by output backpressure. */
-	public onResize?: (columns: number, rows: number) => void;
 	private renderRequested = false;
 	private hasRenderedFrame = false;
 	private outputDrainPending = false;
@@ -412,6 +398,13 @@ export abstract class TuiBase extends Container implements TUI {
 		this.requestRender();
 	}
 
+	/**
+	 * Called for input the host terminal attributes to the user (keys and paste).
+	 * Terminal reports such as focus, size and mode replies are excluded. Hosts
+	 * normally scroll their viewport back to the bottom on such input (L047).
+	 */
+	protected onUserInput(): void {}
+
 	protected beforeTerminalStart(): void {}
 
 	protected afterTerminalStart(): void {}
@@ -424,11 +417,6 @@ export abstract class TuiBase extends Container implements TUI {
 		return this.fullRedrawCount;
 	}
 
-	/** Notify renderers when a control path hides the physical cursor. */
-	protected hideHardwareCursor(): void {
-		this.terminal.hideCursor();
-	}
-
 	getShowHardwareCursor(): boolean {
 		return this.showHardwareCursor;
 	}
@@ -437,7 +425,7 @@ export abstract class TuiBase extends Container implements TUI {
 		if (this.showHardwareCursor === enabled) return;
 		this.showHardwareCursor = enabled;
 		if (!enabled) {
-			this.hideHardwareCursor();
+			this.terminal.hideCursor();
 		}
 		this.requestRender();
 	}
@@ -603,7 +591,7 @@ export abstract class TuiBase extends Container implements TUI {
 		if (!options?.nonCapturing && this.isOverlayVisible(entry)) {
 			this.setFocus(component);
 		}
-		this.hideHardwareCursor();
+		this.terminal.hideCursor();
 		this.requestRender();
 
 		// Return handle for controlling this overlay
@@ -619,7 +607,7 @@ export abstract class TuiBase extends Container implements TUI {
 						const topVisible = this.getTopmostVisibleOverlay();
 						this.setFocus(topVisible?.component ?? entry.preFocus);
 					}
-					if (this.overlayStack.length === 0) this.hideHardwareCursor();
+					if (this.overlayStack.length === 0) this.terminal.hideCursor();
 					this.requestRender();
 				}
 			},
@@ -697,7 +685,7 @@ export abstract class TuiBase extends Container implements TUI {
 			const topVisible = this.getTopmostVisibleOverlay();
 			this.setFocus(topVisible?.component ?? overlay.preFocus);
 		}
-		if (this.overlayStack.length === 0) this.hideHardwareCursor();
+		if (this.overlayStack.length === 0) this.terminal.hideCursor();
 		this.requestRender();
 	}
 
@@ -742,13 +730,10 @@ export abstract class TuiBase extends Container implements TUI {
 		this.beforeTerminalStart();
 		this.terminal.start(
 			(data) => this.handleTerminalInput(data),
-			() => {
-				this.onResize?.(this.terminal.columns, this.terminal.rows);
-				this.onTerminalResize();
-			},
+			() => this.onTerminalResize(),
 		);
 		this.afterTerminalStart();
-		this.hideHardwareCursor();
+		this.terminal.hideCursor();
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031h");
 		}
@@ -899,6 +884,7 @@ export abstract class TuiBase extends Container implements TUI {
 			return;
 		}
 		data = remaining;
+		if (containsUserInput(data)) this.onUserInput();
 
 		if (this.inputListeners.size > 0) {
 			let current = data;
@@ -1344,4 +1330,76 @@ export abstract class TuiBase extends Container implements TUI {
 			this.terminal.write("\x1b[?996n");
 		});
 	}
+}
+
+/**
+ * Whether a chunk contains input the user typed or pasted (L047). The chunk is
+ * split into control sequences so a key that shares a chunk with terminal
+ * reports still counts, while chunks made only of reports, key releases or
+ * mouse reports do not; hosts do not scroll to the bottom for those.
+ */
+function containsUserInput(data: string): boolean {
+	let index = 0;
+	while (index < data.length) {
+		// Printable text and C0 control keys (Enter, Tab, Ctrl+letter) are user input.
+		if (data[index] !== "\x1b") return true;
+		const end = escapeSequenceEnd(data, index);
+		const sequence = data.slice(index, end);
+		if (!isTerminalReport(sequence) && !isKeyRelease(sequence)) return true;
+		index = end;
+	}
+	return false;
+}
+
+/** End index of the escape sequence starting at `start`; an unterminated sequence runs to the end. */
+function escapeSequenceEnd(data: string, start: number): number {
+	const introducer = data[start + 1];
+	// A lone or doubled ESC is the Escape key.
+	if (introducer === undefined || introducer === "\x1b") return start + 1;
+	if (introducer === "[") {
+		let index = start + 2;
+		while (index < data.length && isInRange(data, index, 0x30, 0x3f)) index++;
+		while (index < data.length && isInRange(data, index, 0x20, 0x2f)) index++;
+		return index < data.length && isInRange(data, index, 0x40, 0x7e) ? index + 1 : data.length;
+	}
+	if (introducer === "]" || introducer === "P" || introducer === "_" || introducer === "^" || introducer === "X") {
+		for (let index = start + 2; index < data.length; index++) {
+			if (introducer === "]" && data[index] === "\x07") return index + 1;
+			if (data[index] === "\x1b" && data[index + 1] === "\\") return index + 2;
+		}
+		return data.length;
+	}
+	if (introducer === "O") return Math.min(start + 3, data.length);
+	// Alt+key.
+	return start + 2;
+}
+
+function isInRange(data: string, index: number, low: number, high: number): boolean {
+	const code = data.charCodeAt(index);
+	return code >= low && code <= high;
+}
+
+/** Replies and reports a terminal sends on its own or in answer to a query. */
+function isTerminalReport(sequence: string): boolean {
+	const introducer = sequence[1];
+	// OSC, DCS, APC, PM and SOS strings are terminal replies, never keys.
+	if (introducer === "]" || introducer === "P" || introducer === "_" || introducer === "^" || introducer === "X") return true;
+	const csi = /^\x1b\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e])$/.exec(sequence);
+	if (!csi) return false;
+	const [, params = "", intermediates = "", final] = csi;
+	// Focus in/out.
+	if ((final === "I" || final === "O") && params === "" && intermediates === "") return true;
+	// Window size and state reports.
+	if (final === "t" && /^\d+(?:;\d+)*$/.test(params)) return true;
+	// Cursor position reports (CPR and DECXCPR).
+	if (final === "R" && /^\??\d+;\d+(?:;\d+)?$/.test(params)) return true;
+	// Device attributes, device status and kitty keyboard flag replies.
+	if (final === "c" && /^[?>=]/.test(params)) return true;
+	if (final === "n") return true;
+	if (final === "u" && params.startsWith("?")) return true;
+	// Mode reports (DECRPM).
+	if (final === "y" && intermediates === "$") return true;
+	// SGR mouse reports.
+	if ((final === "M" || final === "m") && params.startsWith("<")) return true;
+	return false;
 }

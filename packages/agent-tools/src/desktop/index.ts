@@ -1,6 +1,7 @@
 import { toRuntimeTool } from '@mavis/agent-core/tools';
 import type { BashEnvPolicy } from '@mavis/agent-core/bash-subprocess-env';
 
+import type { ToolOutputSpill } from '../truncation/spill.js';
 import { LocalAskUserTool } from './local-ask-user.js';
 import { LocalFeatureEnableTool } from './local-feature-enable.js';
 import { LocalBashTool, LocalEditTool, LocalReadTool, LocalWriteTool } from './local-pi-tools.js';
@@ -81,6 +82,7 @@ export * from './matrix-tools.js';
 export * from './types.js';
 export * from './subagent-roles.js';
 export * from '../shared/web-search.js';
+export * from '../truncation/index.js';
 export {
   DEFAULT_BROAD_FILE_EXCLUDES,
   DEFAULT_SCAN_DIRECTORY_NAMES,
@@ -117,6 +119,12 @@ export interface LocalToolRegistryDeps {
   mavisCronAdapter?: LocalMavisCronAdapter;
   mavisMcpAdapter?: LocalMavisMcpAdapter;
   mavisSessionAdapter?: LocalMavisSessionAdapter;
+  /**
+   * Optional full-output spill hook for truncated tool results (bash complete
+   * output, oversized skill content). The CAS-backed implementation arrives
+   * separately; without it tools keep their local persistence fallback.
+   */
+  toolOutputSpill?: ToolOutputSpill;
 }
 
 export function buildLocalToolRegistry(deps: LocalToolRegistryDeps): Map<string, LocalRuntimeTool> {
@@ -131,6 +139,7 @@ export function buildLocalToolRegistry(deps: LocalToolRegistryDeps): Map<string,
         deps.bashEnvPolicy,
         deps.hostTrashRuntime,
         deps.sandboxOperationsFactory,
+        deps.toolOutputSpill,
       ),
     ),
     toRuntimeTool(new LocalGrepTool(deps.workspaceRoot)),
@@ -138,7 +147,7 @@ export function buildLocalToolRegistry(deps: LocalToolRegistryDeps): Map<string,
     toRuntimeTool(new LocalTodoWriteTool(deps.todoEventSink)),
   ];
   if (deps.skillReader) {
-    tools.push(toRuntimeTool(new LocalSkillTool(deps.skillReader)));
+    tools.push(toRuntimeTool(new LocalSkillTool(deps.skillReader, deps.toolOutputSpill)));
   }
   if (deps.memoryAdapter) {
     tools.push(toRuntimeTool(new LocalMemoryTool(deps.memoryAdapter)));

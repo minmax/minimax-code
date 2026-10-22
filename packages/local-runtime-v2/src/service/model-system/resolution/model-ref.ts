@@ -1,5 +1,6 @@
 import { isDefaultThinkingModelId, type Api, type ThinkingLevelMap } from '@earendil-works/pi-ai';
 import type { ThinkingLevel as PiThinkingLevel } from '@earendil-works/pi-agent-core';
+import { normalizeMaxImagesPerRequest } from '@mavis/agent-core/pi-turn-runner';
 import {
   ThinkingLevel,
   ThinkingMode,
@@ -374,7 +375,12 @@ export function resolveMiniMaxM3ThinkingProtocol(
   if (api === 'openai-responses') {
     return { reasoning: { effort: mode === 'on' ? 'minimal' : 'none' } };
   }
-  return { thinking: { type: mode === 'on' ? 'adaptive' : 'disabled' } };
+  return {
+    // Remove the internal on/off value serialized by Pi as a generic effort.
+    ...(api === 'openai-completions' ? { reasoning_effort: undefined } : {}),
+    ...(api === 'anthropic-messages' ? { output_config: { effort: undefined } } : {}),
+    thinking: { type: mode === 'on' ? 'adaptive' : 'disabled' },
+  };
 }
 
 export function resolveModelThinkingMiddleEffort(
@@ -444,6 +450,8 @@ export function resolveModelThinkingProtocol(
   value: unknown,
   modelId?: unknown,
 ): ModelThinkingProtocolConfig | undefined {
+  // Pi owns Google's model-specific thinking parameters.
+  if (api === 'google-generative-ai') return undefined;
   const effort = normalizeModelThinkingEffort(value);
   if (!effort) return undefined;
 
@@ -495,6 +503,7 @@ export function capabilitiesFromModelConfig(
       modalities.includes('video') || modelConfig?.capabilities?.support_video === true,
     ...normalizeLocalFileApiCapabilities(modelConfig?.capabilities),
     ...normalizeLocalMultimodalLimitCapabilities(modelConfig?.capabilities),
+    ...maxImagesPerRequestCapability(modelConfig?.capabilities?.max_images_per_request),
     ...(modelConfig?.capabilities?.support_json_object_output === true
       ? { [SUPPORT_JSON_OBJECT_OUTPUT_CAPABILITY]: true }
       : {}),
@@ -507,6 +516,14 @@ export function capabilitiesFromModelConfig(
     Reflect.set(capabilities, OPENPLATFORM_THINKING_VARIANTS_CAPABILITY, variants);
   }
   return capabilities;
+}
+
+/** Per-request image ceiling (#425); absent unless the model config declares a positive integer. */
+function maxImagesPerRequestCapability(
+  value: unknown,
+): Pick<LocalModelRefCapabilities, 'max_images_per_request'> {
+  const maxImages = normalizeMaxImagesPerRequest(value);
+  return maxImages === undefined ? {} : { max_images_per_request: maxImages };
 }
 
 export function supportsJsonObjectOutput(modelRef: IModelRef): boolean {

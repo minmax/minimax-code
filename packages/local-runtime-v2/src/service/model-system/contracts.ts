@@ -86,6 +86,7 @@ export interface LocalProviderConfig {
   api?: string;
   options?: LocalProviderOptions;
   models?: Record<string, LocalModelConfig>;
+  catalogModels?: Record<string, LocalModelConfig>;
   model_order?: string[];
 }
 
@@ -133,6 +134,8 @@ export interface LocalConversationRuntimeConfig extends LocalRuntimeConfig {
   readonly runawayGuard?: Config['runawayGuard'];
   /** ToolResult compaction values resolved from config.yaml. */
   readonly toolResultCompaction?: Config['toolResultCompaction'];
+  /** Context management values resolved from config.yaml. */
+  readonly contextManagement?: Partial<Config['contextManagement']>;
   /**
    * Widened past `Config['agents']`: the v2 Agent cutover also threads
    * already-resolved capabilities through this read model, and `default` is
@@ -242,7 +245,7 @@ export interface LocalResolvedModelConfig extends LLMModelConfig {
   readonly thinkingRequestPatch?: Readonly<Record<string, unknown>>;
   /** True only for the platform-owned Token Plan / Credits inference path. */
   readonly managedProvider?: boolean;
-  /** Selected Model byte authority for Local Serialized Footprint admission; not wire-exact. */
+  /** Client byte budget for compaction estimates and final transformed JSON payload admission. */
   readonly maxRequestBodyBytes?: number;
   /** Managed-login File API transport identity; absent for every BYOK route. */
   readonly fileApiGatewayAuth?: {

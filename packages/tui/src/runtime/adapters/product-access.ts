@@ -1,8 +1,13 @@
 import { isLegacyManagedMinimaxProvider } from "@mavis/config";
 import {
+  normalizeDangerousCommandGateEnabled,
   normalizeTuiPermissionMode,
   type TuiPermissionMode,
 } from "../../application/permission-mode.js";
+import {
+  normalizeTuiSandboxFilesystemMode,
+  type TuiSandboxFilesystemMode,
+} from "../../application/sandbox-mode.js";
 import type {
   TuiAccountStatus,
   TuiAccountStatusOptions,
@@ -86,6 +91,54 @@ export class TuiProductAccess {
         await this.context
           .service("config.permission.write")
           .setPermissionMode({ mode }),
+      ) ?? mode
+    );
+  }
+
+  /**
+   * The runtime owns this setting, not the TUI: an `undefined` read means the
+   * host does not expose it, and the UI reports that instead of implying the
+   * guard is on or off.
+   */
+  async getDangerousCommandGateEnabled(): Promise<boolean | undefined> {
+    return normalizeDangerousCommandGateEnabled(
+      await this.context
+        .service("config.permission.read")
+        .getDangerousCommandGateEnabled(),
+    );
+  }
+
+  async setDangerousCommandGateEnabled(enabled: boolean): Promise<boolean> {
+    return (
+      normalizeDangerousCommandGateEnabled(
+        await this.context
+          .service("config.permission.write")
+          .setDangerousCommandGateEnabled({ enabled }),
+      ) ?? enabled
+    );
+  }
+
+  /**
+   * The runtime owns the sandbox level, not the TUI: an `undefined` read means
+   * the host runs no sandbox, and the UI reports that instead of implying a
+   * filesystem policy that is not being enforced.
+   */
+  async getSandboxFilesystemMode(): Promise<TuiSandboxFilesystemMode | undefined> {
+    return normalizeTuiSandboxFilesystemMode(
+      await this.context
+        .service("config.permission.read")
+        .getSandboxFilesystemMode(),
+    );
+  }
+
+  async setSandboxFilesystemMode(
+    mode: TuiSandboxFilesystemMode,
+  ): Promise<TuiSandboxFilesystemMode> {
+    return (
+      normalizeTuiSandboxFilesystemMode(
+        await this.context
+          .service("config.permission.write")
+          .setSandboxFilesystemMode({ mode }),
       ) ?? mode
     );
   }

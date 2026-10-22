@@ -53,6 +53,8 @@ import type {
   SessionLlmCallReportCapability,
   SessionRecord,
 } from "../../../session-system/index.js";
+import { repairCanonicalHistory } from "../../../session-system/messages/history/canonical-history-recovery.js";
+import type { CanonicalHistoryEnvelope } from "../../../session-system/sessions/representation/canonical-history-contract.js";
 import { ContextUsageAnchorState } from "../../compaction/execution/usage-anchor.js";
 import { createTurnController } from "../../execution/turn-controller/turn.controller.js";
 import { createBackgroundCadenceReminder } from "../../execution/reminder/background-cadence-reminder.js";
@@ -62,8 +64,10 @@ import type {
   AgentHostFileChangeObservation,
   LocalTurnExecutionInput,
 } from "../runner/contracts.js";
+import { createExecutionBudgetReminder } from "../runner/execution-budget-reminder.js";
 import type { AgentEventDelivery } from "../events/contracts.js";
 import type { CanonicalHistoryStore } from "../history/contracts.js";
+import { copyCanonicalHistoryForPiCompatibility } from "../history/canonical-history-validation.js";
 import { AgentHostCommittedHistoryWriter } from "../history/committed-history-writer.js";
 import {
   AgentTerminalConfirmationError,
@@ -77,9 +81,17 @@ import {
   type LocalRuntimeTurnRunnerInput,
   type LocalRuntimeTurnRunnerResult,
 } from "./executor.js";
+import { turnCheckpointBarrier } from "./turn-checkpoint-policy.js";
+import type { StorageWorker } from "@mavis/storage-worker";
 import { localPluginHookCoordinator } from "../assembly/local-turn-plugin-hooks.js";
 import { NativeLocalTurnExecutionPreparationSource } from "../assembly/local-turn-execution-preparation.js";
 import { LocalTurnInputPreparer } from "../assembly/local-turn-input-preparation.js";
+import { LIGHTWEIGHT_SESSION_PURPOSE } from "@mavis/protocol/local";
+import {
+  LIGHTWEIGHT_SYSTEM_PROMPT,
+  LIGHTWEIGHT_TOOL_CALL_FALLBACK,
+  resolveProviderContextMode,
+} from "./prompt.js";
 
 interface LocalToolContext extends ToolExecutionContext {
   readonly permissionScope?: string;
@@ -1129,6 +1141,132 @@ describe("LocalRuntimeTurnExecutor Bash output capability", () => {
 });
 
 describe("LocalRuntimeTurnExecutor", () => {
+  it("keeps the standard provider context byte-for-byte and trims only explicit lightweight roots", async () => {
+    const tool = {
+      def: {
+        name: "fixture_tool",
+        description: "Fixture tool",
+        schema: { type: "object", properties: { value: { type: "string" } } },
+      },
+      impl: { execute: vi.fn() },
+    } as never;
+    const captures: LocalRuntimeTurnRunnerInput<LocalToolContext>[] = [];
+    const runner = new LocalRuntimeTurnExecutor(
+      options(async (runInput) => {
+        captures.push(runInput);
+        await runInput.eventWriter.pushRuntime(terminalEvent(RuntimeEventStatus.COMPLETED));
+      }),
+    );
+    const base = executionInput({
+      assembly: { ...assembly(), tools: [tool] },
+    });
+    const standardFixture =
+      '{"systemPrompt":"extension system\\n\\nbase system","tools":[{"name":"fixture_tool","description":"Fixture tool","schema":{"type":"object","properties":{"value":{"type":"string"}}}}]}';
+
+    await runner.execute(base);
+    const standard = captures.at(-1)!;
+    expect(
+      JSON.stringify({
+        systemPrompt: standard.systemPrompt,
+        tools: standard.tools?.map(({ def }) => ({
+          name: def.name,
+          description: def.description,
+          schema: def.schema,
+        })),
+      }),
+    ).toBe(standardFixture);
+    expect(standard.unexpectedToolCallFallback).toBeUndefined();
+
+    await runner.execute(
+      executionInput({
+        assembly: { ...assembly(), tools: [tool] },
+        session: {
+          ...base.session,
+          purpose: LIGHTWEIGHT_SESSION_PURPOSE,
+        },
+      }),
+    );
+    const lightweight = captures.at(-1)!;
+    expect(lightweight.systemPrompt).toBe(LIGHTWEIGHT_SYSTEM_PROMPT);
+    expect(lightweight.tools).toEqual([]);
+    expect(lightweight.contextUsagePromptRanges).toBeUndefined();
+    expect(lightweight.unexpectedToolCallFallback).toBe(LIGHTWEIGHT_TOOL_CALL_FALLBACK);
+  });
+
+  it("does not propagate lightweight mode to task or branch child Sessions", async () => {
+    const prompts: string[] = [];
+    const runner = new LocalRuntimeTurnExecutor(
+      options(async (runInput) => {
+        prompts.push(runInput.systemPrompt);
+        await runInput.eventWriter.pushRuntime(terminalEvent(RuntimeEventStatus.COMPLETED));
+      }),
+    );
+    const base = executionInput();
+    for (const session of [
+      {
+        ...base.session,
+        purpose: LIGHTWEIGHT_SESSION_PURPOSE,
+        sessionType: "branch" as const,
+        sessionKind: "task" as const,
+        parentSessionId: "parent",
+      },
+      {
+        ...base.session,
+        purpose: LIGHTWEIGHT_SESSION_PURPOSE,
+        sessionType: "branch" as const,
+        parentSessionId: "parent",
+      },
+    ]) {
+      await runner.execute(executionInput({ session }));
+    }
+    expect(prompts).toEqual([
+      "extension system\n\nbase system",
+      "extension system\n\nbase system",
+    ]);
+  });
+
+  it.each([
+    "code-review:context-mode:lightweight",
+    "context-mode:lightweight:im",
+    " context-mode:lightweight",
+  ])("keeps mixed purpose %j on the standard tool surface", async (purpose) => {
+    let captured: LocalRuntimeTurnRunnerInput<LocalToolContext> | undefined;
+    const tool = {
+      def: { name: "read", description: "Read", schema: { type: "object" } },
+      impl: { execute: vi.fn() },
+    } as never;
+    const runner = new LocalRuntimeTurnExecutor(
+      options(async (runInput) => {
+        captured = runInput;
+        await runInput.eventWriter.pushRuntime(terminalEvent(RuntimeEventStatus.COMPLETED));
+      }),
+    );
+    const base = executionInput();
+    await runner.execute(
+      executionInput({
+        session: { ...base.session, purpose },
+        assembly: { ...assembly(), tools: [tool] },
+      }),
+    );
+    expect(captured?.tools?.map(({ def }) => def.name)).toEqual(["read"]);
+    expect(captured?.systemPrompt).toBe("extension system\n\nbase system");
+  });
+
+  it("keeps compaction on the standard provider context for a lightweight Session", () => {
+    const base = executionInput();
+    const context = {
+      systemPrompt: "full compaction system prompt",
+      tools: [{ name: "read" }],
+    };
+    expect(
+      resolveProviderContextMode(
+        { ...base.session, purpose: LIGHTWEIGHT_SESSION_PURPOSE },
+        context,
+        "compaction",
+      ),
+    ).toBe(context);
+  });
+
   it("projects runtime events before they reach the v2 commit pipeline", async () => {
     const delivered: string[] = [];
     const input = executionInput({
@@ -4146,13 +4284,130 @@ describe("LocalRuntimeTurnExecutor input and tool safety", () => {
   });
 });
 
+describe("LocalRuntimeTurnExecutor session id reminder context", () => {
+  const withSessionId = (sessionId: string) =>
+    `<system-reminder>\n<agent-context>\n  YOUR SESSION ID: ${sessionId}\n</agent-context>\n</system-reminder>\n\nhi`;
+  it.each([
+    ["first turn (empty history)", () => [], false],
+    [
+      "an earlier user message still shows the id",
+      (sessionId: string) => [
+        { role: "user", content: withSessionId(sessionId), timestamp: 1 },
+        { role: "user", content: "later turn", timestamp: 2 },
+      ],
+      true,
+    ],
+    [
+      "text-part user content shows the id",
+      (sessionId: string) => [
+        {
+          role: "user",
+          content: [{ type: "text", text: withSessionId(sessionId) }],
+          timestamp: 1,
+        },
+      ],
+      true,
+    ],
+    [
+      "compaction summarized the id away",
+      (sessionId: string) => [
+        { role: "user", content: withSessionId(sessionId), timestamp: 1 },
+        { role: "compactionSummary", summary: "earlier work" },
+        { role: "user", content: "kept turn", timestamp: 2 },
+      ],
+      false,
+    ],
+    [
+      "a legacy compaction marker hides earlier ids",
+      (sessionId: string) => [
+        { role: "user", content: withSessionId(sessionId), timestamp: 1 },
+        {
+          role: "user",
+          content: "summary",
+          archonCompaction: { schemaVersion: 1, summary: "s" },
+          timestamp: 2,
+        },
+      ],
+      false,
+    ],
+    [
+      "a kept message after compaction shows the id",
+      (sessionId: string) => [
+        { role: "compactionSummary", summary: "earlier work" },
+        { role: "user", content: withSessionId(sessionId), timestamp: 2 },
+      ],
+      true,
+    ],
+  ] as const)(
+    "tells the system reminder whether the session id is in context: %s",
+    async (_label, history, expected) => {
+      const buildSystem = vi.fn(async () => ({ content: "" }));
+      const base = executionInput();
+      const sessionId = base.session.sessionId;
+      await new LocalRuntimeTurnExecutor({
+        ...options(async (runInput) => {
+          await runInput.eventWriter.pushRuntime(
+            terminalEvent(RuntimeEventStatus.COMPLETED),
+          );
+        }),
+        executionPreparation: new NativeLocalTurnExecutionPreparationSource(
+          new LocalTurnInputPreparer({
+            reminders: {
+              buildBackground: vi.fn(async () => ({
+                tasks: [],
+                undeliveredTotal: 0,
+                terminalTotal: 0,
+              })),
+              buildSystem,
+              confirmBackgroundTaskReads: vi.fn(async () => []),
+            },
+          }),
+          { beforeToolCall: vi.fn(async () => undefined) } as never,
+        ),
+      }).execute(
+        executionInput({
+          history: { revision: "r1", messages: history(sessionId) as never },
+        }),
+      );
+      expect(buildSystem).toHaveBeenCalledOnce();
+      const call = (buildSystem.mock.calls[0] as unknown[])[0] as {
+        sessionIdInContext?: boolean;
+      };
+      if (expected) expect(call.sessionIdInContext).toBe(true);
+      else expect(call).not.toHaveProperty("sessionIdInContext");
+    },
+  );
+});
+
 describe("LocalRuntimeTurnExecutor execution budget reminders", () => {
   it.each([
-    { durationMs: 600_000, nearDeadlineMs: 60_000 },
-    { durationMs: 120_000, nearDeadlineMs: 30_000 },
-  ])(
-    "reminds a budgeted run ($durationMs ms) without changing history or the system prompt",
-    async ({ durationMs, nearDeadlineMs }) => {
+    {
+      durationMs: 600_000,
+      // [elapsed ms since start, expected reminder text or undefined]
+      steps: [
+        [0, "about 10 minutes of 10 minutes total. Model generation"],
+        [1_000, undefined],
+        [299_999, undefined],
+        [300_000, "about 5 minutes of 10 minutes total.</system-reminder>"],
+        [400_000, undefined],
+        [450_000, "about 2 minutes of 10 minutes total.</system-reminder>"],
+        [479_999, undefined],
+        [480_000, "about 120 seconds of 10 minutes total."],
+        [485_000, "about 110 seconds of 10 minutes total."],
+        [595_000, "under 10 seconds of 10 minutes total."],
+      ],
+    },
+    {
+      durationMs: 120_000,
+      steps: [
+        [0, "about 120 seconds of 120 seconds total. Model generation"],
+        [1, "about 110 seconds of 120 seconds total.</system-reminder>"],
+        [90_000, "about 30 seconds of 120 seconds total."],
+      ],
+    },
+  ] as const)(
+    "reminds a budgeted run ($durationMs ms) only at thresholds without changing history or the system prompt",
+    async ({ durationMs, steps }) => {
       let nowMs = 1_000;
       const executorOptions = options(async (runInput) => {
         const messages = [
@@ -4170,53 +4425,30 @@ describe("LocalRuntimeTurnExecutor execution budget reminders", () => {
           model: runInput.llm.model,
           thinkingLevel: "off" as const,
         };
-        const initial = await hook?.(hookInput);
-        expect(initial).toMatchObject({
-          type: "replaceRequestMessages",
-          reason: "execution-budget-context",
-          messages: [
-            messages[0],
-            {
-              role: "user",
-              content: expect.stringContaining(`${durationMs / 1_000} seconds`),
-            },
-          ],
-        });
-        nowMs = 1_000 + durationMs - nearDeadlineMs - 1;
-        expect(
-          await hook?.({ ...hookInput, phase: "iteration" }),
-        ).toMatchObject({
-          type: "replaceRequestMessages",
-          messages: [
-            messages[0],
-            { content: expect.stringContaining("Execution time remaining") },
-          ],
-        });
-        nowMs += 1;
-        expect(
-          await hook?.({ ...hookInput, phase: "iteration" }),
-        ).toMatchObject({
-          type: "replaceRequestMessages",
-          messages: [
-            messages[0],
-            {
-              role: "user",
-              content: expect.stringContaining(
-                `${nearDeadlineMs / 1_000} seconds`,
-              ),
-            },
-          ],
-        });
-        nowMs += 1;
-        expect(
-          await hook?.({ ...hookInput, phase: "iteration" }),
-        ).toMatchObject({
-          type: "replaceRequestMessages",
-          messages: [
-            messages[0],
-            { content: expect.stringContaining("Execution time remaining") },
-          ],
-        });
+        for (const [elapsedMs, expected] of steps) {
+          nowMs = 1_000 + elapsedMs;
+          const decision = await hook?.({
+            ...hookInput,
+            phase: elapsedMs === 0 ? "initial" : "iteration",
+          });
+          if (expected === undefined) {
+            expect(decision).toBeUndefined();
+            continue;
+          }
+          expect(decision).toMatchObject({
+            type: "replaceRequestMessages",
+            reason: "execution-budget-context",
+            messages: [
+              messages[0],
+              {
+                role: "user",
+                content: expect.stringContaining(
+                  `<system-reminder>Execution time remaining: ${expected}`,
+                ),
+              },
+            ],
+          });
+        }
         nowMs = 1_000 + durationMs;
         expect(
           await hook?.({ ...hookInput, phase: "iteration" }),
@@ -4246,6 +4478,61 @@ describe("LocalRuntimeTurnExecutor execution budget reminders", () => {
       expect(input.onHistoryChanged).not.toHaveBeenCalled();
     },
   );
+
+  it("retries a threshold reminder that admission rejected", async () => {
+    let nowMs = 1_000;
+    let admit = false;
+    const hook = createExecutionBudgetReminder(
+      1_000 + 1_800_000,
+      () => nowMs,
+      () => admit,
+    )!;
+    const messages = [{ role: "user" as const, content: "hello", timestamp: 1 }];
+    const hookInput = {
+      sessionId: "session-1",
+      turnId: "turn-1",
+      phase: "initial" as const,
+      messages,
+      canonicalMessages: messages,
+      model: {} as never,
+      thinkingLevel: "off" as const,
+    };
+    expect(await hook(hookInput)).toBeUndefined();
+    admit = true;
+    nowMs = 2_000;
+    expect(await hook(hookInput)).toMatchObject({
+      messages: [
+        messages[0],
+        {
+          content:
+            "<system-reminder>Execution time remaining: about 29 minutes of 30 minutes total. Model generation, tools, and waiting all count against it.</system-reminder>",
+        },
+      ],
+    });
+    nowMs = 1_000 + 1_800_000 - 899_000;
+    expect(await hook(hookInput)).toMatchObject({
+      messages: [
+        messages[0],
+        {
+          content:
+            "<system-reminder>Execution time remaining: about 14 minutes of 30 minutes total.</system-reminder>",
+        },
+      ],
+    });
+    // Jumping straight past 25% and 10% emits once for the deepest threshold.
+    nowMs = 1_000 + 1_800_000 - 179_000;
+    expect(await hook(hookInput)).toMatchObject({
+      messages: [
+        messages[0],
+        {
+          content:
+            "<system-reminder>Execution time remaining: about 2 minutes of 30 minutes total.</system-reminder>",
+        },
+      ],
+    });
+    nowMs += 1_000;
+    expect(await hook(hookInput)).toBeUndefined();
+  });
 
   it("samples budget context while preserving existing request observers", async () => {
     let nowMs = 1_000;
@@ -4281,14 +4568,18 @@ describe("LocalRuntimeTurnExecutor execution budget reminders", () => {
         expect.objectContaining({ remaining_ms: 600_000 }),
         "execution budget context sampled",
       );
+      // 99 seconds later no threshold is crossed, so no tokens are spent.
       nowMs = 100_000;
+      expect(
+        await runInput.hooks!.beforeLlmCallHook!.at(-2)!(input),
+      ).toBeUndefined();
+      expect(logger.info).toHaveBeenCalledOnce();
+      nowMs = 301_000;
       const next = await runInput.hooks!.beforeLlmCallHook!.at(-2)!(input);
       if (next?.type !== "replaceRequestMessages")
         throw new Error("Expected time context");
       expect(next.messages.at(-1)).toMatchObject({
-        content: expect.stringContaining(
-          "previous model request was prepared: 99 seconds",
-        ),
+        content: expect.stringContaining("about 5 minutes of 10 minutes total."),
       });
       await runInput.eventWriter.pushRuntime(
         terminalEvent(RuntimeEventStatus.COMPLETED),
@@ -4541,7 +4832,7 @@ describe("LocalRuntimeTurnExecutor budget with durable reminders", () => {
       ).toHaveLength(keepsRequestContext ? 1 : 0);
       if (keepsRequestContext) {
         expect(requestContext).toContain(
-          "Execution time remaining at request preparation: 120 seconds.",
+          "Execution time remaining: about 120 seconds of 120 seconds total.",
         );
       }
       expect(canAppend).toHaveBeenCalledOnce();
@@ -4556,6 +4847,173 @@ describe("LocalRuntimeTurnExecutor budget with durable reminders", () => {
       expect(JSON.stringify(history)).not.toContain("Execution time remaining");
     },
   );
+});
+
+describe("LocalRuntimeTurnExecutor continuation recovery with compaction reminders", () => {
+  it("removes a pending tool round before compaction appends a background reminder", async () => {
+    const usage = {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+    const history = [
+      {
+        message_id: "msg-user-v1-request",
+        turn_id: "turn-original",
+        message: { role: "user", content: "finish the work", timestamp: 1 },
+      },
+      {
+        message_id: "msg-assistant-complete",
+        turn_id: "turn-original",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "tool-call-complete", name: "read", arguments: {} }],
+          api: "anthropic-messages",
+          provider: "provider",
+          model: "model",
+          usage,
+          stopReason: "toolUse",
+          timestamp: 2,
+        },
+      },
+      {
+        message_id: "msg-tool-result-complete",
+        turn_id: "turn-original",
+        message: {
+          role: "toolResult",
+          toolCallId: "tool-call-complete",
+          toolName: "read",
+          content: [{ type: "text", text: "completed result" }],
+          isError: false,
+          timestamp: 3,
+        },
+      },
+      {
+        message_id: "msg-assistant-pending",
+        turn_id: "turn-original",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "tool-call-pending", name: "read", arguments: {} }],
+          api: "anthropic-messages",
+          provider: "provider",
+          model: "model",
+          usage,
+          stopReason: "toolUse",
+          timestamp: 4,
+        },
+      },
+    ] satisfies CanonicalHistoryEnvelope[];
+    const recovered = repairCanonicalHistory(history, { allowPendingToolCallTail: false });
+    const recoveredMessages = copyCanonicalHistoryForPiCompatibility(
+      recovered.records.map((record) => record.message),
+    );
+    expect(recovered.issues).toEqual([
+      { kind: "pending-tool-call-tail", recordIndex: 3, droppedCount: 1 },
+    ]);
+    expect(JSON.stringify(recoveredMessages)).not.toContain("tool-call-pending");
+    expect(recoveredMessages.map((message) => (message as { role: string }).role)).toEqual([
+      "user",
+      "assistant",
+      "toolResult",
+    ]);
+
+    const marker = {
+      role: "custom" as const,
+      customType: "background_task_cadence_reminder",
+      content: "<background-task-finished>task ready</background-task-finished>",
+      display: false as const,
+      timestamp: 5,
+    };
+    const backgroundHook = vi.fn(() => ({
+      type: "appendMessage" as const,
+      reason: "background_task_cadence_reminder",
+      placement: "before-current-user" as const,
+      message: marker,
+    }));
+    const compactionHook = vi.fn((hookInput: PiBeforeLlmCallHookInput) => ({
+      type: "replaceMessages" as const,
+      messages: [
+        {
+          role: "compactionSummary" as const,
+          summary: "The completed tool round was summarized.",
+          tokensBefore: 1_000,
+          timestamp: 5,
+        },
+      ],
+      metadata: {
+        replacementId: "pending-round-continuation-compaction",
+        strategyVersion: "test",
+        summary: "The completed tool round was summarized.",
+        firstKeptIndex: hookInput.canonicalMessages.length,
+        compactedMessages: hookInput.canonicalMessages,
+        keptMessages: [],
+      },
+    }));
+    const providerContexts: string[] = [];
+    const executorOptions = options((runInput) =>
+      new PiTurnRunner().runTurn({
+        ...runInput,
+        toolConfig: { tools: runInput.tools, context: runInput.toolContext! },
+        llm: {
+          ...runInput.llm,
+          streamFn: (model, context) => {
+            providerContexts.push(JSON.stringify(context.messages));
+            const final = {
+              ...afterToolContext().assistantMessage,
+              role: "assistant" as const,
+              api: model.api,
+              content: [{ type: "text" as const, text: "continued safely" }],
+              stopReason: "stop" as const,
+            };
+            const stream = createAssistantMessageEventStream();
+            stream.push({ type: "done", reason: "stop", message: final });
+            stream.end(final);
+            return stream;
+          },
+        },
+      }),
+    );
+    const base = executionInput();
+    const input = executionInput({
+      request: {
+        ...base.request,
+        requiresInputReview: false,
+        executionMode: "continuation",
+      },
+      history: { revision: "r-recovered", messages: recoveredMessages },
+      runnerHistory: { revision: "r-recovered", messages: recoveredMessages },
+    });
+
+    await expect(
+      new LocalRuntimeTurnExecutor({
+        ...executorOptions,
+        backgroundCadenceReminder: {
+          prepare: async () => ({ beforeUserMessages: [], hook: backgroundHook }),
+        },
+        resolveBeforeLlmCallHooks: async () => [compactionHook],
+      }).execute(input),
+    ).resolves.toEqual({ status: "completed" });
+
+    expect(compactionHook).toHaveBeenCalledOnce();
+    expect(backgroundHook).toHaveBeenCalledOnce();
+    expect(providerContexts).toHaveLength(1);
+    expect(providerContexts[0]).toContain("The completed tool round was summarized.");
+    expect(providerContexts[0]).toContain(marker.content);
+    expect(providerContexts[0]).not.toContain("tool-call-pending");
+    expect(providerContexts[0]).not.toContain("tool-call-complete");
+    const changes = vi.mocked(input.onHistoryChanged).mock.calls.map(([change]) => change);
+    expect(changes.slice(0, 2).map((change) => change.reason)).toEqual([
+      "replaceMessages",
+      "messageDelta",
+    ]);
+    expect(changes[0]?.messages.map((message) => (message as { role: string }).role)).toEqual([
+      "compactionSummary",
+    ]);
+    expect(changes[1]?.messages).toEqual([marker]);
+  });
 });
 
 describe("LocalRuntimeTurnExecutor beforeLlmCall and reconcile", () => {
@@ -5885,5 +6343,129 @@ describe("incremental runtime event outcomes", () => {
     const executor = new LocalRuntimeTurnExecutor({ ...runnerOptions,
       runtime: { ...runnerOptions.runtime, acceptsEventSummary } });
     await expect(executor.execute(executionInput())).resolves.toEqual({ status: "completed" });
+  });
+});
+
+function checkpointWorker(
+  checkpointCalls: string[],
+  readCheckpointError?: () => Error | undefined,
+): StorageWorker {
+  return {
+    enqueue: async () => undefined,
+    flush: async () => null,
+    checkpoint: async () => {
+      checkpointCalls.push("checkpoint");
+      const error = readCheckpointError?.();
+      if (error) throw error;
+    },
+    quarantined: [],
+    dispose: async () => undefined,
+  };
+}
+
+describe("LocalRuntimeTurnExecutor checkpoint policy wiring (SE-SW-002)", () => {
+  it("puts the fail-closed durability flush first in beforeLlmCallHook", async () => {
+    const checkpointCalls: string[] = [];
+    const failure: { error?: Error } = {};
+    let captured: LocalRuntimeTurnRunnerInput<LocalToolContext> | undefined;
+    const executorOptions = options(async (runInput) => {
+      captured = runInput;
+      await runInput.eventWriter.pushRuntime(terminalEvent(RuntimeEventStatus.COMPLETED));
+    });
+    const runner = new LocalRuntimeTurnExecutor({
+      ...executorOptions,
+      checkpointBarrier: turnCheckpointBarrier(
+        checkpointWorker(checkpointCalls, () => failure.error),
+      ),
+    });
+    const input = executionInput();
+    await expect(runner.execute(input)).resolves.toEqual({ status: "completed" });
+
+    const hooks = captured?.hooks?.beforeLlmCallHook ?? [];
+    // First position: durability is confirmed before any other before-LLM
+    // decision, ahead of the assembled runtime hooks.
+    expect(hooks[0]).toEqual(expect.any(Function));
+    expect(hooks[1]).toBe(input.assembly.hooks.beforeLlmCallHook?.[0]);
+    const hookInput = {
+      sessionId: "session-1",
+      turnId: "turn-1",
+      phase: "initial",
+    } as PiBeforeLlmCallHookInput;
+    // A confirmed barrier emits no decision: the request proceeds.
+    expect(await hooks[0]?.(hookInput)).toBeUndefined();
+    expect(checkpointCalls).toEqual(["checkpoint"]);
+    // Fail-closed: a barrier failure aborts the request before it is issued.
+    failure.error = new Error("worker sealed");
+    expect(await hooks[0]?.(hookInput)).toMatchObject({
+      type: "abort",
+      reason: expect.stringContaining("checkpoint policy"),
+    });
+  });
+
+  it("runs every admitted tool effect under the barrier", async () => {
+    const checkpointCalls: string[] = [];
+    const tool: RuntimeTool = {
+      def: {
+        name: "echo",
+        description: "echo tool",
+        schema: { type: "object" } as never,
+      },
+      impl: {
+        execute: async () => ({
+          tool_name: "echo",
+          text: "ok",
+          content: [{ type: "text", text: "ok" }],
+        }),
+      },
+    };
+    let captured: LocalRuntimeTurnRunnerInput<LocalToolContext> | undefined;
+    const executorOptions = options(async (runInput) => {
+      captured = runInput;
+      await runInput.eventWriter.pushRuntime(terminalEvent(RuntimeEventStatus.COMPLETED));
+    });
+    const runner = new LocalRuntimeTurnExecutor({
+      ...executorOptions,
+      checkpointBarrier: turnCheckpointBarrier(checkpointWorker(checkpointCalls)),
+    });
+    await runner.execute(
+      executionInput({ assembly: { ...assembly(), tools: [tool] } }),
+    );
+
+    const wrapped = captured?.tools?.find((candidate) => candidate.def.name === "echo");
+    expect(wrapped).toBeDefined();
+    expect(wrapped?.impl).not.toBe(tool.impl);
+    const result = await wrapped!.impl.execute(
+      { sessionId: "session-1", turnId: "turn-1", toolCallId: "call-1" },
+      {},
+    );
+    expect(result.text).toBe("ok");
+    // The flush strictly precedes the effect (one checkpoint for the call).
+    expect(checkpointCalls).toEqual(["checkpoint"]);
+  });
+
+  it("leaves the turn path untouched without a barrier", async () => {
+    const tool: RuntimeTool = {
+      def: {
+        name: "echo",
+        description: "echo tool",
+        schema: { type: "object" } as never,
+      },
+      impl: { execute: vi.fn(async () => ({
+        tool_name: "echo",
+        text: "ok",
+        content: [{ type: "text", text: "ok" }],
+      })) },
+    };
+    let captured: LocalRuntimeTurnRunnerInput<LocalToolContext> | undefined;
+    const executorOptions = options(async (runInput) => {
+      captured = runInput;
+      await runInput.eventWriter.pushRuntime(terminalEvent(RuntimeEventStatus.COMPLETED));
+    });
+    await new LocalRuntimeTurnExecutor(executorOptions).execute(
+      executionInput({ assembly: { ...assembly(), tools: [tool] } }),
+    );
+    expect(captured?.tools?.find((candidate) => candidate.def.name === "echo")?.impl).toBe(
+      tool.impl,
+    );
   });
 });

@@ -6,11 +6,13 @@ import {
   applyExecCliContract,
   applyExecReviewCliContract,
   applyInteractiveCliContract,
+  applyProfileCliOption,
   resolveInteractiveLaunchRequest,
   type RawTuiInteractiveOptions,
   type TuiInteractiveLaunchRequest,
 } from './contract.js';
 import type { McodeProviderCliRequest } from './provider-command.js';
+import type { McodeProfileCliRequest } from './profile-command.js';
 import {
   isModelProviderApiFormat,
   MCODE_PROVIDER_API_FORMATS,
@@ -18,6 +20,15 @@ import {
 } from '../provider/contract.js';
 import type { McodePluginCliRequest, McodePluginMarketplace } from '../plugin/contract.js';
 import { resolveTuiManagedBackendLane } from './environment.js';
+import {
+  applySystemPromptCliOptions,
+  inheritSystemPromptOptions,
+  rejectUnsupportedSystemPromptOptions,
+  resolveSystemPromptOverrides,
+  SYSTEM_PROMPT_OPTION_NAMES,
+  type RawSystemPromptOptions,
+  type SystemPromptOverrides,
+} from './system-prompt-options.js';
 import type { McodeTelemetryCliAction } from './telemetry-command.js';
 
 export type { TuiInteractiveLaunchRequest } from './contract.js';
@@ -37,11 +48,12 @@ export interface CreateTuiProgramOptions {
     commandOptions: RawTuiExecOptions,
     lane?: string,
   ) => Promise<void>;
-  runAcp?: (lane?: string) => Promise<void>;
+  runAcp?: (lane?: string, systemPromptOverrides?: SystemPromptOverrides) => Promise<void>;
   runLogin: (region?: MavisRegion, openBrowser?: boolean, lane?: string) => Promise<void>;
   runLogout: (region?: MavisRegion) => Promise<void>;
   runUpdate: () => Promise<void>;
   runProvider?: (request: McodeProviderCliRequest, lane?: string) => Promise<void>;
+  runProfile?: (request: McodeProfileCliRequest, lane?: string) => Promise<void>;
   runPlugin?: (request: McodePluginCliRequest, lane?: string) => Promise<void>;
   runTelemetry?: (action: McodeTelemetryCliAction) => Promise<void>;
   resolveLane?: typeof resolveTuiManagedBackendLane;
@@ -63,6 +75,12 @@ export function createTuiProgram(options: CreateTuiProgramOptions): Command {
     activeLane
       ? requirePluginRunner(options)(request, activeLane)
       : requirePluginRunner(options)(request);
+  const runProfile = (request: McodeProfileCliRequest) =>
+    options.runProfile
+      ? activeLane
+        ? options.runProfile(request, activeLane)
+        : options.runProfile(request)
+      : defaultRunProfile(request);
   const program = applyInteractiveCliContract(
     new Command()
       .name('mcode')
@@ -74,7 +92,8 @@ export function createTuiProgram(options: CreateTuiProgramOptions): Command {
     options.launchTui(withLane(resolveInteractiveLaunchRequest(prompt, commandOptions))),
   );
 
-  program.hook('preAction', () => {
+  program.hook('preAction', (_program, actionCommand) => {
+    rejectUnsupportedSystemPromptOptions(actionCommand);
     activeLane = (options.resolveLane ?? resolveTuiManagedBackendLane)(
       program.opts<{ lane?: string }>().lane,
     );
@@ -90,27 +109,39 @@ export function createTuiProgram(options: CreateTuiProgramOptions): Command {
 
   const exec = program.command('exec').description('Run one prompt without starting the TUI');
   applyExecCliContract(exec).action(
-    (prompt: string | undefined, commandOptions: RawTuiExecOptions) =>
-      activeLane
-        ? options.runExec(prompt, commandOptions, activeLane)
-        : options.runExec(prompt, commandOptions),
+    (prompt: string | undefined, commandOptions: RawTuiExecOptions) => {
+      const resolved = inheritSystemPromptOptions(exec, commandOptions);
+      return activeLane
+        ? options.runExec(prompt, resolved, activeLane)
+        : options.runExec(prompt, resolved);
+    },
   );
   applyExecReviewCliContract(
     exec.command('review').description('Review staged, unstaged, and untracked local changes'),
   ).action((_commandOptions: RawTuiExecOptions, command: Command) => {
-    const reviewOptions = resolveExecReviewOptions(exec, command);
+    const reviewOptions = inheritSystemPromptOptions(
+      command,
+      resolveExecReviewOptions(exec, command),
+    );
     return activeLane
       ? options.runExec(undefined, reviewOptions, activeLane)
       : options.runExec(undefined, reviewOptions);
   });
 
-  const acp = program
-    .command('acp')
-    .description('Run MiniMax Code as an Agent Client Protocol server over stdio')
+  const acp = applySystemPromptCliOptions(
+    program
+      .command('acp')
+      .description('Run MiniMax Code as an Agent Client Protocol server over stdio'),
+  )
     .allowExcessArguments(false)
-    .action(() =>
-      activeLane ? requireAcpRunner(options)(activeLane) : requireAcpRunner(options)(),
-    );
+    .action((commandOptions: RawSystemPromptOptions, command: Command) => {
+      const runAcp = requireAcpRunner(options);
+      const systemPromptOverrides = resolveSystemPromptOverrides(
+        inheritSystemPromptOptions(command, commandOptions),
+      );
+      if (systemPromptOverrides) return runAcp(activeLane, systemPromptOverrides);
+      return activeLane ? runAcp(activeLane) : runAcp();
+    });
 
   acp
     .command('login')
@@ -341,6 +372,33 @@ export function createTuiProgram(options: CreateTuiProgramOptions): Command {
       }),
     );
 
+  const profile = program.command('profile').description('Inspect and remove named auth profiles');
+
+  profile
+    .command('list')
+    .description('List profiles and their sign-in state')
+    .option('--json', 'print a JSON document')
+    .allowExcessArguments(false)
+    .action((commandOptions: { json?: boolean }) =>
+      runProfile({ action: 'list', json: commandOptions.json }),
+    );
+
+  profile
+    .command('current')
+    .description('Show the profile this invocation resolved to')
+    .allowExcessArguments(false)
+    .action(() => runProfile({ action: 'current' }));
+
+  profile
+    .command('remove')
+    .description('Delete a profile data directory')
+    .argument('<name>', 'profile name')
+    .option('--yes', 'confirm removal')
+    .allowExcessArguments(false)
+    .action((name: string, commandOptions: { yes?: boolean }) =>
+      runProfile({ action: 'remove', name, confirmed: Boolean(commandOptions.yes) }),
+    );
+
   const contributionRegistry = new TuiContributionRegistry<TuiCliCommandContribution>();
   contributionRegistry.registerAll(options.commandContributions ?? []);
   for (const contribution of contributionRegistry.freeze()) {
@@ -350,7 +408,27 @@ export function createTuiProgram(options: CreateTuiProgramOptions): Command {
     contribution.register(program, options);
   }
 
+  applyProfileOptionToEveryCommand(program);
+
   return program;
+}
+
+/**
+ * Give every command its own `--profile` option.
+ *
+ * Commander does not inherit parent options, and the root program runs with
+ * `enablePositionalOptions()`, so `mcode exec --profile work` fails with an
+ * unknown-option error unless `exec` declares the flag itself. Walking the
+ * finished tree keeps that from being a per-command chore and covers contributed
+ * commands too. The root already carries the option from
+ * `applyInteractiveCliContract`, hence the guard.
+ */
+function applyProfileOptionToEveryCommand(command: Command): void {
+  const declared = command.options.some((option) => option.attributeName() === 'profile');
+  if (!declared) applyProfileCliOption(command);
+  for (const child of command.commands) {
+    applyProfileOptionToEveryCommand(child);
+  }
 }
 
 function resolveExecReviewOptions(exec: Command, review: Command): RawTuiExecOptions {
@@ -364,6 +442,8 @@ function resolveExecReviewOptions(exec: Command, review: Command): RawTuiExecOpt
         code: 'commander.unknownOption',
       });
     }
+    // Prompt flags are resolved per slot by inheritSystemPromptOptions.
+    if (SYSTEM_PROMPT_OPTION_NAMES.has(name)) continue;
     // Child defaults must not mask explicit parent options, especially permissions.
     if (review.getOptionValueSource(name) !== 'cli') {
       Object.assign(options, { [name]: exec.getOptionValue(name) });
@@ -423,6 +503,15 @@ function requireAcpRunner(options: CreateTuiProgramOptions) {
 function requireTelemetryRunner(options: CreateTuiProgramOptions) {
   if (!options.runTelemetry) throw new Error('Telemetry inspection is unavailable.');
   return options.runTelemetry;
+}
+
+/**
+ * Used until the composition root in `main.ts` injects `runProfile`, which also
+ * routes the output through its own process stream.
+ */
+async function defaultRunProfile(request: McodeProfileCliRequest): Promise<void> {
+  const { runMcodeProfileCommand } = await import('./profile-command.js');
+  process.stdout.write(`${await runMcodeProfileCommand({ request })}\n`);
 }
 
 function parsePositiveSafeInteger(value: string): number {

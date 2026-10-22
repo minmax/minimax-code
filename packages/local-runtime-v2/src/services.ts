@@ -15,6 +15,7 @@ import type {
 } from "@mavis/shared/global-events";
 import { isOrdinaryQuestionnaireResponseOrigin } from "@mavis/shared/questionnaire";
 import { createGoalBudgetSummaryExtension } from "./application/agent/goal-budget-summary-reminder.js";
+import { createGoalFinalReply } from "./application/agent/goal-final-reply.js";
 import {
   combineLocalTurnToolPolicyGuards,
   createGoalBudgetToolPolicyGuard,
@@ -201,6 +202,7 @@ import {
   type AgentHostRuntimeLifecycle,
   type ToolResultCompactionConfig,
   type TurnSystemOwner,
+  type SystemPromptOverrides,
 } from "./service/turn-system/index.js";
 import { composeV1Conversation } from "./service/v1-conversation-compat/index.js";
 import type { WorkspaceSystem } from "./service/workspace/index.js";
@@ -311,6 +313,8 @@ export interface CreateRuntimeServicesOptions
   readonly promptConfigKey?: Uint8Array;
   /** Client capability ceiling; omitted owners retain the shared legacy surface. */
   readonly capabilityProfile?: "cli";
+  /** Launch-scoped main-Agent prompt overrides; process memory only. */
+  readonly systemPromptOverrides?: SystemPromptOverrides;
   /** Electron owns greeting dispatch; embedded CLI only seeds V2 Agent/Root rows. */
   readonly greetingEnabled?: boolean;
   /** Live optional Runaway Guard override injected by the owning product. */
@@ -946,6 +950,7 @@ async function initializeRuntimeTurnSystem(
       turnFacts,
       pluginHookSessionOwnership,
     }) => {
+      const goalFinalReply = createGoalFinalReply();
       const production = await createLocalAgentHost({
         product: input.product,
         db: input.options.db,
@@ -974,6 +979,7 @@ async function initializeRuntimeTurnSystem(
           input.product.executor.reportFailure,
         ),
         toolPolicyGuard: combineLocalTurnToolPolicyGuards(
+          goalFinalReply.toolPolicyGuard,
           plan.toolGuard,
           createGoalBudgetToolPolicyGuard(),
         ),
@@ -990,6 +996,7 @@ async function initializeRuntimeTurnSystem(
           plan.extension,
           goalVerifierExtension,
           createGoalBudgetSummaryExtension(),
+          goalFinalReply.extension,
           ...normalExtensions,
         ],
         eventObserver: combineAgentEventObservers(

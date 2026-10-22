@@ -86,7 +86,7 @@ describe('legacy MiniMax compatibility', () => {
       const config: LocalRuntimeConfig = {
         dataDir: '/tmp/legacy-model-selection',
         defaultModel: `custom_provider:${key}/retired`,
-        provider: { minimax: { models: { 'MiniMax-M3': {} } } },
+        provider: { minimax: { models: { 'MiniMax-M3.1-Flash': {}, 'MiniMax-M3': {} } } },
         custom_provider: {
           [key]: {
             options: {
@@ -105,7 +105,7 @@ describe('legacy MiniMax compatibility', () => {
         }),
       ).toEqual({
         providerId: 'minimax',
-        modelId: 'MiniMax-M3',
+        modelId: 'MiniMax-M3.1-Flash',
       });
       expect(config).toEqual(before);
       config.custom_provider![key]!.options!.baseURL = 'https://proxy.example/v1';
@@ -163,6 +163,21 @@ describe('model selection input', () => {
     expect(readSelectedThinkingEffort(undefined)).toBeUndefined();
     expect(readSelectedThinkingEffort({ selected_thinking_effort: ' max ' })).toBe('max');
   });
+});
+
+it('creates an API-only session before a shared MiniMax catalog exists', () => {
+  const config: LocalRuntimeConfig = {
+    dataDir: '/tmp/api-only-session-create',
+    defaultModel: 'minimax_api/MiniMax-M3',
+    provider: {},
+    minimax_api: { apiKey: 'api-only-placeholder' },
+  };
+  expect(
+    resolveRequestedSessionModel(config, {
+      providerId: 'minimax_api',
+      modelId: 'MiniMax-M3',
+    }),
+  ).toMatchObject({ providerId: 'minimax_api', modelId: 'MiniMax-M3' });
 });
 
 describe('ordinary session inherits the selected global effort', () => {

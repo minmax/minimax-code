@@ -1,3 +1,5 @@
+import { Buffer } from 'node:buffer';
+
 import { isDefaultThinkingModelId, type Api, type Model } from '@earendil-works/pi-ai';
 import type { LLMModelConfig } from '@mavis/agent-core/pi-turn-runner';
 import { ThinkingLevel, ThinkingMode } from '@mavis/protocol';
@@ -19,6 +21,8 @@ const DEFAULT_FILE_API_REF_SCHEME = 'mm_file://';
 const DEFAULT_FILE_API_TTL_SEC = 43_200;
 
 export interface LocalTurnPayloadTransformOptions {
+  /** Effective client byte budget; enforced after all payload transformations. */
+  readonly maxRequestBodyBytes?: number;
   readonly thinkingLevel?: NonNullable<LocalResolvedModelConfig['thinkingLevel']>;
   readonly thinkingRequestPatch?: LocalResolvedModelConfig['thinkingRequestPatch'];
   readonly managedProvider?: boolean;
@@ -63,6 +67,10 @@ export function buildLocalTurnPayloadTransform(
     options.managedProvider,
     thinkingOn,
   );
+  const selectedEffort =
+    !options.managedProvider && thinkingOn
+      ? readSelectedThinkingEffort(modelConfig ?? {}, capabilities ?? {})
+      : undefined;
 
   return (payload: unknown, model: Model<Api>): Promise<unknown | undefined> =>
     transformLocalTurnPayload({
@@ -72,9 +80,11 @@ export function buildLocalTurnPayloadTransform(
       fileApiPatcher,
       thinking,
       managedThinking,
+      ...(selectedEffort ? { selectedEffort } : {}),
       thinkingRequestPatch: options.thinkingRequestPatch,
       outputContract: options.outputContract,
       jsonObjectOutputEnabled: options.supportsJsonObjectOutput === true,
+      maxRequestBodyBytes: options.maxRequestBodyBytes,
     });
 }
 
@@ -85,7 +95,7 @@ function readManagedThinking(
   enabled: boolean,
 ) {
   if (!managed) return undefined;
-  const effort = model.thinking_effort ?? capabilities.selected_thinking_effort;
+  const effort = readRawThinkingEffort(model, capabilities);
   if (
     model.thinking_level === undefined &&
     capabilities.thinking_mode === undefined &&
@@ -99,6 +109,28 @@ function readManagedThinking(
       ? { effort }
       : {}),
   };
+}
+
+function readRawThinkingEffort(
+  model: Record<string, unknown>,
+  capabilities: Record<string, unknown>,
+): unknown {
+  return model.thinking_effort ?? capabilities.selected_thinking_effort;
+}
+
+/**
+ * The explicitly selected effort level for an API-key request. Plain on/off
+ * models have no level, and `default` means "let the provider decide", so
+ * neither is forwarded.
+ */
+function readSelectedThinkingEffort(
+  model: Record<string, unknown>,
+  capabilities: Record<string, unknown>,
+): string | undefined {
+  const effort = readRawThinkingEffort(model, capabilities);
+  return typeof effort === 'string' && !['', 'on', 'off', 'default'].includes(effort)
+    ? effort
+    : undefined;
 }
 
 export function buildLocalRequestPayloadTransform(
@@ -121,6 +153,7 @@ export function buildLocalRequestPayloadTransform(
   const fileApiFetch = resolveFileApiFetch(input.llm, runtime.fileApi?.fetchImpl);
   return buildLocalTurnPayloadTransform(input.agentConfig, {
     thinkingLevel: input.llm.thinkingLevel ?? 'off',
+    maxRequestBodyBytes: input.llm.maxRequestBodyBytes,
     ...(input.llm.thinkingRequestPatch
       ? { thinkingRequestPatch: input.llm.thinkingRequestPatch }
       : {}),
@@ -181,9 +214,12 @@ async function transformLocalTurnPayload(input: {
     readonly mode: unknown;
     readonly effort?: string;
   };
+  /** User-selected effort for an unmanaged (API-key) request; see patchThinkingPayload. */
+  readonly selectedEffort?: string;
   readonly thinkingRequestPatch: Readonly<Record<string, unknown>> | undefined;
   readonly outputContract: TurnOutputContract | undefined;
   readonly jsonObjectOutputEnabled: boolean;
+  readonly maxRequestBodyBytes: number | undefined;
 }): Promise<unknown | undefined> {
   if (!isRecord(input.payload)) return undefined;
   let changed = false;
@@ -196,7 +232,7 @@ async function transformLocalTurnPayload(input: {
     );
     const thinkingChanged = input.managedThinking
       ? patchManagedThinkingPayload(input.payload, input.thinking, input.managedThinking)
-      : patchThinkingPayload(input.payload, input.thinking, input.model);
+      : patchThinkingPayload(input.payload, input.thinking, input.model, input.selectedEffort);
     changed = videoChanged || fileApiChanged || thinkingChanged;
   }
   const requestPatchChanged = patchRequestPayload(input.payload, input.thinkingRequestPatch);
@@ -206,7 +242,22 @@ async function transformLocalTurnPayload(input: {
     input.outputContract,
     input.jsonObjectOutputEnabled,
   );
+  assertRequestBodyFits(input.payload, input.maxRequestBodyBytes);
   return changed || requestPatchChanged || outputFormatChanged ? input.payload : undefined;
+}
+
+/** The estimate used to trigger compaction is not the final request body. */
+function assertRequestBodyFits(payload: Record<string, unknown>, limit: number | undefined): void {
+  if (limit === undefined) return;
+  const bytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
+  if (bytes <= limit) return;
+  throw Object.assign(
+    new Error(`Request body too large: ${bytes} bytes exceeds client limit ${limit} bytes.`),
+    {
+      code: 'REQUEST_BODY_TOO_LARGE',
+      retryable: false,
+    },
+  );
 }
 
 function patchOutputFormatPayload(
@@ -367,6 +418,7 @@ function patchThinkingPayload(
   payload: Record<string, unknown>,
   thinking: Record<string, unknown> | undefined,
   model: Model<Api>,
+  selectedEffort: string | undefined,
 ): boolean {
   if (!thinking || !Array.isArray(payload.messages)) return false;
   if (model.api === 'anthropic-messages' && isDefaultThinkingModelId(model.id)) {
@@ -375,7 +427,14 @@ function patchThinkingPayload(
     return hadThinking;
   }
   payload.thinking = { ...thinking };
-  if (!shouldPreserveCustomProviderTopEffort(payload, model)) delete payload.output_config;
+  if (shouldPreserveCustomProviderTopEffort(payload, model)) return true;
+  if (selectedEffort && parseProviderId(model.provider)?.source === 'minimax_api') {
+    // The MiniMax API-key path speaks the same Messages dialect as the managed
+    // gateway; keep the selected `--effort` exactly like patchManagedThinkingPayload.
+    payload.output_config = { ...readRecord(payload.output_config), effort: selectedEffort };
+    return true;
+  }
+  delete payload.output_config;
   return true;
 }
 

@@ -30,3 +30,37 @@ packages:
   - packages/oauth-core
   - packages/oauth-lease-protocol
   - packages/mcode-tools-host
+  - packages/cas
+  - packages/durable-backend-sqlite-zstd
+  - packages/durable-core
+  - packages/storage-worker
+  - packages/v2-adapter
+  - packages/context-compaction
+  - packages/context-mmu
+  - packages/context-projection
+  - packages/convert-to-llm
+  - packages/wire-compiler
+  - packages/delegation-supervisor
+  - packages/durable-seam
+  - packages/input-delivery
+  - packages/steering-control
+  - packages/mcoded
+  - packages/speculation
+  - third_party/pi-durable
+  - third_party/chord
+overrides:
+  "react": "18.3.1"
+  "react-dom": "18.3.1"
+  "@modelcontextprotocol/sdk>@hono/node-server": "2.0.12"
+  "minimatch@>=10.2.5>brace-expansion": "5.0.9"
+  "ajv>fast-uri": "3.1.6"
+  "express-rate-limit>ip-address": "10.4.0"
+  "vitest": "4.1.11"
+  "@vitest/coverage-v8": "4.1.11"
+  "vite": "7.3.6"
+  "hono": "4.13.5"
+  "@earendil-works/chord": "npm:@minimax/local/chord@1.3.0"
+onlyBuiltDependencies:
+  - better-sqlite3
+  - esbuild
+  - node-pty

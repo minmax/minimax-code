@@ -111,15 +111,20 @@
     "proper-lockfile": "^4",
     "typebox": "1.1.38",
     "smol-toml": "1.7.1",
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "@mavis/steering-control": "workspace:^",
+    "@mavis/durable-seam": "workspace:^",
+    "@mavis/delegation-supervisor": "workspace:^",
+    "@mavis/input-delivery": "workspace:^",
+    "@mavis/storage-worker": "workspace:*"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@types/node": "^20",
     "@types/proper-lockfile": "^4",
-    "dependency-cruiser": "18.3.1",
-    "jscpd": "^5.2.1",
-    "knip": "^6.27.0",
+    "dependency-cruiser": "18.4.0",
+    "jscpd": "^5.3.3",
+    "knip": "^6.38.0",
     "typescript": "^5",
     "vitest": "^2"
   },

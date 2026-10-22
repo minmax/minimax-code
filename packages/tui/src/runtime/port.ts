@@ -15,6 +15,7 @@ import type {
 } from '../types/runtime-models.js';
 import type { TuiRuntimeEvent } from '../types/runtime-events.js';
 import type { TuiPermissionMode } from '../application/permission-mode.js';
+import type { TuiSandboxFilesystemMode } from '../application/sandbox-mode.js';
 import type { TuiMessage, TuiStreamEvent } from './stream-events.js';
 import type { McodeProviderRuntimePort } from '../provider/contract.js';
 import type { McodePluginRuntimeAccess } from '../plugin/contract.js';
@@ -270,6 +271,25 @@ export interface TuiConfigurationPort extends McodeProviderRuntimePort {
   ): Promise<TuiAccountStatus>;
   getPermissionMode(): Promise<TuiPermissionMode | undefined>;
   setPermissionMode(mode: TuiPermissionMode): Promise<TuiPermissionMode>;
+  /**
+   * Whether the destructive-delete guard is enforced. `undefined` means the
+   * host does not own this setting, which the UI reports instead of guessing.
+   *
+   * Optional like {@link setModelFavorite}: a host that predates the setting
+   * must degrade to "unmanaged", never break permission hydration.
+   */
+  getDangerousCommandGateEnabled?(): Promise<boolean | undefined>;
+  setDangerousCommandGateEnabled?(enabled: boolean): Promise<boolean>;
+  /**
+   * The sandbox filesystem level the host enforces. `undefined` means the host
+   * runs no sandbox, which the UI reports instead of naming a level nothing is
+   * enforcing.
+   *
+   * Optional like the delete guard: a host that predates the setting must
+   * degrade to "managed by host", never break the sandbox command.
+   */
+  getSandboxFilesystemMode?(): Promise<TuiSandboxFilesystemMode | undefined>;
+  setSandboxFilesystemMode?(mode: TuiSandboxFilesystemMode): Promise<TuiSandboxFilesystemMode>;
   listModels(sessionId?: string): Promise<TuiModel[]>;
   selectModel(model: TuiModelSelection, sessionId?: string): Promise<boolean>;
   selectSessionModel(model: TuiModelSelection, sessionId: string): Promise<boolean>;
@@ -584,6 +604,8 @@ export interface TuiBackgroundTask {
   readonly endedAtMs?: number;
   readonly deliveredAtMs?: number;
   readonly lastError?: string;
+  /** Bash still owned by its foreground tool call (not auto-promoted to the background). */
+  readonly foreground?: true;
 }
 
 export interface TuiBackgroundTaskCapability {

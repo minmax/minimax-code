@@ -19,10 +19,15 @@ const MANAGED_BACKEND_LANE_PATTERN = /^[A-Za-z0-9._-]+$/u;
 const STARTUP_ENVIRONMENT_OPTION = '--env';
 const ROOT_OPTIONS_WITH_REQUIRED_VALUES = new Set([
   '--lane',
+  '--profile',
   '--resume',
   '--tui-mode',
   '-m',
   '--model',
+  '--system-prompt',
+  '--system-prompt-file',
+  '--append-system-prompt',
+  '--append-system-prompt-file',
 ]);
 const STARTUP_ENVIRONMENT_ALIASES: Readonly<Record<string, TuiBuildEnvironment>> = Object.freeze({
   test: 'test',

@@ -62,6 +62,7 @@ import {
 import { TuiDailyCheckinApplication } from '../checkin/application.js';
 import { TuiDailyCheckinHttpGateway } from '../checkin/http-gateway.js';
 import { createMcodeSharedAuthSession } from './auth-session.js';
+import type { McodeContextMode } from '@mavis/protocol/local';
 import { resolveTuiManagedBackendLane } from '../cli/environment.js';
 import {
   prepareTuiMcodeToolsIntegration,
@@ -78,9 +79,11 @@ export interface CreateTuiRuntimeOptions {
   version: string;
   configPath?: string;
   promptMode?: CreateLocalRuntimeHostOptions['promptMode'];
+  systemPromptOverrides?: CreateLocalRuntimeHostOptions['systemPromptOverrides'];
   surface?: TuiObservabilitySurface;
   observability?: TuiObservability;
   permissionMode?: NonNullable<LocalRuntimeConfig['permissionMode']>;
+  contextMode?: McodeContextMode;
   lane?: string;
 }
 
@@ -378,6 +381,9 @@ export async function createTuiRuntime(
     defaultWorkspaceDir: options.workspaceDir,
     appVersion: options.version,
     ...(options.promptMode ? { promptMode: options.promptMode } : {}),
+    ...(options.systemPromptOverrides
+      ? { systemPromptOverrides: options.systemPromptOverrides }
+      : {}),
     configGetter: () => {
       const config = getConfig();
       return {
@@ -495,6 +501,7 @@ export async function createTuiRuntime(
       adapter: new TuiRuntimeAdapter(host.cliService, {
         workspaceDir: options.workspaceDir,
         observability,
+        ...(options.contextMode ? { contextMode: options.contextMode } : {}),
         onSessionDeleted: browserProvider?.disposeSession
           ? browserProvider.disposeSession.bind(browserProvider)
           : (sessionId) => disposeTuiBrowserSessionStorage(options.dataDir, sessionId),

@@ -79,6 +79,17 @@ pnpm mcode provider list --json
 
 Providers created by `mcode provider add` are stored under `custom_provider` in the active profile's `config.yaml`. That tree is the supported home for any endpoint other than the official MiniMax API; `minimax_api` is reserved for the official endpoint and keeps its fixed authentication scheme.
 
+Google-compatible endpoints use Pi's native Google adapter. Add the model manually with a base URL ending at the API version (not `/models`):
+
+```bash
+mcode provider add --name "OpenCode Go Gemini" \
+  --base-url https://opencode.ai/inference/go/v1 \
+  --api-format google-generative-ai --model gemini-4-argon-contributor \
+  --api-key-env OPENCODE_API_KEY --use
+```
+
+Google requests use `x-goog-api-key`. Model requests, tool calls and thinking parameters are handled by Pi.
+
 Authentication follows the API format: `openai-completions` and `openai-responses` send `Authorization: Bearer <key>`, and `anthropic-messages` sends the key as `x-api-key`. A relay that expects Bearer authentication on an OpenAI-compatible endpoint therefore needs no extra configuration. If a relay only exposes an Anthropic-compatible endpoint (`/v1/messages`) and requires Bearer authentication, add explicit headers to the provider entry in `config.yaml`:
 
 ```yaml
@@ -153,6 +164,23 @@ text-only again, remove `image` from `modalities.input` and remove or set
 `capabilities.support_image` to `false`. Generic `attachment: true` alone does not
 declare image input support. Restart MCode after editing configuration and select
 the configured model with `/provider`, or use `exec --model` for a single run.
+
+Images stay in the conversation history, so a long session can carry more images
+than a provider accepts in one request. MCode sends only the 20 most recent images
+per request and replaces older ones with a short text note naming the original
+file; the stored history keeps every image. If your provider allows fewer images
+per request, set the limit on the model (Mistral's API is limited to 8
+automatically):
+
+```yaml
+custom_provider:
+  my-vision-provider:
+    models:
+      my-vision-model:
+        capabilities:
+          support_image: true
+          max_images_per_request: 8
+```
 
 After signing in to MiniMax, try a task that explicitly requires search:
 

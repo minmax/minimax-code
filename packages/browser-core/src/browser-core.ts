@@ -3,6 +3,12 @@ import { classifyBrowserNavigationEvent } from './browser-action-helpers.js';
 import { BrowserExtendedActionSupport } from './browser-extended-actions.js';
 import { isHoverSemanticSnapshot, resolveBrowserHoverSemantic } from './browser-hover-semantic.js';
 import {
+  BrowserScriptController,
+  BrowserScriptOperationError,
+  BROWSER_SCRIPT_CODE_MAX_BYTES,
+  resolveBrowserScriptTimeoutMs,
+} from './browser-script-runner.js';
+import {
   asNumber,
   asString,
   delay,
@@ -444,6 +450,8 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
         return this.query(this.state, { ...input, kind: 'dom' });
       case 'screenshot':
         return this.screenshot(this.state, input);
+      case 'run_script':
+        return this.runScript(this.state, input);
       case 'verify_text':
         return this.verifyText(input);
       case 'inspect_editable_targets':
@@ -452,6 +460,44 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
         throw new Error('PROVIDER_LIFECYCLE_ACTION: open_tab must be handled by the provider');
       default:
         throw new Error(`Unsupported Browser Core action: ${String(action)}`);
+    }
+  }
+
+  /**
+   * Run an untrusted script against the live tab inside an isolated worker.
+   * Arbitrary script side effects (navigation, DOM churn) can invalidate any
+   * opaque ref, so the element map is dropped unconditionally afterwards —
+   * same contract as a main-frame navigation.
+   */
+  private async runScript(state: BrowserSessionState, input: Record<string, unknown>): Promise<unknown> {
+    const code = asString(input.code);
+    if (!code) {
+      throw new BrowserScriptOperationError(
+        'RUN_SCRIPT_INPUT_INVALID',
+        'run_script requires inline script code; the caller resolves an input.path into code before dispatch',
+      );
+    }
+    if (Buffer.byteLength(code, 'utf8') > BROWSER_SCRIPT_CODE_MAX_BYTES) {
+      throw new BrowserScriptOperationError(
+        'RUN_SCRIPT_INPUT_INVALID',
+        `run_script code exceeds ${BROWSER_SCRIPT_CODE_MAX_BYTES} bytes`,
+      );
+    }
+    const controller = new BrowserScriptController({
+      transport: state.transport,
+      diagnostics: state.cdpHelper,
+      ...(state.inputCoordinateScaleProvider ? { coordinateScale: state.inputCoordinateScaleProvider } : {}),
+      ...(state.commandTimeoutMs !== undefined ? { commandTimeoutMs: state.commandTimeoutMs } : {}),
+      ...(state.commandSessionId !== undefined ? { commandSessionId: state.commandSessionId } : {}),
+      code,
+      filename: asString(input.filename) || 'run-script.js',
+      timeoutMs: resolveBrowserScriptTimeoutMs(input.timeout),
+      signal: state.commandSignal ?? new AbortController().signal,
+    });
+    try {
+      return await controller.run();
+    } finally {
+      this.invalidate(state);
     }
   }
 
@@ -690,6 +736,13 @@ function actionDeadline(
   fallback: number,
   focusedKeyboard = false,
 ): number {
+  if (action === 'run_script') {
+    // The script timeout governs; the action budget only adds teardown slack
+    // so a script that ends exactly at its own deadline is not killed by the
+    // outer action timer first.
+    const scriptMs = resolveBrowserScriptTimeoutMs(input.timeout);
+    return Math.min(scriptMs + ACTION_COMPLETION_BUFFER_MS, MAX_ACTION_WITH_COMPLETION_BUFFER_MS);
+  }
   const requested = Math.min(MAX_ACTION_TIMEOUT_MS, positiveDeadline(requestedMs, fallback));
   if (action === 'fill' || action === 'type') {
     const text = asString(input.text);

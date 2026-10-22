@@ -2,7 +2,8 @@ export type AgentReferenceResolutionSource =
   | 'stable_name'
   | 'display_name_compat'
   | 'canonical_name'
-  | 'explicit_agent';
+  | 'explicit_agent'
+  | 'plugin';
 
 /**
  * Neutral read scope shared by the local Agent capability and V1 consumers.

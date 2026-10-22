@@ -34,6 +34,12 @@ export interface LocalTurnToolSourcesInput {
   skipAgentResolution?: boolean;
   eventWriter?: PiEventWriter;
   sessionId: string;
+  /**
+   * Session classification of this Turn. `'task'` marks an unattended
+   * sub-agent Session, which keeps the recoverable-delete `rm` shim even when
+   * the main window disabled the destructive-delete guard.
+   */
+  sessionKind?: string;
   authContext?: LocalRuntimeAuthContext;
   routingContextGetter?: () => LocalRuntimeRoutingContext | undefined;
   fetchImpl?: typeof fetch;

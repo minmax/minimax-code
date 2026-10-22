@@ -1,3 +1,4 @@
+import { MINIMAX_MODELS } from "./minimax-model-catalog.js";
 import {
   resolveRunawayGuardConfig,
   type RunawayGuardSettings,
@@ -47,6 +48,7 @@ import {
   type AgentRuntimeConfig,
 } from "./agent-runtime-config.js";
 import { resolveDataDir } from "./data-dir.js";
+import { normalizeProfileSelector, readProfileEnv } from "./auth-profile.js";
 import type { ProviderAuthMode } from "./provider-auth-mode.js";
 import { parseAgentsConfig, type AgentsConfig } from "./agent-capabilities.js";
 import {
@@ -495,11 +497,9 @@ export interface BetaConfig {
    */
   mcodeTools: boolean;
   /**
-   * OpenAI Codex OAuth settings entry. Enabled by default in internal builds and development
-   * environments, regardless of the connected backend environment. Public prod / external staging /
-   * Inside / test builds expose the OAuth connection button in desktop model settings via
-   * `beta.codexOAuth: true`. Provider configuration stays in `config.yaml` and OAuth credentials
-   * stay in `<dataDir>/codex-auth.json`.
+   * OpenAI Codex OAuth model settings entry. Enabled by default in every build environment and
+   * release package; set `beta.codexOAuth: false` to hide it. Provider configuration stays in
+   * `config.yaml` and OAuth credentials stay in `<dataDir>/codex-auth.json`.
    */
   codexOAuth: boolean;
 }
@@ -648,9 +648,7 @@ export const BETA_FEATURE_DEFS = {
     configurableVisibility: "online",
   },
   codexOAuth: {
-    defaultVisibility: "none",
-    defaultBuildEnvironments: ["dev"],
-    defaultBuildVariants: ["internal"],
+    defaultVisibility: "online",
     configurableVisibility: "online",
   },
 } satisfies Record<keyof BetaConfig, BetaFeatureDef>;
@@ -675,7 +673,7 @@ function getBetaFeatureChannel(
 }
 
 // Variant defaults depend only on variant flags: internal builds use buildEnv=staging but remain on the internal release lane
-// and must retain internal defaults such as codexOAuth. Inside builds still use buildEnv=prod.
+// and must retain internal defaults. Inside builds still use buildEnv=prod.
 function isDefaultEnabledForBuildVariant(
   def: BetaFeatureDef,
   context: BetaFeatureResolutionContext,
@@ -889,6 +887,17 @@ export interface ContextManagementConfig {
    * Default: 5.
    */
   cuMaxScreenshotsInContext: number;
+
+  /**
+   * Upper bound for the automatic context compaction trigger.
+   *
+   * A value in `(0, 1]` is a ratio of the current model's context window;
+   * an integer above 1 is an absolute token count. The effective trigger is
+   * the lower of this value and the built-in trigger, so it can only make
+   * compaction start earlier. The runtime ignores invalid numbers (such as
+   * `1.5`) with a warning. Unset keeps the built-in behavior.
+   */
+  compactionTriggerAt?: number;
 }
 
 /**
@@ -1019,6 +1028,8 @@ export interface Config {
   cuBackend: CuBackend;
   /** Built-in local code review behavior. */
   review: ReviewConfig;
+  /** Fetch the selected upstream before creating a new worktree. */
+  worktreeRefreshBeforeCreate: boolean;
   /** Automatic prompt delivery policy. */
   promptConfig: PromptConfig;
   /** Durable Goal policy, budgets, breaker, and verifier defaults. */
@@ -1077,6 +1088,8 @@ export interface ModelCapabilitiesConfig {
   max_video_bytes_inline?: number | string;
   max_request_body_bytes?: number | string;
   max_attachments_count?: number | string;
+  /** Most images one provider request may carry; older history images become placeholders. */
+  max_images_per_request?: number | string;
   [key: string]: unknown;
 }
 
@@ -1137,6 +1150,8 @@ export interface ProviderConfig {
   id?: string;
   npm?: string;
   models?: Record<string, ModelConfig>;
+  /** Read-time reference to the official catalog before user Context selections. */
+  catalogModels?: Record<string, ModelConfig>;
   /** Display order for managed models; omitted models retain their catalog order. */
   model_order?: string[];
   blacklist?: string[];
@@ -1159,7 +1174,7 @@ export interface MinimaxApiConfig {
   apiKey?: string;
   /** Optional endpoint override; defaults to the runtime's builtin MiniMax API endpoint. */
   baseURL?: string;
-  /** User-owned context selections applied only to the independent MiniMax API catalog. */
+  /** User-owned Context selections for the API route of the shared MiniMax catalog. */
   modelContextLimits?: Record<string, number>;
 }
 
@@ -1217,21 +1232,51 @@ function runtimeEnv(suffix: string): string | undefined {
     : undefined;
 }
 
+/**
+ * Read a root option value out of `process.argv`.
+ *
+ * This runs before commander parses anything, because the data directory and
+ * the identity it selects must be known that early. Two rules keep it
+ * consistent with commander:
+ *
+ * - Scanning stops at `--`. Everything after it is positional text, so
+ *   `mcode exec -- --profile work` passes a prompt, it does not select a
+ *   profile.
+ * - The **last** occurrence wins, matching commander's default. Returning the
+ *   first would let `--profile work --profile personal` start in one account
+ *   while commander reports the other.
+ */
 function cliArgValue(name: string): string | undefined {
   const flag = `--${name}`;
+  let value: string | undefined;
   for (let i = 2; i < process.argv.length; i++) {
     const arg = process.argv[i];
-    if (arg === flag) return process.argv[i + 1];
-    if (arg?.startsWith(`${flag}=`)) return arg.slice(flag.length + 1);
+    if (arg === "--") break;
+    if (arg === flag) {
+      const next = process.argv[i + 1];
+      // A following flag is not this option's value. Report it as missing
+      // rather than passing `--env` down as a profile name and failing
+      // validation with a misleading message.
+      value = next === undefined || next.startsWith("-") ? undefined : next;
+      i++;
+      continue;
+    }
+    if (arg?.startsWith(`${flag}=`)) {
+      const inline = arg.slice(flag.length + 1);
+      value = inline.length > 0 ? inline : undefined;
+    }
   }
-  return undefined;
+  return value;
 }
 
 function hasCliFlag(name: string): boolean {
   const flag = `--${name}`;
-  return process.argv
-    .slice(2)
-    .some((arg) => arg === flag || arg.startsWith(`${flag}=`));
+  for (let i = 2; i < process.argv.length; i++) {
+    const arg = process.argv[i];
+    if (arg === "--") return false;
+    if (arg === flag || arg?.startsWith(`${flag}=`)) return true;
+  }
+  return false;
 }
 
 export const DEFAULT_PORT = 5321;
@@ -1330,9 +1375,19 @@ function shouldUseGitAutoConfig(): boolean {
   return true;
 }
 
+/**
+ * Resolve the explicitly requested profile from `--profile`, `MINIMAX_PROFILE`,
+ * or the gated legacy runtime variable.
+ *
+ * A non-blank selector is validated rather than sanitised. The value becomes a
+ * directory segment, so an unusable name must fail loudly instead of silently
+ * resolving to the default profile and its credentials.
+ *
+ * @throws {InvalidProfileNameError}
+ */
 function getExplicitProfileEnv(): string | null {
-  const profile = cliArgValue("profile") ?? runtimeEnv("PROFILE");
-  return profile && profile.length > 0 ? profile : null;
+  const profile = cliArgValue("profile") ?? readProfileEnv() ?? runtimeEnv("PROFILE");
+  return normalizeProfileSelector(profile);
 }
 
 function getExplicitPortEnv(): number | null {
@@ -1516,80 +1571,6 @@ export function getConfigPath(): string {
 // Default provider presets per environment combo (MAVIS_REGION x MAVIS_BUILD_ENV)
 // ---------------------------------------------------------------------------
 
-const MINIMAX_M3_FILE_API_CAPABILITIES: ModelCapabilitiesConfig = {
-  support_files_api: true,
-  files_api_upload_endpoint: "/v1/files/upload",
-  max_image_bytes_inline: 10_485_760,
-  max_video_bytes_inline: 52_428_800,
-  max_request_body_bytes: 67_108_864,
-  max_attachments_count: 4,
-};
-
-const MINIMAX_MODELS: Record<string, ModelConfig> = {
-  "MiniMax-M3": {
-    name: "MiniMax-M3",
-    attachment: true,
-    reasoning: true,
-    tool_call: true,
-    temperature: true,
-    modalities: { input: ["text", "image", "video"], output: ["text"] },
-    limit: { context: 512000, output: 128000 },
-    contextWindowOptions: [512000, 1000000],
-    contextWindowOptionHints: { "1000000": "higher_usage" },
-    options: { reasoningSummary: "auto" },
-    thinking_config: { mode: "switchable", default_value: "true" },
-    variants: {
-      "none-thinking": { thinking: { type: "disabled" } },
-      thinking: { thinking: { type: "adaptive" } },
-    },
-    capabilities: MINIMAX_M3_FILE_API_CAPABILITIES,
-  },
-  "MiniMax-M3.1-Flash-Preview": {
-    name: "M3.1-Flash-Preview",
-    attachment: true,
-    reasoning: true,
-    tool_call: true,
-    temperature: true,
-    modalities: { input: ["text", "image", "video"], output: ["text"] },
-    limit: { context: 512000, output: 128000 },
-    contextWindowOptions: [512000, 1000000],
-    contextWindowOptionHints: { "1000000": "higher_usage" },
-    options: { reasoningSummary: "auto" },
-    thinking: {
-      effortOptions: ["default", "low", "medium", "high", "xhigh", "max"],
-      defaultEffort: "default",
-    },
-    thinking_config: { mode: "forced_on" },
-    variants: {
-      "none-thinking": { thinking: { type: "disabled" } },
-      thinking: { thinking: { type: "adaptive" } },
-    },
-    capabilities: MINIMAX_M3_FILE_API_CAPABILITIES,
-  },
-  "MiniMax-M2.7-highspeed": {
-    name: "MiniMax-M2.7-highspeed",
-    attachment: false,
-    reasoning: true,
-    tool_call: true,
-    temperature: true,
-    modalities: { input: ["text"], output: ["text"] },
-    limit: { context: 200000, output: 128000 },
-  },
-  "MiniMax-M2.7": {
-    name: "MiniMax-M2.7",
-    attachment: false,
-    reasoning: true,
-    tool_call: true,
-    temperature: true,
-    modalities: { input: ["text"], output: ["text"] },
-    limit: { context: 200000, output: 128000 },
-  },
-};
-
-/** MiniMax models the user's own API key may call and the first-run managed fallback. */
-export const MINIMAX_API_MODEL_CATALOG: Record<string, ModelConfig> =
-  MINIMAX_MODELS;
-
 const PRESET_BASE_URLS: Record<PresetKey, string> = {
   "cn-test": "https://matrix-test.example.invalid/mavis/api/v1/llm/v1",
   "cn-dev": "https://matrix-test.example.invalid/mavis/api/v1/llm/v1",
@@ -1708,7 +1689,7 @@ function buildPresetEntry(key: PresetKey) {
   };
   return {
     provider: { minimax: provider } as ModelsConfig,
-    defaultModel: "minimax/MiniMax-M3",
+    defaultModel: "minimax/MiniMax-M3.1-Flash",
   };
 }
 
@@ -1836,6 +1817,7 @@ const DEFAULTS: Omit<
   },
   logRetentionDays: 3,
   cuBackend: DEFAULT_CU_BACKEND,
+  worktreeRefreshBeforeCreate: true,
   review: {
     mode: "subagent",
     modeSource: "default",
@@ -2129,6 +2111,7 @@ export function resolveConfigFromRaw(
     mcpToolSearch: parseMcpToolSearchConfig(raw),
     cuBackend: parseCuBackend(raw.cuBackend),
     review: parseReviewConfig(raw.review, DEFAULTS.review),
+    worktreeRefreshBeforeCreate: raw.worktreeRefreshBeforeCreate !== false,
     promptConfig: resolvePromptConfig(raw.promptConfig),
     goal: goalParsed.config,
     goalWarnings: goalParsed.warnings,
@@ -2562,7 +2545,18 @@ function parseContextManagementConfig(
       ? Math.floor(rawCuMax)
       : defaults.cuMaxScreenshotsInContext;
 
-  return { disableSystemReminderModels, cuMaxScreenshotsInContext };
+  // Semantic validation (ratio vs. token count) lives with the trigger in
+  // @mavis/context-manager; keep numbers so the runtime can warn on bad ones.
+  const compactionTriggerAt =
+    typeof obj.compactionTriggerAt === "number"
+      ? obj.compactionTriggerAt
+      : undefined;
+
+  return {
+    disableSystemReminderModels,
+    cuMaxScreenshotsInContext,
+    ...(compactionTriggerAt === undefined ? {} : { compactionTriggerAt }),
+  };
 }
 
 // ── Agent Runtime config parsing — see ./agent-runtime-config.ts for the

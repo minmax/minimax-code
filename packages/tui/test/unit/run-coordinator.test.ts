@@ -237,6 +237,34 @@ describe('TuiRunCoordinator', () => {
     );
   });
 
+  it('fires timeouts above the Node timer limit only at the requested deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const timeoutRuntime = createRuntime(async function* pendingTimeout(_req, signal) {
+        yield* [];
+        await new Promise<void>((resolve) =>
+          signal?.addEventListener('abort', () => resolve(), { once: true }),
+        );
+      });
+      // 200 ms beyond Node's 32-bit timer limit; a plain setTimeout would
+      // clamp this to 1 ms and cancel the run almost immediately.
+      const timed = new TuiRunCoordinator(timeoutRuntime, { nowMs: () => 1_000 }).execute({
+        ...request('turn-timeout-overflow'),
+        policy: { timeoutMs: 2_147_483_847 },
+      });
+      expect(timeoutRuntime.abortSession).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_147_483_647);
+      expect(timeoutRuntime.abortSession).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(200);
+      await expect(timed).resolves.toMatchObject({ status: 'timeout' });
+      expect(timeoutRuntime.abortSession).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'timeout' }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reports a Runtime questionnaire as awaiting continuation without aborting it', async () => {
     const runtime = createRuntime(async function* () {
       yield {
@@ -254,6 +282,17 @@ describe('TuiRunCoordinator', () => {
     });
     expect(runtime.abortSession).not.toHaveBeenCalled();
   });
+
+  it.each(['questionnaire.dismiss', 'questionnaire.superseded'])(
+    'does not mistake %s for a new continuation', async (eventType) => {
+      const runtime = createRuntime(async function* () {
+        yield { type: 'generic', eventType, data: { requestId: 'old-ask' } } as const;
+        yield { type: 'message', message: { role: 'assistant', content: 'Final answer' } } as const;
+      });
+      await expect(new TuiRunCoordinator(runtime).execute(request('turn-after-dismiss')))
+        .resolves.toMatchObject({ status: 'succeeded', outcome: { answer: 'Final answer' } });
+    },
+  );
 
   it('leaves permission interaction ownership to the active surface', async () => {
     const runtime = createRuntime(async function* () {
@@ -297,6 +336,48 @@ describe('TuiRunCoordinator', () => {
       status: 'failed',
       outcome: { error: { code: 'EMPTY_RESPONSE' } },
     });
+  });
+
+  it.each(['message', 'delta'] as const)(
+    'keeps a quickly answered questionnaire as a continuation from its %s tool result',
+    async (type) => {
+      const toolCalls = [{
+        name: 'ask_user', status: 2,
+        output: { details: { request_id: 'ask-fast', waiting_for_user: true } },
+      }];
+      const runtime = {
+        ...createRuntime(async function* (): AsyncGenerator<TuiStreamEvent> {
+          yield type === 'message'
+            ? { type, message: { role: 'assistant', turnId: 'turn-fast', toolCalls } }
+            : { type, turnId: 'turn-fast', toolCalls };
+          yield { type: 'done' };
+        }),
+        getPendingQuestionnaire: vi.fn(async () => undefined),
+      };
+      await expect(new TuiRunCoordinator(runtime).execute({
+        ...request('turn-fast'), policy: { requireAnswer: true },
+      })).resolves.toMatchObject({
+        status: 'awaiting-user-continuation',
+        outcome: { error: { code: 'QUESTIONNAIRE_REQUIRED' } },
+      });
+    },
+  );
+
+  it.each([
+    { waiting: false, owner: 'turn-empty', status: 2 },
+    { waiting: true, owner: 'turn-old', status: 2 },
+    { waiting: true, owner: 'turn-empty', status: 3 },
+  ])('does not hide an empty response behind an unowned or suppressed tool result %j', async (test) => {
+    const runtime = createRuntime(async function* (): AsyncGenerator<TuiStreamEvent> {
+      yield {
+        type: 'delta', turnId: test.owner,
+        toolCalls: [{ name: 'ask_user', status: test.status, output: { details: { waiting_for_user: test.waiting } } }],
+      };
+      yield { type: 'done' };
+    });
+    await expect(new TuiRunCoordinator(runtime).execute({
+      ...request('turn-empty'), policy: { requireAnswer: true },
+    })).resolves.toMatchObject({ status: 'failed', outcome: { error: { code: 'EMPTY_RESPONSE' } } });
   });
 
   it('accepts a final assistant response delivered only as text deltas', async () => {

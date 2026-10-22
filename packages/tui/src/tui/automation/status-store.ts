@@ -17,16 +17,24 @@ export interface TuiAutomationStatusFacts {
   readonly compacting: boolean;
   readonly retrying: boolean;
   readonly agentCounts?: { readonly active: number; readonly total: number };
+  readonly backgroundTasks?: number;
 }
 
 export interface TuiAutomationStatusSnapshot {
   readonly seq: string;
   readonly status: TuiAgentStatus;
+  /**
+   * `error` caused by a missing login rather than a fatal failure. The `[V]`
+   * line still reports `error`; human-facing outputs can say that login is
+   * needed. Derived from current account facts, so it clears after login.
+   */
+  readonly loginRequired?: true;
   readonly sessionId?: string;
   readonly turnId?: string;
   readonly requestId?: string;
   readonly activeAgents: number;
   readonly totalAgents: number;
+  readonly backgroundTasks: number;
 }
 
 type AutomationStatusTuple = Omit<TuiAutomationStatusSnapshot, 'seq'>;
@@ -80,8 +88,8 @@ export class TuiAutomationStatusStore {
       acceptedSettledTurn?.status === 'failed' || acceptedSettledTurn?.status === 'blocked';
     if (
       facts.interaction?.kind === 'invalid' ||
-      (facts.snapshot.account && tuiAccountNeedsLoginPrompt(facts.snapshot.account)) ||
       (facts.snapshot.status === 'error' &&
+        !(facts.snapshot.account && tuiAccountNeedsLoginPrompt(facts.snapshot.account)) &&
         facts.snapshot.errorRetryable === false &&
         !activeTurnId &&
         !this.pendingTurnId &&
@@ -99,6 +107,7 @@ export class TuiAutomationStatusStore {
       activeTurnId,
       activeAgents,
       totalAgents,
+      backgroundTasks: boundedCount(facts.backgroundTasks),
     });
     const semanticKey = tupleKey(tuple);
     if (this.semanticKey === undefined) {
@@ -117,9 +126,14 @@ export class TuiAutomationStatusStore {
       readonly activeTurnId?: string;
       readonly activeAgents: number;
       readonly totalAgents: number;
+      readonly backgroundTasks: number;
     },
   ): AutomationStatusTuple {
-    const counts = { activeAgents: facts.activeAgents, totalAgents: facts.totalAgents };
+    const counts = {
+      activeAgents: facts.activeAgents,
+      totalAgents: facts.totalAgents,
+      backgroundTasks: facts.backgroundTasks,
+    };
     const session = facts.sessionId ? { sessionId: facts.sessionId } : {};
 
     // A disconnected or reconciling SSE projection cannot prove ready or terminal.
@@ -129,6 +143,11 @@ export class TuiAutomationStatusStore {
 
     if (this.stickyFatalError) {
       return { status: 'error', ...session, ...counts };
+    }
+
+    // Login is recoverable within the same Session; derive it from current account facts.
+    if (facts.snapshot.account && tuiAccountNeedsLoginPrompt(facts.snapshot.account)) {
+      return { status: 'error', loginRequired: true, ...session, ...counts };
     }
 
     if (facts.snapshot.status === 'error') {
@@ -237,6 +256,7 @@ function tupleKey(tuple: AutomationStatusTuple): string {
     tuple.requestId ?? '',
     tuple.activeAgents,
     tuple.totalAgents,
+    tuple.backgroundTasks,
   ].join('\u0000');
 }
 
