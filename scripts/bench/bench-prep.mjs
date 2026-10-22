@@ -3,9 +3,12 @@
 // any history length; goal ≤5 ms warm") through the RUNTIME COMPOSITION —
 // `ContextWirePipeline.prepare()`, the exact request path:
 // convertEntry → compiledEntryToWireEntry → compiledRecordDialect, with the
-// per-entry conversion NOT memoized across prepares (it re-runs for every
-// window segment on every prepare, exactly as in
-// packages/local-runtime-v2/.../context-wire.ts).
+// per-entry conversion MEMOIZED across prepares by
+// `(entryId, dialect, normalizerVersion, residency cacheState)` (judge round
+// 2, final-architecture.md:74/:90): a warm prepare re-converts only the
+// delta — new entries and residency flips — and serves every other record
+// from the conversion memo, exactly as
+// packages/local-runtime-v2/.../context-wire.ts does.
 //
 // Image residency (Ф2 R2, judge round 1): the window's image entries are
 // published into a real CAS and wrapped in the Context MMU (budget
@@ -28,8 +31,8 @@
 //                    per iteration; every segment converted + serialized +
 //                    hashed fresh. Gates at ≤50 ms p95.
 //   prep.warmP95Ms — the steady state: one warm pipeline; 100% segment-cache
-//                    hits, no re-hashing — but the per-entry conversion still
-//                    runs, because that is what the runtime does. Gates at
+//                    hits, no re-hashing, and the conversion served from the
+//                    memo (O(delta)). Gates at
 //                    ≤8 ms p95. METHODOLOGY: MEDIAN-OF-5-WINDOWS, warmup
 //                    discarded (WARM_PASSES env, default 5; pass 0 is a
 //                    warmup and does not enter the median) — a single-window
@@ -181,7 +184,7 @@ for (let i = 0; i < iters; i += 1) {
 }
 
 // ── Warm: one pipeline, pre-warmed; the steady-state prepare — cache hits,
-// no re-hashing, conversion still runs per segment (the runtime behavior).
+// no re-hashing, the per-entry conversion served from the memo (O(delta)).
 // The gate metric is the MEDIAN of per-pass p95s over WARM_PASSES passes
 // (the bench-worker-commit.mjs stall methodology, 6d2cbdb): pass 0 is a
 // warmup (JIT, allocator, first-touch page faults) and is discarded from the

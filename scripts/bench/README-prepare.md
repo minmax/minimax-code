@@ -32,13 +32,16 @@ budgets the architecture pins on it:
    `ProjectionService.fromCapsule` with the MMU-backed residency policy
    (text pages always resident; image pages follow the MMU's LRU decision).
    Reported as the median of `OPEN_ITERS` runs.
-4. **Prepare** — the per-request path: `llmContext()` through the residency
-   policy, `convertEntry` per window entry (the pinned per-entry stage from
-   `@mavis/convert-to-llm`), `compiledEntryToWireEntry`, then `compile()`
-   (`@mavis/wire-compiler`) with the 32 MiB guard, the compiled-record
-   dialect and a persistent segment cache — hashes on cache misses only, the
-   runtime steady state. A separate cold + fully-hashed pass (`prep.coldMs`)
-   produces the body the mock verifies.
+4. **Prepare** — the per-request path through the RUNTIME COMPOSITION
+   (`local-runtime-v2` `context-wire.ts` `compileWindow`, the engine of
+   `ContextWirePipeline.prepare()`): `llmContext()` through the residency
+   policy, then the per-entry conversion stage MEMOIZED by
+   `(entryId, dialect, normalizerVersion, residency cacheState)` (the pinned
+   `@mavis/convert-to-llm` stage; a warm prepare re-converts only the delta),
+   then `compile()` (`@mavis/wire-compiler`) with the 32 MiB guard, the
+   compiled-record dialect and a persistent segment cache — hashes on cache
+   misses only, the runtime steady state. A separate cold + fully-hashed
+   pass (`prep.coldMs`) produces the body the mock verifies.
 5. **LLM-mock** — the provider is replaced by a body verification, no
    network: NDJSON line boundaries (every segment ends with LF and the
    segments cover the body exactly), per-segment sha256 re-hashing, the
@@ -82,15 +85,20 @@ HEAVY_IMAGES=1 node --conditions=development --experimental-transform-types --ex
 
 # 10× size: 20610 entries — history-length independence of prep/payload
 N_ENTRIES=20610 node --conditions=development --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
+
+# big text window: 4000-entry history, 2000-entry window of 16-KiB texts
+# (~32 MiB payload — the full wire budget). The warm prepare must stay
+# O(delta) at the memoized conversion stage and hold the RSS budget.
+N_ENTRIES=4000 WINDOW=2000 ENTRY_TEXT_KIB=16 node --conditions=development --experimental-transform-types --expose-gc scripts/bench/bench-prepare.mjs
 ```
 
-All three profiles must print `gate=PASS` and exit 0.
+All four profiles must print `gate=PASS` and exit 0.
 
 ## Metrics (`name=value` lines)
 
 | Metric | Meaning |
 | --- | --- |
-| `prep.p50Ms` / `prep.p95Ms` / `prep.maxMs` | warm per-request prepare (conversion re-runs, segments served from the cache, no re-hashing); the gate consumes `prep.p95Ms` |
+| `prep.p50Ms` / `prep.p95Ms` / `prep.maxMs` | warm per-request prepare (conversion served from the memo — O(delta), segments from the cache, no re-hashing); the gate consumes `prep.p95Ms` |
 | `prep.coldMs` | one fully-hashed cold pass (every segment serialized + sha256'd — the degraded equivalence mode) |
 | `payload.bytes` | exact byte length of the compiled NDJSON body — the wire byte truth; gate consumer |
 | `payload.sha256` | digest of the verified body (stable across runs: the corpus is deterministic) |
@@ -110,7 +118,7 @@ All three profiles must print `gate=PASS` and exit 0.
 | `WINDOW` | `200` | LLM window kept after the trailing compaction commit |
 | `ITERS` | `30` | warm prepare samples |
 | `OPEN_ITERS` | `5` | head-open samples (median reported) |
-| `ENTRY_TEXT_KIB` | `2` | text bytes per non-image entry |
+| `ENTRY_TEXT_KIB` | `2` | text bytes per non-image entry (the big-window profile raises it to 16) |
 | `MAX_PAYLOAD_BYTES` | `33554432` | wire budget (32 MiB) and `compile()` guard |
 | `PREP_BUDGET_MS` | `50` | prep p95 gate |
 | `MMU_RESIDENT_BYTES` | `12582912` | Context MMU resident budget (12 MiB) |
