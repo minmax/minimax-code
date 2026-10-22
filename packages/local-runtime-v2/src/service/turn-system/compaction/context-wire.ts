@@ -17,10 +17,18 @@
 //
 // — and exposes the two operations the turn loop needs: `applyCommit` per
 // durable commit (O(entries of the commit)) and `prepare()` per provider
-// request (O(window); warm requests reuse cached segments without
-// re-hashing). The byte guard (`maxBytes`) runs inside every `prepare`, so a
-// payload breach fails the request preparation with `WireBudgetExceeded`
-// before anything is sent.
+// request. `prepare()` is warm-path O(delta) at the conversion stage: the
+// per-entry stage is MEMOIZED by the convert-to-llm record key
+// `(entryId, dialect, normalizerVersion)` — including the residency
+// `#resident@<sha16>` cache state — so only new or residency-flipped entries
+// re-convert (final-architecture.md:74/:90); segment bytes and hashing were
+// already cached below it (wire-compiler LRU). The byte guard (`maxBytes`)
+// runs inside every `prepare`, so a payload breach fails the request
+// preparation with `WireBudgetExceeded` before anything is sent — and the
+// optional `ContextWireOptions.compaction` seam wires the byte-axis trigger
+// (a real `BackgroundCompactionScheduler`) so the window compacts UP TO that
+// guard (75%/90% of `maxBytes` by default) instead of at it
+// (final-architecture.md:397).
 //
 // Window selection (steering D+C contract, `convert-to-llm/src/audit.ts`):
 // the projection manifest never carries `mcode.*` segments, but TWO control
@@ -58,16 +66,31 @@ import {
 import {
   convertEntry,
   convertEntryTails,
+  compileKey,
   decodeEntryPayload,
   isPlacedEntryKind,
   isReminderEntryKind,
   isVisibleControlKind,
+  MINIMAX_M3_DIALECT,
+  recordCacheKey,
+  type CompiledEntry,
   type ImageRendering,
 } from '../../../../../convert-to-llm/src/index.js';
 // Context MMU: type-only here (the runtime wires the instance in via
 // `ContextWireOptions.residency`) — the packages do not link until the
 // integrator registers them, same as the backend types above.
 import type { ContextMmu, PageHandle } from '../../../../../context-mmu/src/index.js';
+// Background compaction (the `pi-durable-background-compaction` slot): the
+// double-trigger scheduler the composed pipeline drives from `applyCommit`.
+// Workspace-relative like every wave-2 import above.
+import {
+  createBackgroundCompactionScheduler,
+  type BackgroundCompactionScheduler,
+  type CompactionBudgets,
+  type DurableEntryDraft,
+  type LogEntry,
+  type Summarizer,
+} from '../../../../../context-compaction/src/index.js';
 import {
   WireBudgetExceeded,
   compile,
@@ -120,6 +143,88 @@ export interface ContextWireResidency {
   readonly pageOf: (entry: Entry) => PageHandle | undefined;
 }
 
+/**
+ * Memo cache of the per-entry conversion stage (Ф2: `pi-convert-to-llm` is
+ * "the memoized per-entry stage inside the wire compiler",
+ * final-architecture.md:74/:90). `records` maps {@link recordCacheKey} —
+ * `(entryId, dialect, normalizerVersion)` extended with the residency
+ * `cacheState` (`resident@<sha16>`) when a rendering is active — to the
+ * converted record (`null` included: an audit/control page converts to
+ * `null`, and memoizing that keeps the miss a one-time cost too). `tails`
+ * maps the base key (a `#tails` suffix namespace) to the entry's reminder
+ * tail records — rendering-independent by convert-to-llm's rule (a tail's
+ * bytes are its reminder block, which no image rendering can touch).
+ *
+ * Correctness rests on the same frozen-entry guarantee the wire compiler's
+ * segment cache already rests on (wire-compiler `compile.ts`): an entryId
+ * never maps to different content, and a rendering change folds its
+ * `cacheState` into the key.
+ *
+ * The memo is pruned to the keys of the CURRENT window after every
+ * {@link compileWindow} pass, so it holds O(window), never O(history).
+ */
+export interface ContextWireConversionMemo {
+  readonly records: Map<string, CompiledEntry | null>;
+  readonly tails: Map<string, readonly CompiledEntry[]>;
+}
+
+/** Fresh conversion memo (one pipeline's warm-path state). */
+export function createConversionMemo(): ContextWireConversionMemo {
+  return { records: new Map(), tails: new Map() };
+}
+
+/** Memo key of one entry's primary record under its residency rendering. */
+function conversionMemoKey(entryId: string, rendering: ImageRendering | undefined): string {
+  return recordCacheKey(entryId, MINIMAX_M3_DIALECT, rendering);
+}
+
+/** Memo key of one entry's reminder tail records (rendering-independent). */
+function tailsMemoKey(entryId: string): string {
+  return `${compileKey(entryId, MINIMAX_M3_DIALECT)}#tails`;
+}
+
+/**
+ * Background-compaction seam (Ф2: "`pi-compaction`/`split-turn`/
+ * `overflow-recovery` with the byte trigger; background-compaction as the
+ * scheduler", final-architecture.md:397) — the composed pipeline OWNS the
+ * double trigger when this is wired: {@link BackgroundCompactionScheduler}
+ * is created over the caller's log/append/summarizer and notified on every
+ * {@link ContextWirePipeline.applyCommit}.
+ *
+ * The byte axis defaults to the pipeline's wire guard (`maxBytes`, the Ф2
+ * 32-МБ payload budget): the window compacts UP TO the guard — background
+ * compaction starts at 75% of the budget, compaction becomes blocking at
+ * 90% — and the wire guard itself stays the last-resort hard line that fails
+ * a request with {@link WireBudgetExceeded}, never the working trigger.
+ *
+ * The caller owns the durable side: `entries` serves the raw append-only log
+ * in the compaction package's vocabulary (`mcode.message` / `mcode.system` /
+ * ... — adapting the session's own message kinds is the log owner's job, and
+ * the `mcode.*` control kinds pass through natively; a compaction checkpoint
+ * MUST be visible there, it is what resets the byte axis), `append`
+ * persists the produced `mcode.compaction` draft under the writer gate AND
+ * applies it back into this pipeline (via `applyCommit`), so the next
+ * `prepare()` compiles the cut window. A blocking-level job (90%) must be
+ * awaited before the next provider request —
+ * {@link ContextWirePipeline.whenCompactionIdle} is that admission point.
+ */
+export interface ContextWireCompaction {
+  /** Summary backend of `pi-compaction` (an injected async function). */
+  readonly summarizer: Summarizer;
+  /** Live append-only session log, oldest first, growing only. */
+  readonly entries: () => readonly LogEntry[];
+  /** Durable append of checkpoint drafts (writer-gated; applies back into the pipeline). */
+  readonly append: (drafts: readonly DurableEntryDraft[]) => Promise<void>;
+  /**
+   * Double-trigger budgets. `byteBudget` defaults to the pipeline's
+   * `maxBytes` (the wire guard) when omitted; `tokenBudget` has no default —
+   * set it to enable the token axis (`0` disables an axis).
+   */
+  readonly budgets?: Omit<CompactionBudgets, 'byteBudget'> & { readonly byteBudget?: number };
+  /** Recent-context budget for the cut point. Default: the scheduler's own. */
+  readonly keepRecentTokens?: number;
+}
+
 export interface ContextWireOptions {
   /**
    * Hard cap on the compiled provider payload in bytes; `prepare()` throws
@@ -132,6 +237,12 @@ export interface ContextWireOptions {
   readonly cache?: WireSegmentCache;
   /** Context-MMU image residency (Ф2 R2). Default: everything evicted. */
   readonly residency?: ContextWireResidency;
+  /**
+   * Background-compaction seam; when wired, the pipeline creates and drives
+   * the double-trigger scheduler (byte axis defaults to `maxBytes`).
+   * Default: no scheduler — the wire guard alone bounds the window.
+   */
+  readonly compaction?: ContextWireCompaction;
 }
 
 /** The prepared provider payload plus the facts the turn loop reports. */
@@ -158,14 +269,40 @@ export class ContextWirePipeline {
   private readonly cache: WireSegmentCache;
   private readonly maxBytes: number;
   private readonly residency: ContextWireResidency | undefined;
+  private readonly scheduler: BackgroundCompactionScheduler | undefined;
   /** Content pages of the current window; pruned to the manifest after each commit. */
   private readonly content = new Map<string, Entry>();
+  /** Warm-path conversion memo: one record per `(entryId, dialect, cacheState)`. */
+  private readonly conversions: ContextWireConversionMemo = createConversionMemo();
 
   constructor(options?: ContextWireOptions) {
     this.service = new ProjectionService();
     this.maxBytes = options?.maxBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
     this.cache = options?.cache ?? createLruSegmentCache(options?.cacheCapacity ?? 4096);
     this.residency = options?.residency;
+    // The byte axis defaults to the WIRE GUARD: compaction must shrink the
+    // window up to (75%/90% of) the payload budget, never let the guard
+    // become the only line of defense (final-architecture.md:397).
+    const compaction = options?.compaction;
+    this.scheduler =
+      compaction === undefined
+        ? undefined
+        : createBackgroundCompactionScheduler({
+            budgets: {
+              ...compaction.budgets,
+              byteBudget: compaction.budgets?.byteBudget ?? this.maxBytes,
+            },
+            session: {
+              // The seam serves the log through a callback (`entries()`); the
+              // scheduler's session wants the live array itself.
+              get entries() {
+                return compaction.entries();
+              },
+              append: compaction.append,
+            },
+            summarizer: compaction.summarizer,
+            keepRecentTokens: compaction.keepRecentTokens,
+          });
   }
 
   /**
@@ -186,7 +323,27 @@ export class ContextWirePipeline {
     for (const entry of commit.entries) this.content.set(entry.id, entry);
     this.service.apply(commit);
     this.pruneToWindow();
+    // The double trigger is evaluated at the O(delta) moment — bytes grow
+    // here, not in prepare(). A background-level crossing starts the job
+    // fire-and-forget; a blocking-level crossing starts the same job and the
+    // turn loop awaits it via `whenCompactionIdle()` before the next request.
+    this.scheduler?.notify();
     return this.service.manifest();
+  }
+
+  /**
+   * Resolves when no compaction job is in flight — the admission point the
+   * turn loop awaits before the next `prepare()` (a blocking-level crossing
+   * at 90% of the byte budget must cut the window BEFORE the request is
+   * compiled). Resolves immediately without the compaction seam.
+   */
+  whenCompactionIdle(): Promise<void> {
+    return this.scheduler?.whenIdle() ?? Promise.resolve();
+  }
+
+  /** The double-trigger scheduler when the compaction seam is wired. */
+  get compactionScheduler(): BackgroundCompactionScheduler | undefined {
+    return this.scheduler;
   }
 
   /** Current window manifest snapshot. */
@@ -205,9 +362,14 @@ export class ContextWirePipeline {
   }
 
   /**
-   * Compiles the current window into the provider payload. Warm requests pay
-   * O(window) arithmetic — cached segments, no re-hashing; cold segments
-   * serialize once and are cached by `(dialect, version, entryId)`.
+   * Compiles the current window into the provider payload. The per-entry
+   * conversion stage is MEMOIZED across prepares by
+   * `(entryId, dialect, normalizerVersion, residency cacheState)` —
+   * final-architecture.md:74/:90 — so a warm request re-converts only the
+   * delta (entries appended since the last prepare, plus entries whose
+   * residency state flipped); everything else reuses the converted record
+   * and its cached wire segment. Warm requests pay O(window) arithmetic —
+   * cached segments, no re-hashing; cold entries serialize once.
    */
   prepare(): PreparedContext {
     const manifest = this.service.manifest();
@@ -215,6 +377,7 @@ export class ContextWirePipeline {
       maxBytes: this.maxBytes,
       cache: this.cache,
       residency: this.residency,
+      conversionMemo: this.conversions,
     });
     return { ...compiled, manifest, manifestBytes: manifest.windowBytes };
   }
@@ -261,6 +424,14 @@ export class ContextWirePipeline {
  * the exact record order `assembleManifestPayload` produces, so the two
  * manifest assembly paths are byte-identical on the same window.
  *
+ * The per-entry conversion stage is memoized through `options.conversionMemo`
+ * by {@link recordCacheKey} — `(entryId, dialect, normalizerVersion)` plus
+ * the residency `cacheState` — so warm callers (the pipeline's `prepare`)
+ * re-convert only the delta; tail records memoize under a `#tails` suffix
+ * (rendering-independent by convert-to-llm's rule). The memo is pruned to
+ * the current pass's keys, so it holds O(window). Omitted (the one-shot
+ * replay), every page converts fresh — "no carried cache".
+ *
  * A manifest segment without a resident page throws: the projection holds
  * handles, not content, and a missing page is a caller bug here (all window
  * pages are resident in the Ф2 baseline; Context-MMU faulting is the R2
@@ -274,15 +445,18 @@ export class ContextWirePipeline {
  * content-keyed wire identity (`<entryId>#resident@<sha16>`, the same
  * convention as the compaction summary record) — the segment cache keys on
  * the wire id, so a residency flip always recompiles instead of serving the
- * other state's cached bytes.
+ * other state's cached bytes. `options.requireHashes` passes through to
+ * `compile` (the degraded equivalence mode's hash-verification path).
  */
-function compileWindow(
+export function compileWindow(
   windowPages: readonly Entry[],
   manifest: ContextManifest,
   options: {
     readonly maxBytes: number;
     readonly cache: WireSegmentCache;
     readonly residency?: ContextWireResidency;
+    readonly conversionMemo?: ContextWireConversionMemo;
+    readonly requireHashes?: boolean;
   },
 ): CompiledBody {
   const segmentIds = new Set(manifest.segments.map((segment) => segment.entryId));
@@ -301,6 +475,29 @@ function compileWindow(
   const tailEntries: WireEntry[] = [];
   const tailRefs: { entryId: string }[] = [];
   const seenInputEntryIds = new Set<string>();
+  const memo = options.conversionMemo;
+  const liveRecordKeys = new Set<string>();
+  const liveTailsKeys = new Set<string>();
+  const memoRecord = (key: string, convert: () => CompiledEntry | null): CompiledEntry | null => {
+    if (memo === undefined) return convert();
+    liveRecordKeys.add(key);
+    let record = memo.records.get(key);
+    if (record === undefined) {
+      record = convert();
+      memo.records.set(key, record);
+    }
+    return record;
+  };
+  const memoTails = (key: string, convert: () => readonly CompiledEntry[]): readonly CompiledEntry[] => {
+    if (memo === undefined) return convert();
+    liveTailsKeys.add(key);
+    let tails = memo.tails.get(key);
+    if (tails === undefined) {
+      tails = convert();
+      memo.tails.set(key, tails);
+    }
+    return tails;
+  };
   for (const page of windowPages) {
     if (!segmentIds.has(page.id) && !isVisibleControlKind(page.kind)) continue;
     if (isPlacedEntryKind(page.kind)) {
@@ -322,7 +519,7 @@ function compileWindow(
               part.data === undefined ? undefined : `data:${part.mimeType};base64,${part.data}`,
           }
         : undefined;
-    const record = convertEntry(page, undefined, rendering);
+    const record = memoRecord(conversionMemoKey(page.id, rendering), () => convertEntry(page, undefined, rendering));
     if (isReminderEntryKind(page.kind)) {
       // A dedicated reminder entry IS a tail record: strictly after the
       // stable prefix, never inside it.
@@ -345,9 +542,21 @@ function compileWindow(
     }
     // Embedded `<system-reminder>` blocks split into tail records; the
     // prefix record keeps the residual bytes (convert-to-llm's split rule).
-    for (const tail of convertEntryTails(page)) {
+    // Tails are rendering-independent, so their memo key never carries a
+    // cache state.
+    for (const tail of memoTails(tailsMemoKey(page.id), () => convertEntryTails(page, MINIMAX_M3_DIALECT))) {
       tailEntries.push(compiledEntryToWireEntry(tail));
       tailRefs.push({ entryId: tail.entryId });
+    }
+  }
+  if (memo !== undefined) {
+    // Keep the memo O(window): a key the current window no longer converts
+    // (the entry was cut, or its residency state flipped back) is dropped.
+    for (const key of memo.records.keys()) {
+      if (!liveRecordKeys.has(key)) memo.records.delete(key);
+    }
+    for (const key of memo.tails.keys()) {
+      if (!liveTailsKeys.has(key)) memo.tails.delete(key);
     }
   }
 
@@ -360,6 +569,7 @@ function compileWindow(
     maxBytes: options.maxBytes,
     dialect: compiledRecordDialect(),
     cache: options.cache,
+    requireHashes: options.requireHashes === true,
   });
 }
 

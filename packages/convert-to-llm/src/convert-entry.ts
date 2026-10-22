@@ -55,8 +55,14 @@ export interface ImageRendering {
   readonly cacheState?: string;
 }
 
-/** Cache key of a record under an optional rendering override. */
-function recordCacheKey(entryId: string, dialect: Dialect, images: ImageRendering | undefined): string {
+/**
+ * Cache key of a record under an optional rendering override — the key the
+ * wire compiler's consumers memoize the per-entry stage by: `(entryId,
+ * dialect, normalizerVersion)`, extended with the rendering's `cacheState`
+ * (e.g. `resident@<sha16>`) when one is active, so the two renderings of the
+ * same entry never share memoized bytes.
+ */
+export function recordCacheKey(entryId: string, dialect: Dialect, images: ImageRendering | undefined): string {
   return images?.cacheState === undefined ? compileKey(entryId, dialect) : `${compileKey(entryId, dialect)}@${images.cacheState}`;
 }
 

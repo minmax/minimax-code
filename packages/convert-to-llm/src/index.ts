@@ -53,6 +53,7 @@ export {
   convertBatch,
   convertEntry,
   convertEntryTails,
+  recordCacheKey,
   type DecodedImagePart,
   type ImageRendering,
 } from './convert-entry.js';

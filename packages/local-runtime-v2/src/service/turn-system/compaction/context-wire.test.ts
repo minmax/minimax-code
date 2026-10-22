@@ -22,6 +22,8 @@ import {
   ContextWirePipeline,
   DEFAULT_MAX_PAYLOAD_BYTES,
   commitOfEntries,
+  compileWindow,
+  createConversionMemo,
   prepareContextWire,
   type ContextWireResidency,
 } from './context-wire.js';
@@ -30,7 +32,7 @@ import {
   assembleManifestPayload,
   serializeCompiledEntry,
 } from '../../../../../convert-to-llm/src/index.js';
-import { WireBudgetExceeded } from '../../../../../wire-compiler/src/index.js';
+import { WireBudgetExceeded, createLruSegmentCache } from '../../../../../wire-compiler/src/index.js';
 
 let counter = 0;
 
@@ -390,5 +392,228 @@ describe('ContextWirePipeline image residency (Ф2 R2 overlay, judge round 1)', 
     });
     digestOnly.applyCommit(commitOfEntries(1, [img]));
     expect(digestOnly.prepare().body.equals(prepared.body)).toBe(true);
+  });
+
+  it('the conversion memo keys on the residency state: a flip re-converts, never serves the other state', () => {
+    const img = imageEntry(1, 0, 'QUFBQUFB');
+    const page = { id: 'page-a', sha256: 'a'.repeat(64) };
+    const statusByPage = new Map<string, 'resident' | 'digest'>([['page-a', 'resident']]);
+    const memo = createConversionMemo();
+    const cache = createLruSegmentCache(64);
+    const manifest = prepareContextWire([img]).manifest;
+    const compileOnce = (resident: boolean) => {
+      statusByPage.set('page-a', resident ? 'resident' : 'digest');
+      return compileWindow([img], manifest, {
+        maxBytes: DEFAULT_MAX_PAYLOAD_BYTES,
+        cache,
+        residency: residencyOf(new Map([[img.id, page]]), statusByPage),
+        conversionMemo: memo,
+      });
+    };
+
+    const resident = compileOnce(true);
+    expect(resident.body.toString('utf8')).toContain('data:image/png;base64,QUFBQUFB');
+    const evicted = compileOnce(false);
+    const evictedText = evicted.body.toString('utf8');
+    expect(evictedText).not.toContain('QUFBQUFB');
+    expect(evictedText).toContain('[image: image/png]');
+    const back = compileOnce(true);
+    expect(back.body.equals(resident.body)).toBe(true);
+    // Both states lived under their own recordCacheKey — the plain key for
+    // the placeholder, the content-keyed one for the resident rendering —
+    // and the memo pruned to the LAST pass's keys (the resident state).
+    const residentKey = `${img.id}@minimax-m3#v1@resident@${'a'.repeat(16)}`;
+    expect([...memo.records.keys()]).toEqual([residentKey]);
+  });
+});
+
+describe('compileWindow conversion memo (Ф2 warm path, judge round 2)', () => {
+  it('a shared memo is byte-transparent and prunes to the window after a compaction cut', () => {
+    const pages = [...turn(1, 'first'), ...turn(2, 'second')];
+    const reference = prepareContextWire(pages);
+    const manifest = reference.manifest;
+    const memo = createConversionMemo();
+    const cache = createLruSegmentCache(64);
+    const options = {
+      maxBytes: DEFAULT_MAX_PAYLOAD_BYTES,
+      cache,
+      conversionMemo: memo,
+    };
+
+    const first = compileWindow(pages, manifest, options);
+    expect(first.body.equals(reference.body)).toBe(true);
+    // One memoized record and one memoized tail list per window page.
+    expect(memo.records.size).toBe(4);
+    expect(memo.tails.size).toBe(4);
+
+    // A warm pass over the same window: identical bytes, no new keys.
+    const warm = compileWindow(pages, manifest, options);
+    expect(warm.body.equals(reference.body)).toBe(true);
+    expect(memo.records.size).toBe(4);
+    expect(memo.tails.size).toBe(4);
+
+    // A compaction cut shrinks the window: the memo follows it.
+    const keptId = manifest.segments[2]!.entryId;
+    const checkpoint = entry(
+      'mcode.compaction',
+      {
+        summary: 'summary of turn 1',
+        firstKeptEntryId: keptId,
+        systemMessage: null,
+        isSplitTurn: false,
+        tokensBefore: 100,
+        estimatedTokensAfter: 20,
+        createdAtMs: 1,
+      },
+      3,
+      0,
+    );
+    const cutLog = [...pages, checkpoint];
+    const cutReference = prepareContextWire(cutLog);
+    const cut = compileWindow(cutLog, cutReference.manifest, options);
+    expect(cut.body.equals(cutReference.body)).toBe(true);
+    expect(memo.records.size).toBe(2);
+    expect(memo.tails.size).toBe(2);
+  });
+
+  it('an incremental pipeline with its warm memo prepares bytes identical to the one-shot replay', () => {
+    // The pipeline memoizes conversions across prepares (its own memo); the
+    // one-shot replay never carries one. The two paths must stay
+    // byte-identical — memoization is a cache, never a third set of rules.
+    const pipeline = new ContextWirePipeline();
+    const log: Entry[] = [];
+    for (let seq = 1; seq <= 3; seq += 1) {
+      const batch = turn(seq, `q${seq}`);
+      log.push(...batch);
+      pipeline.applyCommit(commitOfEntries(seq, batch));
+      pipeline.prepare(); // warm the memo incrementally, one delta at a time
+    }
+    expect(pipeline.prepare().body.equals(prepareContextWire(log).body)).toBe(true);
+  });
+});
+
+describe('ContextWirePipeline background-compaction seam (byte trigger, final-architecture.md:397)', () => {
+  /** The seam's log view: pi.* entries adapted to the compaction vocabulary. */
+  function adaptToCompactionLog(log: readonly Entry[]): unknown[] {
+    return log
+      .filter(
+        (candidate) =>
+          candidate.kind === 'pi.user' ||
+          candidate.kind === 'pi.assistant' ||
+          candidate.kind.startsWith('mcode.'),
+      )
+      .map((candidate) => {
+        // Message kinds adapt to `mcode.message`; the `mcode.*` control kinds
+        // (compaction checkpoints included) ARE the compaction vocabulary —
+        // the trigger axes reset only if the checkpoint reaches the tracker.
+        if (candidate.kind !== 'pi.user' && candidate.kind !== 'pi.assistant') {
+          return {
+            id: candidate.id,
+            parentId: candidate.parentId,
+            kind: candidate.kind,
+            payload: candidate.payload,
+            seq: candidate.seq,
+            ordinal: candidate.ordinal,
+          };
+        }
+        const [message] = (candidate.payload as { model: unknown[] }).model;
+        return {
+          id: candidate.id,
+          parentId: candidate.parentId,
+          kind: 'mcode.message',
+          payload: message,
+          seq: candidate.seq,
+          ordinal: candidate.ordinal,
+        };
+      });
+  }
+
+  it('creates the scheduler with the byte axis defaulted to the wire guard', async () => {
+    const wired = new ContextWirePipeline({
+      compaction: { summarizer: async () => 'unused', entries: () => [], append: async () => {} },
+    });
+    expect(wired.compactionScheduler).toBeDefined();
+    // The byte trigger budgets the WIRE GUARD itself: the window compacts up
+    // to (75%/90% of) maxBytes, never at it.
+    expect(wired.compactionScheduler?.budgets.byteBudget).toBe(DEFAULT_MAX_PAYLOAD_BYTES);
+
+    const unwired = new ContextWirePipeline();
+    expect(unwired.compactionScheduler).toBeUndefined();
+    await unwired.whenCompactionIdle(); // resolves without a seam
+  });
+
+  it('an explicit byteBudget overrides the wire-guard default', () => {
+    const pipeline = new ContextWirePipeline({
+      compaction: {
+        summarizer: async () => 'unused',
+        entries: () => [],
+        append: async () => {},
+        budgets: { tokenBudget: 0, byteBudget: 1024 },
+      },
+    });
+    expect(pipeline.compactionScheduler?.budgets.byteBudget).toBe(1024);
+  });
+
+  it('the byte trigger compacts the window through the seam before the wire guard fires', async () => {
+    const log: Entry[] = [];
+    // One seq counter for BOTH the message commits and the seam's checkpoint
+    // append — the durable writer assigns the successor of the applied log.
+    let seq = 0;
+    const nextSeq = (): Seq => ++seq as Seq;
+    type CheckpointDraft = { id: string; parentId?: string | null; kind: string; payload: unknown };
+    let pipeline: ContextWirePipeline;
+    // The durable side of the seam: persist the checkpoint draft, then apply
+    // it back into the pipeline — the window the NEXT prepare compiles is
+    // the cut one.
+    const append = async (drafts: readonly CheckpointDraft[]) => {
+      const entries = drafts.map((draft, ordinal) => ({
+        id: draft.id,
+        parentId: draft.parentId ?? null,
+        kind: draft.kind,
+        payload: draft.payload,
+        seq: nextSeq(),
+        ordinal,
+      })) as Entry[];
+      pipeline.applyCommit(commitOfEntries(seq, entries));
+      log.push(...entries);
+    };
+    pipeline = new ContextWirePipeline({
+      compaction: {
+        summarizer: async () => 'byte-trigger summary of the early turns',
+        entries: () => adaptToCompactionLog(log),
+        append,
+        budgets: { byteBudget: 2000 },
+        // The cut SIZE is token-driven (keepRecentTokens); the byte axis only
+        // selects WHEN — so the budget must leave room for the token-sized
+        // tail plus the checkpoint payload (here ~1.1 KiB).
+        keepRecentTokens: 40,
+      },
+    });
+
+    // Seven ~130-byte turns: the window crosses the background line (75% of
+    // 2000 = 1500) well before the 32-MiB wire guard could ever fire.
+    for (let index = 1; index <= 7; index += 1) {
+      const batch = turn(index, 'x'.repeat(80));
+      log.push(...batch);
+      pipeline.applyCommit(commitOfEntries(nextSeq(), batch));
+    }
+    const bytesBefore = pipeline.compactionScheduler?.usage().bytes ?? 0;
+
+    // The admission point: a blocking-level crossing must cut the window
+    // before the next provider request is compiled.
+    await pipeline.whenCompactionIdle();
+
+    const mark = pipeline.manifest().compaction;
+    expect(mark).toBeDefined();
+    const prepared = pipeline.prepare();
+    expect(prepared.body.toString('utf8')).toContain('byte-trigger summary of the early turns');
+    // The cut is real: fewer provider records than the fourteen messages...
+    expect(prepared.segments.length).toBeLessThan(14);
+    // ...and the byte axis RESET to the kept tail + checkpoint payload —
+    // strictly below its pre-cut value and back under the background line
+    // that fired, not pinned at it.
+    const bytesAfter = pipeline.compactionScheduler?.usage().bytes ?? 0;
+    expect(bytesAfter).toBeLessThan(bytesBefore);
+    expect(bytesAfter).toBeLessThan(1500);
   });
 });
