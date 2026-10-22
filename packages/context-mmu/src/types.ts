@@ -157,7 +157,13 @@ export interface ContextMmu {
   stats(): MmuStats;
   /** Lifecycle status of a handle. */
   statusOf(handle: PageHandle): PageStatus;
-  /** Protects the page from eviction for `turns` turns (default `pinTurns`). */
+  /**
+   * Protects the page from eviction for `turns` turns (default `pinTurns`).
+   * Re-pinning a page takes the MAXIMUM of the existing and the new deadline
+   * (`pin(h, 2)` + `pin(h, 5)` protects for 5 turns, not 7): one pin must not
+   * extend the window disproportionately, and a shorter re-pin never shortens
+   * an existing protection.
+   */
   pin(handle: PageHandle, turns?: number): void;
   /**
    * Ends a pin early; the page keeps a small evict-protection grace

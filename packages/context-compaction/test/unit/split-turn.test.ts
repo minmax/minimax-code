@@ -10,6 +10,7 @@ import {
   COMPACTION_ENTRY_KIND,
   SPLIT_TURN_SEPARATOR,
   compact,
+  mergeSplitTurnSummary,
   parseCompactionEntry,
   projectContext,
 } from '../../src/index.js';
@@ -176,5 +177,17 @@ describe('compact / split turn', () => {
     });
     expect(outcome).toBeNull();
     expect(summarizer.callCount).toBe(0);
+  });
+});
+
+describe('mergeSplitTurnSummary', () => {
+  it('does not leave a dangling separator when the turn-prefix summary is empty', () => {
+    // A summarizer that returned an empty string used to produce a checkpoint
+    // ending in the bare glue; a delimiter without content reads as corrupt.
+    expect(mergeSplitTurnSummary('HISTORY', '')).toBe('HISTORY');
+    expect(mergeSplitTurnSummary('', '')).toBe('');
+    expect(mergeSplitTurnSummary('HISTORY', 'PREFIX')).toBe(
+      `HISTORY${SPLIT_TURN_SEPARATOR}PREFIX`,
+    );
   });
 });

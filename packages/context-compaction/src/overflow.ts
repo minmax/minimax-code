@@ -23,7 +23,10 @@ import type { DurableEntryDraft } from './types.js';
 export function isContextOverflowError(error: unknown): boolean {
   const texts: string[] = [];
   let current: unknown = error;
-  for (let depth = 0; current !== undefined && current !== null && depth < 4; depth += 1) {
+  // Deep wrapper chains are normal in this stack (SDK client -> transport ->
+  // provider error -> cause), so the walk is bounded far beyond the typical
+  // nesting; the cap only exists to survive a (pathological) circular cause.
+  for (let depth = 0; current !== undefined && current !== null && depth < 16; depth += 1) {
     if (typeof current === 'string') {
       texts.push(current);
       break;
@@ -32,6 +35,10 @@ export function isContextOverflowError(error: unknown): boolean {
     const record = current as { message?: unknown; status?: unknown; code?: unknown; cause?: unknown };
     if (typeof record.message === 'string') texts.push(record.message);
     if (typeof record.code === 'string') texts.push(record.code);
+    // HTTP 413 (Content Too Large) is an overflow verdict on its own: some
+    // providers fail the request with a bare `{ status: 413 }` (no message,
+    // no code), and refusing to compact on it would wedge the session.
+    if (record.status === 413 || record.status === '413') return true;
     current = record.cause;
   }
   const text = texts.join('\n');

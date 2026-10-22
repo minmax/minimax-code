@@ -109,6 +109,13 @@ export interface WireSegmentCache {
   get(key: string): Buffer | undefined;
   /** Stores (or overwrites) a segment as the most recently used entry. */
   set(key: string, segment: Buffer): void;
+  /**
+   * Removes a key. Optional so minimal custom caches stay valid: `compile()`
+   * uses it to roll back the segments its own pass inserted when the pass
+   * aborts (budget breach) — a failed compile must not leave shared-cache
+   * state behind for other callers.
+   */
+  delete?(key: string): void;
 }
 
 /** Options of {@link compile}. */

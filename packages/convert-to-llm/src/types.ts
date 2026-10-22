@@ -137,9 +137,14 @@ export interface AssembleStats {
   readonly totalEntries: number;
   /** Audit/control entries dropped by the `mcode.*` kind filter. */
   readonly auditDropped: number;
-  /** Duplicate placed entries dropped by the `inputEntryId` dedup. */
+  /**
+   * Duplicate placed entries dropped by the `inputEntryId` dedup — counted
+   * only when an earlier occurrence of the same input actually DELIVERED its
+   * provider record (an undecodable first occurrence does not own the slot;
+   * a later duplicate is promoted instead of counted here).
+   */
   readonly placedDropped: number;
-  /** Kept entries that produced no provider record (reset boundaries, undecodable payloads, reminder-consumed text, empty system records). */
+  /** Kept entries that produced no provider record (reset boundaries, undecodable payloads — including dedicated reminders with no decodable text and placed occurrences that never converted — reminder-consumed text, empty system records). */
   readonly noProviderRecord: number;
   /** Immediate-send batch merges performed (extra members joined). */
   readonly batchJoins: number;

@@ -55,6 +55,30 @@ describe('isContextOverflowError', () => {
     expect(isContextOverflowError(new Error('request failed', { cause }))).toBe(true);
   });
 
+  // Regression (wave-2 review): the walk used to stop at depth 4, so an error
+  // wrapped in 4+ layers (SDK client -> transport -> provider -> ...) lost its
+  // overflow verdict and recovery never ran.
+  it('recognizes overflow through a deeply nested cause chain', () => {
+    let error: Error = new Error('prompt is too long');
+    for (let depth = 0; depth < 8; depth += 1) {
+      error = new Error(`wrapper-${depth}`, { cause: error });
+    }
+    expect(isContextOverflowError(error)).toBe(true);
+  });
+
+  // Regression (wave-2 review): some providers fail with a bare `{ status:
+  // 413 }` — no message, no code. The detector used to read `status` but never
+  // act on it, so no compaction ran and the session wedged on the overflow.
+  it('treats a bare 413 status as an overflow verdict', () => {
+    expect(isContextOverflowError({ status: 413 })).toBe(true);
+    expect(isContextOverflowError({ status: '413' })).toBe(true);
+    expect(isContextOverflowError({ status: 413, cause: new Error('boom') })).toBe(true);
+    expect(isContextOverflowError(new Error('wrapped', { cause: { status: 413 } }))).toBe(true);
+    // Other statuses are not an overflow verdict on their own.
+    expect(isContextOverflowError({ status: 400 })).toBe(false);
+    expect(isContextOverflowError({ status: 429 })).toBe(false);
+  });
+
   it('rejects unrelated failures', () => {
     expect(isContextOverflowError(new Error('401 unauthorized'))).toBe(false);
     expect(isContextOverflowError(new Error('rate limit exceeded, retry later'))).toBe(false);

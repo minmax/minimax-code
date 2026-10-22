@@ -166,8 +166,15 @@ export function createBackgroundCompactionScheduler(
 
   async function runBlocking(): Promise<CompactionOutcome | null> {
     // Join an in-flight background job first — a duplicate checkpoint helps
-    // nobody — then compact now; this is the 90% / overflow path.
-    if (inFlight !== null) await inFlight.catch(() => undefined);
+    // nobody. When that job already recorded a checkpoint, it IS the blocking
+    // compaction: starting a second pass would re-summarize the freshly cut
+    // window (a wasted model call on the 90% path). Only a joined job that
+    // found nothing to compact (`null`) or failed falls through to a fresh
+    // pass over the current log.
+    if (inFlight !== null) {
+      const joined = await inFlight.catch(() => null);
+      if (joined !== null) return joined;
+    }
     return startJob();
   }
 

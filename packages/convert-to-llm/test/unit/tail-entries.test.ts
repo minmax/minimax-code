@@ -21,6 +21,26 @@ import { makeEntry, resetEntrySeq, userEntry } from './helpers.js';
 
 const REMINDER = '<system-reminder>todo state changed</system-reminder>';
 
+describe('reminder accounting', () => {
+  // Regression (wave-2 review): a dedicated reminder whose text failed to
+  // decode used to vanish from BOTH the records and the counters —
+  // `totalEntries` no longer reconciled with
+  // `auditDropped + placedDropped + noProviderRecord + records`, and the
+  // telemetry silently lost the fact that a reminder was dropped.
+  it('counts an undecodable dedicated reminder in noProviderRecord', () => {
+    resetEntrySeq();
+    const payload = assemblePayload([
+      userEntry('u1', 'before'),
+      // No `text`/`content`/`blocks` and no decodable model message.
+      makeEntry('rem1', 'mcode.system-reminder', { broken: true }),
+    ]);
+    expect(payload.tails).toHaveLength(0);
+    expect(payload.stats.totalEntries).toBe(2);
+    expect(payload.stats.noProviderRecord).toBe(1);
+    expect(payload.stats.reminderTails).toBe(0);
+  });
+});
+
 describe('dedicated reminder entries become tail records', () => {
   it('positions reminder entries after the prefix regardless of log position', () => {
     resetEntrySeq();

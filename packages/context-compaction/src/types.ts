@@ -254,11 +254,16 @@ export interface TriggerEvaluation {
 
 /** Budgets and thresholds of the double trigger (tokens AND bytes). */
 export interface CompactionBudgets {
-  /** Context window in tokens; the primary trigger axis. */
+  /**
+   * Context window in tokens; the primary trigger axis. `0` (or any
+   * non-positive budget) DISABLES the axis — the trigger can never fire on
+   * it — rather than treating the usage as always over budget.
+   */
   readonly tokenBudget: number;
   /**
    * Byte budget of the session manifest (sum of serialized entry lengths);
-   * when set, it triggers independently of the token axis.
+   * when set, it triggers independently of the token axis. As with
+   * `tokenBudget`, `0` disables the axis.
    */
   readonly byteBudget?: number;
   /** Background compaction starts at this usage ratio. Default 0.75. */

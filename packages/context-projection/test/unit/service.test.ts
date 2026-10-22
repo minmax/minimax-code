@@ -169,6 +169,34 @@ describe('apply validation', () => {
 		expect(() => service.apply(empty)).toThrow(ProjectionError);
 	});
 
+	// Regression (wave-2 review): the fold tolerates a mid-batch START on
+	// purpose (a resume slice may begin in the middle of a batch), so an
+	// internal ordinal gap was caught while a wrong ordinal BASE slipped
+	// through — `apply` accepted a whole-batch commit whose first entry
+	// carried ordinal 1 and parked the watermark on a nonexistent position.
+	it('rejects a whole batch whose first entry does not carry ordinal 0', () => {
+		const service = new ProjectionService();
+		service.apply(commitOf(1, [llmEntry('pi.user', { text: 'u1' }, 1, 0)]));
+
+		const cutStart = commitOf(2, [
+			llmEntry('pi.user', { text: 'mid-batch tail' }, 2, 1),
+			llmEntry('pi.assistant', { text: 'a' }, 2, 2),
+		]);
+		expect(() => service.apply(cutStart)).toThrow(ProjectionError);
+
+		// Atomic: the rejected commit left the service untouched.
+		expect(service.capsule().appliedSeq).toBe(1);
+		expect(service.manifest().watermark).toEqual({ seq: 1, ordinal: 0 });
+
+		// The corrected whole batch applies at the same sequence.
+		service.apply(commitOf(2, [
+			llmEntry('pi.user', { text: 'head' }, 2, 0),
+			llmEntry('pi.assistant', { text: 'tail' }, 2, 1),
+		]));
+		expect(service.capsule().appliedSeq).toBe(2);
+		expect(service.manifest().watermark).toEqual({ seq: 2, ordinal: 1 });
+	});
+
 	it('rejects a commit whose head differs from its seq (backend invariant)', () => {
 		const service = new ProjectionService();
 		const commit = commitOf(1, [llmEntry('pi.user', { text: 'u1' }, 1, 0)]);

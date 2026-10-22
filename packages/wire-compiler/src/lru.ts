@@ -60,6 +60,10 @@ class LruCache implements LruSegmentCache {
       this.entries.delete(oldest.value);
     }
   }
+
+  delete(key: string): void {
+    this.entries.delete(key);
+  }
 }
 
 /** Creates an isolated LRU segment cache with the given capacity. */

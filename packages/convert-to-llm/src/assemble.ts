@@ -80,10 +80,16 @@ export function assemblePayload(
 ): AssembledPayload {
   const dialect = options.dialect ?? MINIMAX_M3_DIALECT;
 
-  // 1. Kind-level exclusion and placed-entry dedup (steering D+C contract).
+  // 1. Kind-level exclusion; repeated placed placements are RETAINED per
+  // `inputEntryId` (log order) instead of dropped on sight: the dedup counts
+  // by the SUCCESSFULLY CONVERTED placement (step 3), so a recovery artifact
+  // whose first occurrence is undecodable cannot swallow the dedup slot and
+  // lose the user input entirely. "Placed exactly once" (crash-matrix gate)
+  // still holds — a placement delivers at most one provider record.
   const auditDropped = { count: 0 };
   const placedDropped = { count: 0 };
   const seenInputEntryIds = new Set<string>();
+  const placementRetries = new Map<string, DurableEntry[]>();
   const kept: DurableEntry[] = [];
   for (const entry of entries) {
     if (isAuditControlKind(entry.kind)) {
@@ -94,7 +100,9 @@ export function assemblePayload(
       const { inputEntryId } = decodeEntryPayload(entry.kind, entry.payload);
       const dedupId = inputEntryId ?? entry.id;
       if (seenInputEntryIds.has(dedupId)) {
-        placedDropped.count += 1;
+        const retries = placementRetries.get(dedupId);
+        if (retries === undefined) placementRetries.set(dedupId, [entry]);
+        else retries.push(entry);
         continue;
       }
       seenInputEntryIds.add(dedupId);
@@ -122,9 +130,20 @@ export function assemblePayload(
   const tailRecords: CompiledEntry[] = [];
   let batchJoins = 0;
   let noProviderRecord = 0;
+  /** Placement ids whose provider record an occurrence already delivered. */
+  const deliveredPlacements = new Set<string>();
   for (const unit of units) {
     const head = unit[0];
     if (head === undefined) continue;
+
+    const headDedupId = isPlacedEntryKind(head.kind)
+      ? (decodeEntryPayload(head.kind, head.payload).inputEntryId ?? head.id)
+      : undefined;
+    if (headDedupId !== undefined && deliveredPlacements.has(headDedupId)) {
+      // True duplicate: an earlier occurrence of this input already delivered.
+      placedDropped.count += 1;
+      continue;
+    }
 
     let main: CompiledEntry | null;
     if (unit.length > 1) {
@@ -136,15 +155,50 @@ export function assemblePayload(
 
     if (isReminderEntryKind(head.kind)) {
       // A dedicated reminder entry IS a tail record; convertEntry built it
-      // with `tail: true`.
+      // with `tail: true`. An undecodable reminder text still counts — a
+      // reminder that vanishes without a record AND without a counter would
+      // break the totalEntries accounting and silently lose the loss.
       if (main !== null) tailRecords.push(main);
+      else noProviderRecord += 1;
     } else {
-      if (main === null) noProviderRecord += 1;
-      else prefixRecords.push(main);
+      if (main === null) {
+        noProviderRecord += 1;
+        // Placement recovery: promote the next retained occurrence of the
+        // same input, so the undecodable first occurrence does not take the
+        // user text down with it. The first occurrence that CONVERTS wins;
+        // failed tries are counted, never silent.
+        if (headDedupId !== undefined) {
+          const retries = placementRetries.get(headDedupId) ?? [];
+          placementRetries.delete(headDedupId);
+          for (const retry of retries) {
+            const retryRecord = convertEntry(retry, dialect);
+            if (retryRecord === null) {
+              noProviderRecord += 1;
+              continue;
+            }
+            prefixRecords.push(retryRecord);
+            tailRecords.push(...convertEntryTails(retry, dialect));
+            deliveredPlacements.add(headDedupId);
+            break;
+          }
+        }
+      } else {
+        prefixRecords.push(main);
+        if (headDedupId !== undefined) deliveredPlacements.add(headDedupId);
+      }
       for (const entry of unit) {
         tailRecords.push(...convertEntryTails(entry, dialect));
       }
     }
+  }
+
+  // Placement accounting for the duplicates step 1 held back: a placement
+  // that delivered makes its remaining occurrences true duplicates; one that
+  // never delivered has no leftovers here (the promotion loop consumed and
+  // counted them) — the defensive branch keeps that true by construction.
+  for (const [dedupId, retries] of placementRetries) {
+    if (deliveredPlacements.has(dedupId)) placedDropped.count += retries.length;
+    else noProviderRecord += retries.length;
   }
 
   const records = [...prefixRecords, ...tailRecords];

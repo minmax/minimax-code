@@ -40,6 +40,53 @@ describe('wire budget guard', () => {
     expect(raised?.message).toContain('long');
   });
 
+  // Regression (wave-2 review): a budget-failed compile used to leave the
+  // segments it had just serialized in the (shared) cache — without ever
+  // publishing their sha256. A later successful pass of another caller then
+  // reported `cacheHit: true` with `sha256: undefined` for entries it had
+  // never serialized itself. The failed pass now rolls its inserts back.
+  it('a budget breach leaves the cache exactly as it found it', () => {
+    const cache = createLruSegmentCache(64);
+    expect(() => compile(MANIFEST, sizedEntries(), { maxBytes: 8, cache })).toThrow(
+      WireBudgetExceeded,
+    );
+    expect(cache.size).toBe(0);
+
+    // The next successful pass is a COLD pass: it serializes everything
+    // itself and can publish hashes for every segment.
+    const after = compile(MANIFEST, sizedEntries(), {
+      maxBytes: Number.MAX_SAFE_INTEGER,
+      cache,
+    });
+    expect(after.segments.every((segment) => segment.cacheHit === false)).toBe(true);
+    expect(after.segments.every((segment) => typeof segment.sha256 === 'string')).toBe(true);
+  });
+
+  it('rollback only removes what the failed pass itself inserted', () => {
+    const cache = createLruSegmentCache(64);
+    // Warm one entry first: it predates the failing pass.
+    compile([{ entryId: 'short' }], [sizedEntries()[0]!], {
+      maxBytes: Number.MAX_SAFE_INTEGER,
+      cache,
+    });
+
+    let raised: unknown;
+    try {
+      compile(MANIFEST, sizedEntries(), { maxBytes: 8, cache });
+    } catch (error) {
+      raised = error;
+    }
+    expect(raised).toBeInstanceOf(WireBudgetExceeded);
+
+    // The pre-existing entry survives; the failed pass's own inserts are gone.
+    expect(cache.size).toBe(1);
+    const warmed = compile([{ entryId: 'short' }], [sizedEntries()[0]!], {
+      maxBytes: Number.MAX_SAFE_INTEGER,
+      cache,
+    });
+    expect(warmed.segments[0]!.cacheHit).toBe(true);
+  });
+
   it('admits a body exactly at the budget (the guard is a strict >)', () => {
     const reference = compile(MANIFEST, sizedEntries(), { maxBytes: Number.MAX_SAFE_INTEGER, cache: createLruSegmentCache(64) });
     const exact = compile(MANIFEST, sizedEntries(), {

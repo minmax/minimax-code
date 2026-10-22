@@ -208,7 +208,11 @@ export function decodeEntryPayload(kind: string, payload: JsonValue): DecodedEnt
   }
 
   if (kind === 'mcode.owner-input.placed') {
-    const inputEntryId = asString(payload.inputEntryId);
+    // Same non-empty discipline as `decodeBatchId`: an empty `inputEntryId`
+    // carries no linkage, and letting it through would make every empty-linked
+    // placement share one dedup key (distinct user inputs collapsing into one).
+    const raw = asString(payload.inputEntryId);
+    const inputEntryId = raw !== undefined && raw.length > 0 ? raw : undefined;
     const decoded = decodeModel(payload);
     const messages = decoded.length > 0 ? decoded : decodePlacedContent(payload);
     return inputEntryId === undefined ? { messages } : { messages, inputEntryId };

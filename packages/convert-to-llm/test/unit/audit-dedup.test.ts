@@ -108,6 +108,56 @@ describe('placed-entry dedup by inputEntryId', () => {
     expect(payload.stats.placedDropped).toBe(1);
   });
 
+  // Regression (wave-2 review): the dedup used to consume the slot at filter
+  // time — BEFORE conversion. An undecodable first occurrence (broken payload,
+  // `model: []`) therefore ate the `inputEntryId` slot, and the valid duplicate
+  // was dropped as a repeat: "placed exactly once" degraded to "placed zero
+  // times" and the user input never reached the provider.
+  it('promotes a valid duplicate when the first placement is undecodable', () => {
+    resetEntrySeq();
+    const payload = assemblePayload([
+      makeEntry('p1', 'mcode.owner-input.placed', { inputEntryId: 'in_7', model: [] }),
+      makeEntry('p2', 'mcode.owner-input.placed', placedPayload('in_7', 'steer text')),
+    ]);
+
+    const placed = payload.records.filter((record) => record.kind === 'mcode.owner-input.placed');
+    expect(placed).toHaveLength(1);
+    expect(placed[0]!.entryId).toBe('p2');
+    expect(placed[0]!.content).toBe('steer text');
+    // The failed try is counted, never silent; the promoted one is not a drop.
+    expect(payload.stats.noProviderRecord).toBe(1);
+    expect(payload.stats.placedDropped).toBe(0);
+  });
+
+  it('counts every failed placement when no occurrence converts', () => {
+    resetEntrySeq();
+    const payload = assemblePayload([
+      makeEntry('p1', 'mcode.owner-input.placed', { inputEntryId: 'in_8', model: [] }),
+      makeEntry('p2', 'mcode.owner-input.placed', { inputEntryId: 'in_8', model: [] }),
+    ]);
+    expect(payload.records).toHaveLength(0);
+    expect(payload.stats.noProviderRecord).toBe(2);
+    expect(payload.stats.placedDropped).toBe(0);
+  });
+
+  // Regression (wave-2 review): an EMPTY inputEntryId used to pass the decoder
+  // as a valid string and became the dedup key — every empty-linked placement
+  // collapsed into one record, dropping distinct user inputs. The decoder now
+  // applies the same non-empty discipline as `immediateSendBatchId`, so an
+  // empty linkage means "no linkage" and the entry-id fallback dedups.
+  it('does not collapse placements that carry an empty inputEntryId', () => {
+    resetEntrySeq();
+    const payload = assemblePayload([
+      makeEntry('p1', 'mcode.owner-input.placed', placedPayload('', 'first input')),
+      makeEntry('p2', 'mcode.owner-input.placed', placedPayload('', 'second input')),
+    ]);
+    const users = payload.records.filter((record) => record.role === 'user');
+    expect(users).toHaveLength(2);
+    expect(users[0]!.content).toBe('first input');
+    expect(users[1]!.content).toBe('second input');
+    expect(payload.stats.placedDropped).toBe(0);
+  });
+
   it('dedups a placed entry without decodable inputEntryId by its entry id', () => {
     resetEntrySeq();
     const payload = assemblePayload([

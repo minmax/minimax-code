@@ -11,6 +11,11 @@
  *
  * Each segment is one JSON line (trailing `\n`), so the concatenated body
  * stays newline-delimited JSON regardless of how many segments it joins.
+ *
+ * Failure atomicity: a compile pass that aborts (`WireBudgetExceeded`) rolls
+ * back the segments it inserted into the cache — a failed pass leaves the
+ * shared cache exactly as it found it, so later callers never inherit
+ * hash-less hits from someone else's budget breach.
  */
 
 import { createHash } from 'node:crypto';
@@ -32,6 +37,13 @@ import type {
 /** Cache key of one per-entry stage: dialect, normalizer revision, entry. */
 function segmentKey(dialect: WireDialect, entryId: string): string {
   // JSON encoding keeps the key unambiguous even if ids contain separators.
+  // The entry CONTENT is deliberately not part of the key: correctness rests
+  // on the frozen-entry guarantee (an entryId never maps to different
+  // content — the durable log's writer contract, see `Entry`). Folding a
+  // content hash in would force O(payload) hashing of the whole window on
+  // every compile — the exact cost the segment cache exists to avoid — so a
+  // reused entryId with mutated content is a writer-contract violation,
+  // not something the warm path re-verifies.
   return JSON.stringify([dialect.name, dialect.normalizerVersion, entryId]);
 }
 
@@ -86,6 +98,7 @@ export function compile(
 
   const parts: Buffer[] = [];
   const stats: SegmentStat[] = [];
+  const insertedKeys: string[] = [];
   let totalBytes = 0;
 
   // A duplicated manifest reference would silently repeat a segment in the
@@ -110,7 +123,10 @@ export function compile(
     // and the O(payload) sha256 with them — the warm path stays O(window)
     // arithmetic, never re-hashing megabytes.
     const segment = cacheHit ? cached : compileSegment(entry, dialect);
-    if (!cacheHit) cache.set(key, segment);
+    if (!cacheHit) {
+      cache.set(key, segment);
+      insertedKeys.push(key);
+    }
     const sha256 =
       cacheHit && !requireHashes ? undefined : createHash('sha256').update(segment).digest('hex');
 
@@ -126,6 +142,11 @@ export function compile(
   }
 
   if (totalBytes > opts.maxBytes) {
+    // Roll back the segments THIS pass inserted: a failed compile must not
+    // warm the shared cache on behalf of other callers — otherwise a later
+    // successful pass would hit entries it never serialized and could not
+    // publish hashes for (cacheHit: true, sha256: undefined).
+    for (const key of insertedKeys) cache.delete?.(key);
     throw new WireBudgetExceeded({
       totalBytes,
       maxBytes: opts.maxBytes,

@@ -177,6 +177,10 @@ export const SPLIT_TURN_SEPARATOR = '\n\n---\n\n**Turn Context (split turn):**\n
 
 /** Merge the history summary and the turn-prefix summary of a split turn. */
 export function mergeSplitTurnSummary(historySummary: string, turnPrefixSummary: string): string {
+  // A summarizer that returned an empty string must not leave a dangling
+  // separator at the end of the merged summary: a delimiter with no content
+  // behind it reads as a corrupt checkpoint, not as an empty turn context.
+  if (turnPrefixSummary.length === 0) return historySummary;
   return `${historySummary}${SPLIT_TURN_SEPARATOR}${turnPrefixSummary}`;
 }
 

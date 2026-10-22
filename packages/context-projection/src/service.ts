@@ -207,6 +207,17 @@ export class ProjectionService {
 				);
 			}
 		}
+		// A commit is a WHOLE batch: its first entry must carry ordinal 0. The
+		// fold itself tolerates a mid-batch start on purpose (a resume slice may
+		// begin in the middle of a batch), so an internal gap is caught by the
+		// fold while a wrong BASE would slip through and park the watermark on
+		// an ordinal that does not exist in the applied batch.
+		if (entries[0]!.ordinal !== 0) {
+			throw new ProjectionError(
+				`commit ${commit.seq}: first entry ${JSON.stringify(entries[0]!.id)} carries ordinal ` +
+					`${entries[0]!.ordinal}; a whole batch starts at ordinal 0`,
+			);
+		}
 
 		// Every commit folds through the same single `foldEntry` step — control
 		// kinds included, whose fold operates on the cached segments alone. The

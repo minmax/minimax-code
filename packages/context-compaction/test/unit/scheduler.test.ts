@@ -196,6 +196,54 @@ describe('BackgroundCompactionScheduler triggers', () => {
     expect(summarizer.callCount).toBe(1);
   });
 
+  // Regression (wave-2 review): runBlocking used to await the in-flight
+  // background job and then start a SECOND pass — re-summarizing the window
+  // the background checkpoint had just cut (a wasted model call on the 90%
+  // path). The joined checkpoint itself is the blocking compaction.
+  it('runBlocking joins an in-flight background checkpoint without a second pass', async () => {
+    const summarizer = new RecordingSummarizer('S');
+    let release!: () => void;
+    const summarizerGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let summarizerCalls = 0;
+    const gated = async (prompt: string): Promise<string> => {
+      summarizerCalls += 1;
+      await summarizerGate;
+      return summarizer.call(prompt);
+    };
+
+    const log = new MemoryLog();
+    log.entries.push(...windowAtTokens(30_000));
+    // 30k of a 40k budget = 75%: the background trigger fires and the job
+    // reaches the summarizer call synchronously within notify().
+    const scheduler = createBackgroundCompactionScheduler({
+      budgets: { tokenBudget: 40_000 },
+      session: {
+        entries: log.entries,
+        append: async (drafts) => {
+          await log.append(drafts);
+        },
+      },
+      summarizer: gated,
+    });
+
+    // A background job is in flight when the blocking request arrives; the
+    // gate makes that deterministic (notify() reaches the summarizer call
+    // synchronously).
+    const notification = scheduler.notify();
+    expect(summarizerCalls).toBe(1);
+    const blocking = scheduler.runBlocking();
+    release();
+    const joined = await blocking;
+    const backgroundOutcome = await notification.job;
+
+    expect(joined).not.toBeNull();
+    expect(joined).toBe(backgroundOutcome);
+    expect(summarizerCalls).toBe(1); // no duplicate pass
+    expect(log.entries.filter((entry) => entry.kind === COMPACTION_ENTRY_KIND)).toHaveLength(1);
+  });
+
   it('runBlocking compacts immediately regardless of the triggers', async () => {
     const summarizer = new RecordingSummarizer('S');
     // 30k anchored tokens: below every trigger, big enough to summarize.
